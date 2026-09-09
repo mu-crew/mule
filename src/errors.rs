@@ -1,4 +1,5 @@
 use anyhow::Error as AnyhowError;
+use anyhow::Result;
 use thiserror::Error;
 
 pub const EXIT_NO_MASTER: i32 = 3;
@@ -64,4 +65,27 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
         Some(CoopError::Dropped { .. }) => EXIT_DROPPED,
         Some(CoopError::SessionChannelBusy) | None => 1,
     }
+}
+
+/// Refuse to proceed without a control master, naming the command that opens
+/// one.
+///
+/// Every job verb needs this, not just `run`: without it `poll`, `wait`,
+/// `tail`, `kill` and `rm` fell through to ssh and reported a generic failure
+/// with exit 1, instead of the documented exit 3 and the recovery command. The
+/// exception is `coop host list`, whose whole job is to *report* which hosts
+/// have a master.
+pub fn require_master(
+    t: &dyn crate::transport::Transport,
+    host: &crate::config::Host,
+) -> Result<()> {
+    if t.master_alive(host) {
+        return Ok(());
+    }
+    Err(CoopError::NoMaster {
+        host: host.name.clone(),
+        socket: host.socket.display().to_string(),
+        target: host.target.clone(),
+    }
+    .into())
 }

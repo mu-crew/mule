@@ -108,6 +108,7 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
 }
 
 pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
+    crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
     let script = format!(
         "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; tmux -L {} kill-session -t coop-{id}",
@@ -117,6 +118,7 @@ pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
 }
 
 pub fn rm(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
+    crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
     let script = format!(
         "tmux -L {} kill-session -t coop-{id} 2>/dev/null || true; rm -rf {dir}",

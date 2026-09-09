@@ -136,3 +136,46 @@ fn a_config_with_no_hosts_is_an_error_not_an_empty_success() {
     assert!(err.contains("no hosts"), "{err}");
     std::fs::remove_dir_all(tmp("empty")).ok();
 }
+
+#[test]
+fn a_hostile_tmux_socket_is_rejected() {
+    // `tmux_socket` is interpolated unquoted into every remote script, so shell
+    // syntax here would be command injection from a config file. tmux socket
+    // names are a filename component, so the restriction costs nothing real.
+    for hostile in [
+        "coop; touch /tmp/PWNED",
+        "$(id)",
+        "`id`",
+        "a b",
+        "a'b",
+        "a\"b",
+        "a|b",
+        "a&&b",
+        "../escape",
+        "",
+    ] {
+        let body = format!(
+            "[hosts.dev]\ntmux_socket = \"{}\"\n",
+            hostile.escape_debug()
+        );
+        assert!(
+            Config::parse(&body).is_err(),
+            "must reject tmux_socket {hostile:?}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_tmux_socket_names_are_accepted() {
+    for ok in ["coop", "coop-test-123", "coop_2", "coop.alt"] {
+        let body = format!("[hosts.dev]\ntmux_socket = \"{ok}\"\n");
+        assert_eq!(
+            Config::parse(&body)
+                .unwrap()
+                .host(None)
+                .unwrap()
+                .tmux_socket,
+            ok
+        );
+    }
+}

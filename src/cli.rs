@@ -215,7 +215,12 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
 }
 
 pub fn poll(t: &dyn Transport, host: &Host, id: &crate::wrapper::JobId, json: bool) -> Result<i32> {
-    let result = probe(t, host, id, 0)?;
+    // State only: `poll` discards log bytes, so asking for them would transfer
+    // the whole log -- potentially hundreds of MB -- while holding the single
+    // session channel and the ticket lock. That is invariant 3 violated by the
+    // cheapest verb in the tool.
+    crate::errors::require_master(t, host)?;
+    let result = probe(t, host, id, crate::probe::From::StateOnly)?;
     if json {
         let (state, rc) = match result.state {
             State::Running => ("running", "null".to_string()),
@@ -242,6 +247,7 @@ pub fn wait(
     id: &crate::wrapper::JobId,
     timeout: Option<u64>,
 ) -> Result<i32> {
+    crate::errors::require_master(t, host)?;
     crate::tail::wait_only(t, host, id, timeout)
 }
 

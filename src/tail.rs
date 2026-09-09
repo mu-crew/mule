@@ -23,6 +23,7 @@ pub fn once(
     selection: Selection,
     out: &mut dyn Write,
 ) -> Result<()> {
+    crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
     let read = match selection {
         // Payload size is lock hold time. 64KB is deliberately conservative

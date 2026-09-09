@@ -146,3 +146,21 @@ fn state_only_fetches_no_log_bytes() {
     // The size field still arrives, so a later tail knows where to start.
     assert_eq!(result.log_size, 12);
 }
+
+#[test]
+fn poll_does_not_download_the_log() {
+    // `poll` discards bytes, so requesting them would ship the whole log
+    // through the one session channel while holding the lock. A 200MB log would
+    // make the cheapest verb in the tool the one that starves everything.
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(Output::ok("rc=\nalive=1\nsize=209715200\nbytes:\n"));
+
+    coop::cli::poll(&fake, &host(), &"abc123".parse().unwrap(), false).unwrap();
+
+    let script = &fake.scripts()[0];
+    assert!(
+        !script.contains("tail -c"),
+        "poll must not read log bytes: {script}"
+    );
+}

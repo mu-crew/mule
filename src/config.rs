@@ -121,6 +121,23 @@ impl Config {
             .hosts
             .into_iter()
             .map(|(name, h)| {
+                let tmux_socket = h
+                    .tmux_socket
+                    .unwrap_or_else(|| DEFAULT_TMUX_SOCKET.to_string());
+                // Interpolated unquoted into every remote script, so a socket
+                // name containing shell syntax would be command injection from
+                // a config file. tmux socket names are a filename component,
+                // so this grammar loses nothing real.
+                if tmux_socket.is_empty()
+                    || !tmux_socket
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+                {
+                    bail!(
+                        "host {name:?}: invalid tmux_socket {tmux_socket:?}; \
+                         use letters, digits, dot, dash or underscore"
+                    );
+                }
                 let socket = match h.socket {
                     Some(s) => expand_tilde(&s)?,
                     None => expand_tilde(&format!("~/.ssh/coop/{name}.sock"))?,
@@ -128,9 +145,7 @@ impl Config {
                 Ok(Host {
                     target: h.target.unwrap_or_else(|| name.clone()),
                     socket,
-                    tmux_socket: h
-                        .tmux_socket
-                        .unwrap_or_else(|| DEFAULT_TMUX_SOCKET.to_string()),
+                    tmux_socket,
                     max_running: h.max_running.unwrap_or(DEFAULT_MAX_RUNNING),
                     default_cwd: h.default_cwd,
                     keep_days: h.keep_days.unwrap_or(DEFAULT_KEEP_DAYS),

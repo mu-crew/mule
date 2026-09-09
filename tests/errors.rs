@@ -118,3 +118,45 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         assert!(help.contains(text), "help missing {text:?}:\n{help}");
     }
 }
+
+#[test]
+fn every_job_verb_demands_a_master_with_exit_three() {
+    // Previously only `run` checked. The rest fell through to ssh and reported
+    // a generic failure with exit 1, instead of exit 3 and the one command that
+    // fixes it. A caller cannot script around an error it cannot recognise.
+    isolate_state();
+    let cfg = coop::config::Config::parse("[hosts.dev]\ntarget = \"h\"\n").unwrap();
+    let host = cfg.host(None).unwrap();
+    let down = coop::transport::Fake::no_master();
+    let id = "abc123".parse().unwrap();
+    let mut sink = Vec::new();
+
+    let failures: Vec<anyhow::Error> = vec![
+        coop::cli::poll(&down, host, &id, false).unwrap_err(),
+        coop::cli::wait(&down, host, &id, None).unwrap_err(),
+        coop::jobs::kill(&down, host, &id).unwrap_err(),
+        coop::jobs::rm(&down, host, &id).unwrap_err(),
+        coop::tail::once(
+            &down,
+            host,
+            &id,
+            coop::tail::Selection::LastBytes,
+            &mut sink,
+        )
+        .unwrap_err(),
+    ];
+
+    for error in &failures {
+        assert_eq!(
+            coop::errors::exit_code(error),
+            3,
+            "expected exit 3, got: {error:#}"
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("ssh -MNf"), "must name the fix: {text}");
+    }
+    assert!(
+        down.scripts().is_empty(),
+        "a verb must not touch the channel when the master is down"
+    );
+}
