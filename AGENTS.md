@@ -4,9 +4,8 @@
 else can contend with, and hands back a job id you poll, wait or tail against.
 The caller never holds an ssh connection.
 
-Read [`SPEC.md`](SPEC.md) before changing behaviour: it carries the design, the
-measurements behind it, and why the alternatives were rejected. The plan lives
-in the `coop` mu workstream (`mu state -w coop`).
+Read [`SPEC.md`](SPEC.md) before changing behaviour: it carries the design,
+the measurements behind it, and why the alternatives were rejected.
 
 ---
 
@@ -77,8 +76,7 @@ These are the tool. Breaking one silently makes coop worse than plain `ssh`.
 
 1. **coop uses its own `ControlPath`** (`~/.ssh/coop/<host>.sock`). The
    `MaxSessions` cap is per-connection, not per-user, so coop cannot contend
-   with `git fetch`, rsync or murmur on the default socket — and they cannot
-   starve it.
+   with tools on the default socket, and they cannot starve it.
 2. **Jobs run under a private tmux server** (`tmux -L coop`), invisible to the
    user's `tmux ls`.
 3. **Nothing long-running ever rides the channel.** Every ssh coop issues is a
@@ -109,9 +107,8 @@ Consequences, each of which has cost someone real debugging time:
 
 ## Style
 
-Follow `~/hacking/tuicr`: Rust edition 2024, `clap` derive, `anyhow` at the
-boundary with `thiserror` for errors callers switch on, `serde` + `toml` for
-config.
+Use Rust edition 2024, `clap` derive, `anyhow` at the boundary with
+`thiserror` for errors callers switch on, and `serde` with `toml` for config.
 
 Comments explain **why**, not what. The what is recoverable from the code; the
 why is not. Where a decision was measured, put the number in the comment — that
