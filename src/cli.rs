@@ -192,6 +192,30 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
 
 pub fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
+        Commands::Run {
+            host,
+            cwd,
+            wait,
+            no_tail,
+            cmd,
+        } => {
+            if wait || no_tail {
+                anyhow::bail!("`run --wait` is not implemented yet");
+            }
+            let cfg = load_config(cli.config.as_deref())?;
+            let host = cfg.host(host.host.as_deref())?;
+            match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref()) {
+                Ok(id) => {
+                    println!("{id}");
+                    Ok(0)
+                }
+                Err(error) if error.downcast_ref::<crate::run::NoMaster>().is_some() => {
+                    eprintln!("coop: {error}");
+                    Ok(EXIT_NO_MASTER)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Commands::Host(HostCmd::List { json }) => {
             let cfg = load_config(cli.config.as_deref())?;
             host_list(&cfg, &Ssh, json)?;
