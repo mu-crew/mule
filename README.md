@@ -49,6 +49,18 @@ ssh -MNf -S ~/.ssh/coop/build.sock -o ControlPersist=8h build
 
 If authentication uses a hardware token, this costs one tap per `ControlPersist` window. A job command that needs the missing master exits **3** and prints the command above.
 
+### Exit 3 needs a human. Stop and ask.
+
+Opening the master can require a physical act — touching a hardware key, typing a one-time code. No program can do that for you, which is why `coop` refuses to try instead of failing in a way that looks like something else.
+
+If you are an automated caller and you get exit 3, **stop and ask the operator to run the printed command.** Do not:
+
+- retry, or sleep and retry. The master does not appear on its own.
+- run `ssh -MNf` yourself. It needs a terminal to prompt on and fails silently from a background process.
+- fall back to `ssh host command`. That holds a session channel for the whole job, which is the failure this tool exists to remove, and on a capped host it breaks every other tool's connection.
+
+Exit 3 is a distinct code so that a script can recognise this one case and escalate rather than improvise. One tap unblocks every job for the life of the window.
+
 ## Operational details
 
 Three details from `coop --help` matter:

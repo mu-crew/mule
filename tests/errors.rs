@@ -46,10 +46,17 @@ fn no_master_names_the_exact_recovery_command() {
         target: "build.example".into(),
     };
 
+    let text = error.to_string();
     assert_eq!(
-        error.to_string(),
-        "no control master for dev\n  run: ssh -MNf -S /tmp/coop-dev.sock -o ControlPersist=8h build.example"
+        text,
+        "no control master for dev\n  \
+         run: ssh -MNf -S /tmp/coop-dev.sock -o ControlPersist=8h build.example\n  \
+         a human may need to tap a hardware key; ask rather than retrying"
     );
+    // The last line is for automated callers, which are the primary users: this
+    // is the one failure no amount of retrying resolves, because it waits on a
+    // physical act. An agent that retries instead of escalating hangs forever.
+    assert!(text.contains("ask rather than retrying"), "{text}");
 }
 
 #[test]

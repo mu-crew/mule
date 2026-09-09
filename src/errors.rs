@@ -10,7 +10,9 @@ pub const EXIT_DROPPED: i32 = 6;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CoopError {
     #[error(
-        "no control master for {host}\n  run: ssh -MNf -S {socket} -o ControlPersist=8h {target}"
+        "no control master for {host}\n  \
+         run: ssh -MNf -S {socket} -o ControlPersist=8h {target}\n  \
+         a human may need to tap a hardware key; ask rather than retrying"
     )]
     NoMaster {
         host: String,

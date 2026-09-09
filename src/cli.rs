@@ -30,6 +30,12 @@ Operational facts:
   * coop does NOT open the ssh master. `ssh -MNf` needs a TTY for a hardware
     token and cannot prompt from a background call. This costs one token tap per
     ControlPersist window.
+
+    Exit 3 means the master is missing, and it needs a HUMAN: someone may have
+    to touch a hardware key. If you are an agent or a script, STOP and ask the
+    operator to run the printed command. Do not retry, do not run `ssh -MNf`
+    yourself, and do not fall back to `ssh host command` -- that holds a session
+    channel for the whole job, which is the failure coop exists to remove.
   * jobs run in a NON-login, NON-interactive shell: no ~/.profile, so no nvm or
     cargo on PATH unless your command sources it.
   * stdout and stderr are MERGED into one log. Redirect inside your command if
@@ -199,7 +205,8 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
     if rows.iter().any(|(_, up)| !up) {
         eprintln!(
             "\nsome hosts have no control master. coop cannot open one \
-             (ssh -MNf needs a TTY for a hardware token):"
+             (ssh -MNf needs a TTY for a hardware token).\n\
+             A human may need to tap a key; ask rather than retrying:"
         );
         for (h, up) in &rows {
             if !up {

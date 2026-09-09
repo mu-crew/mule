@@ -122,6 +122,20 @@ coop: no control master for build
 
 Opening a master can require a terminal for a hardware token. The explicit command costs one token tap per `ControlPersist` window; a background process cannot perform that prompt. Missing masters exit with status **3**.
 
+### Exit 3 is a request for a human, not a transient error
+
+The distinction matters for automated callers, which are the primary users. Every other failure is something a program can reason about; this one requires a physical act that no amount of retrying produces.
+
+So exit 3 has its own code, and the contract for a caller receiving it is to **stop and escalate to an operator**. Three specific responses are wrong:
+
+| Response | Why it fails |
+| --- | --- |
+| Retry, or sleep and retry | A master does not appear without the human act. The wait is unbounded. |
+| Run `ssh -MNf` from the agent | Measured: it cannot prompt for a token without a terminal, and fails opaquely from a background call. |
+| Fall back to `ssh host command` | Holds a session channel for the job's lifetime — the exact failure this design removes — and starves every other tool on a capped connection. |
+
+One tap unblocks every job for the life of the `ControlPersist` window, so the escalation is cheap and rare. An agent that improvises instead converts a ten-second interruption into a broken host.
+
 ## Commands and output
 
 ```text
