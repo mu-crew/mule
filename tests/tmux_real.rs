@@ -140,4 +140,22 @@ fn generated_wrapper_runs_jobs_on_a_real_private_tmux_server() {
     assert!(
         !bad_cwd.join("log").exists() || !read(bad_cwd.join("log")).contains("this-must-not-run")
     );
+
+    // A cwd containing a space, proven end to end rather than only on the
+    // string. Unquoted interpolation splits it into two words, so `cd` either
+    // fails or lands somewhere else entirely -- and landing somewhere else is
+    // the silent one.
+    let spaced = server.root.join("a dir with spaces");
+    fs::create_dir_all(&spaced).unwrap();
+    let in_spaced = server.run("000005", "pwd", Some(spaced.to_str().unwrap()));
+    assert_eq!(read(in_spaced.join("rc")).trim(), "0");
+    // Compare the trailing component rather than the whole path: on macOS the
+    // temp dir lives under a `/var -> /private/var` symlink, so `pwd` (logical)
+    // and `canonicalize()` (physical) legitimately disagree on the prefix. What
+    // is being tested is that the spaced segment survived intact.
+    let landed = read(in_spaced.join("log")).trim().to_string();
+    assert!(
+        landed.ends_with("/a dir with spaces"),
+        "the job must run in the spaced directory, not a prefix of it: {landed}"
+    );
 }

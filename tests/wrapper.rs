@@ -45,3 +45,21 @@ fn generated_ids_are_short_lowercase_hex_and_effectively_unique() {
     }));
     assert!(ids.iter().collect::<HashSet<_>>().len() > 990);
 }
+
+#[test]
+fn a_cwd_with_a_space_is_quoted() {
+    // `--cwd` is user input and lands in the tmux argument unquoted, so a path
+    // with a space splits into two words and `cd` runs somewhere else -- or
+    // succeeds against the wrong directory. The command itself is base64'd and
+    // safe; this was the one interpolation left.
+    let job = Job {
+        id: "abc123".into(),
+        cmd: "echo hi".into(),
+        cwd: Some("/tmp/my dir".into()),
+    };
+    let script = dispatch_script(&host(), &job);
+    assert!(
+        !script.contains("cd /tmp/my dir &&"),
+        "cwd must not be interpolated raw: {script}"
+    );
+}

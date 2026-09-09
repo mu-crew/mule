@@ -24,10 +24,23 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         .or(host.default_cwd.as_deref())
         .unwrap_or("$HOME");
 
+    // The cwd is encoded for the same reason the command is: it is user input
+    // crossing the same three expansion layers. Interpolated raw, a path with a
+    // space splits into two words and `cd` either fails or -- worse -- succeeds
+    // against the wrong directory. `$HOME` is the one value coop supplies
+    // itself, and it must stay unencoded so the remote shell expands it.
+    let cd = match cwd {
+        "$HOME" => "cd \"$HOME\"".to_string(),
+        path => format!(
+            "cd \"$(printf %s {} | base64 -d)\"",
+            base64(path.as_bytes())
+        ),
+    };
+
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
          tmux -L {} new-session -d -s coop-{} \
-         'cd {cwd} && printf %s {command} | base64 -d | sh > {dir}/log 2>&1; echo $? > {dir}/rc'",
+         '{cd} && printf %s {command} | base64 -d | sh > {dir}/log 2>&1; echo $? > {dir}/rc'",
         host.tmux_socket, job.id
     )
 }
