@@ -1,0 +1,84 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use coop::config::Host;
+use coop::probe::{State, next_interval, probe};
+use coop::transport::{Fake, Output};
+
+fn host() -> Host {
+    Host {
+        name: format!("probe-test-{}", std::process::id()),
+        target: "dev".into(),
+        socket: PathBuf::from("/tmp/coop.sock"),
+        tmux_socket: "coop".into(),
+        max_running: 4,
+        default_cwd: None,
+        keep_days: 14,
+    }
+}
+
+#[test]
+fn maps_rc_and_session_presence_to_job_state() {
+    let cases = [
+        ("rc=0\nalive=0\nsize=0\nbytes:\n", State::Done(0)),
+        ("rc=3\nalive=0\nsize=0\nbytes:\n", State::Done(3)),
+        ("rc=\nalive=1\nsize=0\nbytes:\n", State::Running),
+        ("rc=\nalive=0\nsize=0\nbytes:\n", State::Orphan),
+        ("rc=7\nalive=1\nsize=0\nbytes:\n", State::Done(7)),
+    ];
+
+    for (reply, expected) in cases {
+        let fake = Fake::new();
+        fake.push(Output::ok(reply));
+        assert_eq!(probe(&fake, &host(), "abc123", 0).unwrap().state, expected);
+    }
+}
+
+#[test]
+fn preserves_arbitrary_log_bytes_after_the_header() {
+    let bytes = b"rc=\nalive=1\nsize=22\nbytes:\nrc=9\nbytes:\n\xff\0tail";
+    let fake = Fake::new();
+    fake.push(Output::ok(bytes.as_slice()));
+
+    let result = probe(&fake, &host(), "abc123", 17).unwrap();
+
+    assert_eq!(result.log_size, 22);
+    assert_eq!(result.bytes, b"rc=9\nbytes:\n\xff\0tail");
+    let scripts = fake.scripts();
+    assert_eq!(scripts.len(), 1);
+    assert!(scripts[0].contains("tail -c +18"));
+}
+
+#[test]
+fn probe_is_one_remote_round_trip() {
+    let fake = Fake::new();
+    fake.push(Output::ok("rc=\nalive=1\nsize=0\nbytes:\n"));
+
+    probe(&fake, &host(), "abc123", 0).unwrap();
+
+    assert_eq!(fake.scripts().len(), 1);
+}
+
+#[test]
+fn polling_interval_backs_off_to_five_seconds_and_resets_on_output() {
+    assert_eq!(
+        next_interval(Duration::from_secs(1), false),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        next_interval(Duration::from_secs(2), false),
+        Duration::from_secs(4)
+    );
+    assert_eq!(
+        next_interval(Duration::from_secs(4), false),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        next_interval(Duration::from_secs(5), false),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        next_interval(Duration::from_secs(5), true),
+        Duration::from_secs(1)
+    );
+}

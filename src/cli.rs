@@ -1,13 +1,15 @@
 //! The command surface.
 //!
-//! Subcommands beyond `host list` are declared here but unimplemented: the
-//! shape is settled by the spec, and declaring it up front keeps `--help`
-//! honest about where the tool is going. Each lands in its own task.
+//! The command shapes are settled by the spec and declared up front so
+//! `--help` stays honest while each implementation lands.
 
-use anyhow::Result;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use crate::config::Config;
+use crate::config::{Config, Host};
+use crate::probe::{State, next_interval, probe};
 use crate::transport::{Ssh, Transport};
 
 /// Exit code for "no ssh control master".
@@ -75,13 +77,13 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Print a job's exit code, or "running"
+    /// Print state, but no job output; prints nothing from the job; use coop tail <id>
     Poll {
         id: String,
         #[arg(long)]
         json: bool,
     },
-    /// Block until a job finishes; exits with the job's own code
+    /// Block until done; prints nothing; use coop tail <id>
     Wait {
         id: String,
         #[arg(long, value_name = "S")]
@@ -190,7 +192,55 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn poll(t: &dyn Transport, host: &Host, id: &str, json: bool) -> Result<i32> {
+    let result = probe(t, host, id, 0)?;
+    if json {
+        let (state, rc) = match result.state {
+            State::Running => ("running", "null".to_string()),
+            State::Done(code) => ("done", code.to_string()),
+            State::Orphan => ("orphan", "null".to_string()),
+        };
+        println!(
+            "{{\"state\":\"{state}\",\"rc\":{rc},\"log_size\":{}}}",
+            result.log_size
+        );
+    } else {
+        match result.state {
+            State::Running => println!("running"),
+            State::Done(code) => println!("{code}"),
+            State::Orphan => println!("orphan"),
+        }
+    }
+    Ok(0)
+}
+
+pub fn wait(t: &dyn Transport, host: &Host, id: &str, timeout: Option<u64>) -> Result<i32> {
+    let started = Instant::now();
+    let timeout = timeout.map(Duration::from_secs);
+    let mut interval = Duration::from_secs(1);
+    let mut offset = 0;
+    loop {
+        let result = probe(t, host, id, offset)?;
+        match result.state {
+            State::Done(code) => return Ok(code),
+            State::Orphan => bail!("job {id} is orphaned; no rc will ever arrive"),
+            State::Running => {}
+        }
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            bail!("timed out waiting for job {id}; it is still running");
+        }
+        let new_bytes = !result.bytes.is_empty();
+        offset = offset.saturating_add(result.bytes.len() as u64);
+        let sleep = timeout
+            .map(|limit| interval.min(limit.saturating_sub(started.elapsed())))
+            .unwrap_or(interval);
+        std::thread::sleep(sleep);
+        interval = next_interval(interval, new_bytes);
+    }
+}
+
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    let cfg = load_config(cli.config.as_deref())?;
     match cli.command {
         Commands::Run {
             host,
@@ -217,10 +267,11 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Commands::Host(HostCmd::List { json }) => {
-            let cfg = load_config(cli.config.as_deref())?;
             host_list(&cfg, &Ssh, json)?;
             Ok(0)
         }
+        Commands::Poll { id, json } => poll(&Ssh, cfg.host(None)?, &id, json),
+        Commands::Wait { id, timeout } => wait(&Ssh, cfg.host(None)?, &id, timeout),
         other => anyhow::bail!("`{}` is not implemented yet", verb_of(&other)),
     }
 }
