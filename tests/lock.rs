@@ -3,8 +3,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+/// Point the lock directory at a temp dir for the whole test binary.
+///
+/// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes one
+/// directory per test run into the developer's real `~/.local/state/coop`. A
+/// full run left 151 of them behind, mixed in with live job state.
+///
+/// `set_var` is safe here because it runs once, before any thread that reads it.
+fn isolate_state() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+    });
+}
+
 #[test]
 fn four_concurrent_callers_all_wait_bounded() {
+    isolate_state();
     let host = format!("locktest-bounded-{}", std::process::id());
     let mut hs = vec![];
     for _ in 0..4 {
@@ -30,6 +48,7 @@ fn four_concurrent_callers_all_wait_bounded() {
 
 #[test]
 fn mutual_exclusion_holds() {
+    isolate_state();
     let host = format!("locktest-exclusive-{}", std::process::id());
     let inside = Arc::new(AtomicUsize::new(0));
     let mut threads = Vec::new();
@@ -56,6 +75,7 @@ fn mutual_exclusion_holds() {
 
 #[test]
 fn dead_holder_is_stolen() {
+    isolate_state();
     let host = format!("locktest-dead-{}", std::process::id());
     let path = coop::lock::lock_path(&host);
     fs::create_dir_all(&path).unwrap();
@@ -74,6 +94,7 @@ fn dead_holder_is_stolen() {
 
 #[test]
 fn two_hosts_do_not_serialise() {
+    isolate_state();
     let suffix = std::process::id();
     let host_a = format!("locktest-host-a-{suffix}");
     let host_b = format!("locktest-host-b-{suffix}");
@@ -99,6 +120,7 @@ fn two_hosts_do_not_serialise() {
 
 #[test]
 fn a_ticket_abandoned_before_its_turn_does_not_wedge_the_host() {
+    isolate_state();
     // The dangerous shape of a dead caller: it claimed a ticket, then died
     // BEFORE its turn arrived, so it never wrote `holder`. The holder-stealing
     // branch cannot see it -- there is no holder -- and every later caller
@@ -138,6 +160,7 @@ fn a_ticket_abandoned_before_its_turn_does_not_wedge_the_host() {
 
 #[test]
 fn waiter_files_do_not_accumulate() {
+    isolate_state();
     // `waiter.<n>` is per-ticket, so a long-lived host directory would collect
     // one file per lock acquisition ever made if they were not cleaned up.
     let host = format!("waiters-{}", std::process::id());

@@ -5,7 +5,25 @@ use coop::config::Host;
 use coop::probe::{State, next_interval, probe};
 use coop::transport::{Fake, Output};
 
+/// Point the lock directory at a temp dir for the whole test binary.
+///
+/// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes one
+/// directory per test run into the developer's real `~/.local/state/coop`. A
+/// full run left 151 of them behind, mixed in with live job state.
+///
+/// `set_var` is safe here because it runs once, before any thread that reads it.
+fn isolate_state() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+    });
+}
+
 fn host() -> Host {
+    isolate_state();
     Host {
         name: format!("probe-test-{}", std::process::id()),
         target: "dev".into(),
@@ -19,6 +37,7 @@ fn host() -> Host {
 
 #[test]
 fn maps_rc_and_session_presence_to_job_state() {
+    isolate_state();
     let cases = [
         ("rc=0\nalive=0\nsize=0\nbytes:\n", State::Done(0)),
         ("rc=3\nalive=0\nsize=0\nbytes:\n", State::Done(3)),
@@ -36,6 +55,7 @@ fn maps_rc_and_session_presence_to_job_state() {
 
 #[test]
 fn preserves_arbitrary_log_bytes_after_the_header() {
+    isolate_state();
     let bytes = b"rc=\nalive=1\nsize=22\nbytes:\nrc=9\nbytes:\n\xff\0tail";
     let fake = Fake::new();
     fake.push(Output::ok(bytes.as_slice()));
@@ -51,6 +71,7 @@ fn preserves_arbitrary_log_bytes_after_the_header() {
 
 #[test]
 fn probe_is_one_remote_round_trip() {
+    isolate_state();
     let fake = Fake::new();
     fake.push(Output::ok("rc=\nalive=1\nsize=0\nbytes:\n"));
 
@@ -61,6 +82,7 @@ fn probe_is_one_remote_round_trip() {
 
 #[test]
 fn polling_interval_backs_off_to_five_seconds_and_resets_on_output() {
+    isolate_state();
     assert_eq!(
         next_interval(Duration::from_secs(1), false),
         Duration::from_secs(2)
