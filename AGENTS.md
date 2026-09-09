@@ -42,6 +42,21 @@ Rules:
 `cargo test` must pass **with no network and no ssh**. Test layers 1 and 2 (see
 below) are the default suite precisely so this holds on a plane.
 
+## If the master is down, stop and ask
+
+`coop` verbs exit **3** when there is no ssh control master. Opening one can
+require a human to touch a hardware key, and `ssh -MNf` cannot prompt without a
+terminal — so this is the one failure no program resolves on its own.
+
+Working on this repo, you will hit it while testing against a real host. Ask the
+operator to run the command coop prints. Do not retry it, do not call
+`ssh -MNf` from a tool call, and do not fall back to `ssh <host> <cmd>` "just to
+check something" — that holds the capped channel for the whole command and is
+the exact failure this tool exists to remove.
+
+For automated tests, use the local `sshd` recipe instead (test layer 3, below).
+It needs no master and no token.
+
 ## Testing layers
 
 Three layers, because every invariant this design rests on was measured against
