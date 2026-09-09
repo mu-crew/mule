@@ -41,8 +41,12 @@ fn four_concurrent_callers_all_wait_bounded() {
         }));
     }
     let worst = hs.into_iter().map(|h| h.join().unwrap()).max().unwrap();
-    // 4 callers x 50ms of work: a fair queue tops out near 200ms + overhead.
-    // The naive spin measured 6x its work; assert we are nowhere near that.
+    // 4 callers x 50ms of work: a perfectly fair queue peaks near 200ms, plus
+    // one POLL_INTERVAL per handoff. Measured worst case is ~260ms with 5ms
+    // polling; it was 443ms at 20ms polling, which flaked this bound roughly 1
+    // run in 15. The naive spin measured 6x its work (4.14s for a 0.25s op),
+    // so 600ms still asserts the property while leaving headroom for a loaded
+    // machine.
     assert!(worst < Duration::from_millis(600), "worst wait {worst:?}");
 }
 

@@ -8,7 +8,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How often a waiter re-checks whether its ticket is being served.
+///
+/// This is added to *every* handoff, so it is a direct tax on the whole queue,
+/// not just on one waiter. Measured with 4 callers x 5 rounds x 50ms of work
+/// (1s of serialised work, so a perfectly fair queue peaks near 200ms):
+///
+/// | poll | p50 | worst observed |
+/// | --- | --- | --- |
+/// | 20ms | ~275ms | **443ms**, and it flaked a 600ms bound 1 run in 15 |
+/// | 5ms | ~237ms | 261ms across 6 runs |
+///
+/// 5ms costs a few more syscalls on a critical section that is sub-second by
+/// construction, and buys back most of the granularity overhead.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// How long to wait before telling the user the queue is not dead.
+///
+/// Never a timeout: aborting would reintroduce the failure the ticket lock
+/// exists to remove.
 const WARN_AFTER: Duration = Duration::from_secs(5);
 
 /// The state directory for one host's ticket lock.

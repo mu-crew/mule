@@ -72,7 +72,7 @@ impl TmuxServer {
             cwd: cwd.map(str::to_owned),
         };
         let script = dispatch_script(&host, &job).replace(
-            &format!("$HOME/.local/state/coop/{id}"),
+            &format!("{}/{id}", coop::wrapper::JOBS_ROOT),
             &self.root.join(id).display().to_string(),
         );
         let status = Command::new("sh")

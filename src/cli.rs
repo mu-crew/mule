@@ -80,18 +80,24 @@ pub enum Commands {
     /// Print state, but no job output; prints nothing from the job; use coop tail <id>
     Poll {
         id: String,
+        #[command(flatten)]
+        host: HostArg,
         #[arg(long)]
         json: bool,
     },
     /// Block until done; prints nothing; use coop tail <id>
     Wait {
         id: String,
+        #[command(flatten)]
+        host: HostArg,
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
     },
     /// Print a job's merged stdout and stderr as raw bytes
     Tail {
         id: String,
+        #[command(flatten)]
+        host: HostArg,
         /// Follow until the job finishes
         #[arg(short, long)]
         follow: bool,
@@ -113,9 +119,17 @@ pub enum Commands {
         json: bool,
     },
     /// Kill a running job
-    Kill { id: String },
+    Kill {
+        id: String,
+        #[command(flatten)]
+        host: HostArg,
+    },
     /// Drop a job's state directory
-    Rm { id: String },
+    Rm {
+        id: String,
+        #[command(flatten)]
+        host: HostArg,
+    },
     /// Inspect configured hosts
     #[command(subcommand)]
     Host(HostCmd),
@@ -260,15 +274,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             host_list(&cfg, &Ssh, json)?;
             Ok(0)
         }
-        Commands::Poll { id, json } => poll(&Ssh, cfg.host(None)?, &id, json),
-        Commands::Wait { id, timeout } => wait(&Ssh, cfg.host(None)?, &id, timeout),
+        Commands::Poll { id, host, json } => poll(&Ssh, cfg.host(host.host.as_deref())?, &id, json),
+        Commands::Wait { id, host, timeout } => {
+            wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
+        }
         Commands::Tail {
             id,
+            host,
             follow,
             all,
             lines,
         } => {
-            let host = cfg.host(None)?;
+            let host = cfg.host(host.host.as_deref())?;
             let mut stdout = std::io::stdout().lock();
             if follow {
                 crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
@@ -287,12 +304,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             print_jobs(&rows, &unreachable, json);
             Ok(0)
         }
-        Commands::Kill { id } => {
-            crate::jobs::kill(&Ssh, cfg.host(None)?, &id)?;
+        Commands::Kill { id, host } => {
+            crate::jobs::kill(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
             Ok(0)
         }
-        Commands::Rm { id } => {
-            crate::jobs::rm(&Ssh, cfg.host(None)?, &id)?;
+        Commands::Rm { id, host } => {
+            crate::jobs::rm(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
             Ok(0)
         }
     }
@@ -366,4 +383,3 @@ fn json_escape(input: &str) -> String {
     }
     escaped
 }
-

@@ -4,7 +4,7 @@ use crate::config::{Config, Host};
 use crate::lock::with_lock;
 use crate::probe::State;
 use crate::transport::Transport;
-use crate::wrapper::state_dir;
+use crate::wrapper::{JOBS_ROOT, state_dir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -60,7 +60,7 @@ pub fn list(
 
 fn list_script(host: &Host) -> String {
     format!(
-        "root=$HOME/.local/state/coop; now=$(date +%s); \
+        "root={JOBS_ROOT}; now=$(date +%s); \
          for d in \"$root\"/*; do [ -d \"$d\" ] || continue; \
          id=${{d##*/}}; rc=$(cat \"$d/rc\" 2>/dev/null || true); \
          alive=$(tmux -L {} has-session -t \"coop-$id\" 2>/dev/null && echo 1 || echo 0); \
@@ -140,7 +140,7 @@ fn run_mutation(
 
 pub fn prune(host: &Host) -> String {
     format!(
-        "root=$HOME/.local/state/coop; [ ! -d \"$root\" ] || \
+        "root={JOBS_ROOT}; [ ! -d \"$root\" ] || \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{} \
          -exec test -f '{{}}/rc' \\; -exec rm -rf '{{}}' +",
         host.keep_days

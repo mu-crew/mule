@@ -11,9 +11,19 @@ pub struct Job {
     pub cwd: Option<String>,
 }
 
+/// Remote per-job state, as a shell string (never a local `PathBuf`).
+///
+/// Jobs live under `jobs/` rather than directly in the state dir because the
+/// ticket lock keeps `<host>.lock` in the same tree. Sharing one parent made
+/// `coop ls` report `dev.lock` as an orphaned job, and would have let prune
+/// delete a live lock. They collide whenever the orchestrator and the target
+/// are the same machine, which is exactly the local-sshd test setup.
 pub fn state_dir(id: &str) -> String {
-    format!("$HOME/.local/state/coop/{id}")
+    format!("{JOBS_ROOT}/{id}")
 }
+
+/// Parent of every job's state directory.
+pub const JOBS_ROOT: &str = "$HOME/.local/state/coop/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
     let dir = state_dir(&job.id);
