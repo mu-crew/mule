@@ -282,19 +282,88 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Ok(0)
             }
         }
-        other => anyhow::bail!("`{}` is not implemented yet", verb_of(&other)),
+        Commands::Ls { host, all, json } => {
+            let (rows, unreachable) = crate::jobs::list(&cfg, &Ssh, host.host.as_deref(), all)?;
+            print_jobs(&rows, &unreachable, json);
+            Ok(0)
+        }
+        Commands::Kill { id } => {
+            crate::jobs::kill(&Ssh, cfg.host(None)?, &id)?;
+            Ok(0)
+        }
+        Commands::Rm { id } => {
+            crate::jobs::rm(&Ssh, cfg.host(None)?, &id)?;
+            Ok(0)
+        }
     }
 }
 
-fn verb_of(c: &Commands) -> &'static str {
-    match c {
-        Commands::Run { .. } => "run",
-        Commands::Poll { .. } => "poll",
-        Commands::Wait { .. } => "wait",
-        Commands::Tail { .. } => "tail",
-        Commands::Ls { .. } => "ls",
-        Commands::Kill { .. } => "kill",
-        Commands::Rm { .. } => "rm",
-        Commands::Host(_) => "host",
+fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable], json: bool) {
+    for host in unreachable {
+        eprintln!("{}: unreachable ({})", host.host, host.why);
+    }
+    if json {
+        let items = rows
+            .iter()
+            .map(|row| {
+                let (state, rc) = match row.state {
+                    State::Running => ("running", "null".to_string()),
+                    State::Done(code) => ("done", code.to_string()),
+                    State::Orphan => ("orphan", "null".to_string()),
+                };
+                format!(
+                    r#"{{"id":"{}","host":"{}","state":"{state}","rc":{rc},"age_secs":{},"cmd":"{}"}}"#,
+                    json_escape(&row.id),
+                    json_escape(&row.host),
+                    row.age_secs,
+                    json_escape(&row.cmd)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let down = unreachable
+            .iter()
+            .map(|host| {
+                format!(
+                    r#"{{"host":"{}","why":"{}"}}"#,
+                    json_escape(&host.host),
+                    json_escape(&host.why)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(r#"{{"items":[{items}],"unreachable":[{down}]}}"#);
+        return;
+    }
+
+    for row in rows {
+        let (state, rc) = match row.state {
+            State::Running => ("running", "-".to_string()),
+            State::Done(code) => ("done", code.to_string()),
+            State::Orphan => ("orphan", "-".to_string()),
+        };
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            row.id, row.host, state, rc, row.age_secs, row.cmd
+        );
     }
 }
+
+fn json_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c < '\u{20}' => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+

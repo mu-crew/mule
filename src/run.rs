@@ -50,7 +50,8 @@ pub fn dispatch_with_warnings(
         cwd: cwd.map(str::to_owned),
     };
     let script = format!(
-        "{} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",
+        "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",
+        crate::jobs::prune(host),
         dispatch_script(host, &job),
         host.tmux_socket
     );

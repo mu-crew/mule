@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod jobs;
 pub mod lock;
 pub mod probe;
 pub mod run;
