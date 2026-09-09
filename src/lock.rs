@@ -32,6 +32,16 @@ pub fn with_lock<T>(host: &str, f: impl FnOnce() -> T) -> Result<T> {
         if !path.join("serving").exists() {
             write_counter(&path.join("serving"), 0)?;
         }
+        // Record that a live process is waiting on this ticket. Without it, a
+        // caller that dies *before* its turn arrives leaves a gap nothing can
+        // detect: `serving` reaches its number, no `holder` was ever written,
+        // and every later caller queues behind a ticket that will never be
+        // claimed. Reproduced -- it wedged the host indefinitely.
+        fs::write(
+            waiter_file(&path, next),
+            format!("{}\n", std::process::id()),
+        )
+        .context("cannot record lock waiter")?;
         Ok(next)
     })?;
 
@@ -40,6 +50,10 @@ pub fn with_lock<T>(host: &str, f: impl FnOnce() -> T) -> Result<T> {
     let result = f();
     drop(guard);
     Ok(result)
+}
+
+fn waiter_file(path: &Path, ticket: u64) -> PathBuf {
+    path.join(format!("waiter.{ticket}"))
 }
 
 fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
@@ -52,15 +66,37 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
             if serving == ticket {
                 fs::write(path.join("holder"), format!("{}\n", std::process::id()))
                     .context("cannot record lock holder")?;
+                // Our turn: we are the holder now, not a waiter.
+                fs::remove_file(waiter_file(path, ticket)).ok();
                 return Ok(true);
             }
 
-            if serving < ticket
-                && let Some(pid) = read_pid(&path.join("holder"))?
-                && !pid_is_alive(pid)
-            {
-                fs::remove_file(path.join("holder")).ok();
-                write_counter(&path.join("serving"), serving + 1)?;
+            if serving < ticket {
+                match read_pid(&path.join("holder"))? {
+                    // A holder that died mid-work. Step over it.
+                    Some(pid) if !pid_is_alive(pid) => {
+                        fs::remove_file(path.join("holder")).ok();
+                        write_counter(&path.join("serving"), serving + 1)?;
+                    }
+                    Some(_) => {}
+                    // Nobody holds the lock, so whoever owns `serving` is
+                    // either waiting for it or gone. Deciding by pid rather
+                    // than by a timeout keeps this deterministic: a live
+                    // waiter writes `holder` inside the same counter lock we
+                    // are inside now, so it cannot be mid-claim here.
+                    None => {
+                        let waiter = waiter_file(path, serving);
+                        let abandoned = match read_pid(&waiter)? {
+                            Some(pid) => !pid_is_alive(pid),
+                            // No waiter file at all: handed out, then lost.
+                            None => true,
+                        };
+                        if abandoned {
+                            fs::remove_file(&waiter).ok();
+                            write_counter(&path.join("serving"), serving + 1)?;
+                        }
+                    }
+                }
             }
             Ok(false)
         })?;
