@@ -1,0 +1,71 @@
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::Host;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Job {
+    pub id: String,
+    pub cmd: String,
+    pub cwd: Option<String>,
+}
+
+pub fn state_dir(id: &str) -> String {
+    format!("$HOME/.local/state/coop/{id}")
+}
+
+pub fn dispatch_script(host: &Host, job: &Job) -> String {
+    let dir = state_dir(&job.id);
+    let command = base64(job.cmd.as_bytes());
+    let cwd = job
+        .cwd
+        .as_deref()
+        .or(host.default_cwd.as_deref())
+        .unwrap_or("$HOME");
+
+    format!(
+        "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
+         tmux -L {} new-session -d -s coop-{} \
+         'cd {cwd} && printf %s {command} | base64 -d | sh > {dir}/log 2>&1; echo $? > {dir}/rc'",
+        host.tmux_socket, job.id
+    )
+}
+
+pub fn new_id() -> String {
+    // Time plus pid avoids a dependency for a non-secret id; the odd step keeps
+    // the low 24 bits unique until the six-hex-digit space wraps.
+    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    let next = NEXT.get_or_init(|| {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        AtomicU64::new(time ^ u64::from(std::process::id()))
+    });
+    let value = next.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    format!("{:06x}", value & 0x00ff_ffff)
+}
+
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let bits = u32::from(chunk[0]) << 16
+            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        output.push(ALPHABET[((bits >> 18) & 63) as usize] as char);
+        output.push(ALPHABET[((bits >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[((bits >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(bits & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
