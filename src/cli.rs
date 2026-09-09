@@ -9,15 +9,9 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, Host};
+use crate::errors::{CoopError, EXIT_NO_MASTER};
 use crate::probe::{State, probe};
 use crate::transport::{Ssh, Transport};
-
-/// Exit code for "no ssh control master".
-///
-/// 3 matches `mu-sync-dev`, which takes the same posture for the same reason:
-/// `ssh -MNf` needs a TTY for a hardware token and cannot prompt from a
-/// background call, so a tool that tries anyway fails opaquely.
-pub const EXIT_NO_MASTER: i32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -28,19 +22,27 @@ Hand coop a command, get an id back, then poll, wait or tail against that id.
 You never see ssh, never see tmux, and never hold a connection.
 
 coop uses its OWN ssh ControlPath, so it cannot contend with git fetch, rsync or
-anything else on the default socket. Jobs run detached under a private tmux
-server and write their exit code to a file, which is what makes a completion
-signal survive a dropped connection.
+anything else on the default socket. The coop channel is never lent to local
+commands like rsync or git fetch.
 
-Two things that surprise people, stated here rather than discovered:
+Operational facts:
 
   * coop does NOT open the ssh master. `ssh -MNf` needs a TTY for a hardware
-    token and cannot prompt from a background call, so coop exits 3 and prints
-    the command to run. Costs one token tap per ControlPersist window.
-
+    token and cannot prompt from a background call. This costs one token tap per
+    ControlPersist window.
   * jobs run in a NON-login, NON-interactive shell: no ~/.profile, so no nvm or
-    cargo on PATH unless your command sources it. Use --cwd for the directory;
-    the rest is yours to arrange."
+    cargo on PATH unless your command sources it.
+  * stdout and stderr are MERGED into one log. Redirect inside your command if
+    you need them apart.
+  * poll and wait print NO job output; `coop tail <id>` is the output verb.
+
+Exit status:
+  0   coop operation or job succeeded
+  3   no ssh control master
+  4   timed out waiting
+  5   orphaned job
+  6   connection dropped while waiting
+  <n> wait/--wait return the job's own exit code"
 )]
 pub struct Cli {
     /// Config file (default: ~/.config/coop/config.toml)
@@ -257,13 +259,19 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         return Ok(0);
                     }
                     let mut stdout = std::io::stdout().lock();
-                    if no_tail {
+                    let result = if no_tail {
                         crate::tail::follow_deferred(&Ssh, host, &id, &mut stdout)
                     } else {
                         crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
-                    }
+                    };
+                    result.map_err(|error| crate::errors::waiting(error, &id))
                 }
-                Err(error) if error.downcast_ref::<crate::run::NoMaster>().is_some() => {
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<CoopError>(),
+                        Some(CoopError::NoMaster { .. })
+                    ) =>
+                {
                     eprintln!("coop: {error}");
                     Ok(EXIT_NO_MASTER)
                 }
@@ -277,6 +285,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Poll { id, host, json } => poll(&Ssh, cfg.host(host.host.as_deref())?, &id, json),
         Commands::Wait { id, host, timeout } => {
             wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
+                .map_err(|error| crate::errors::waiting(error, &id))
         }
         Commands::Tail {
             id,

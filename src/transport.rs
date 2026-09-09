@@ -87,9 +87,13 @@ impl Transport for Ssh {
             .arg(script)
             .output()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if let Some(error) = crate::errors::classify(&stderr) {
+            return Err(error.into());
+        }
         Ok(Output {
             stdout: out.stdout,
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
             code: out.status.code().unwrap_or(-1),
         })
     }

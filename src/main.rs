@@ -8,7 +8,7 @@ fn main() {
             // `{:#}` so the whole context chain surfaces; the outermost frame
             // alone routinely hides the actual cause.
             eprintln!("coop: {e:#}");
-            std::process::exit(1);
+            std::process::exit(coop::errors::exit_code(&e));
         }
     }
 }

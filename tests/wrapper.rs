@@ -30,7 +30,10 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     assert!(script.contains("tmux -L coop new-session -d -s coop-a1b2c3"));
     assert!(!script.contains(command));
     assert_eq!(script.matches('\'').count() % 2, 0);
-    assert_eq!(state_dir(&job.id), "$HOME/.local/state/coop/a1b2c3");
+    // Under `jobs/`, not the state dir root: the ticket lock keeps
+    // `<host>.lock` in that tree, and sharing one parent made `coop ls` report
+    // `dev.lock` as an orphaned job.
+    assert_eq!(state_dir(&job.id), "$HOME/.local/state/coop/jobs/a1b2c3");
 }
 
 #[test]

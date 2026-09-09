@@ -1,20 +1,12 @@
 use std::io::Write;
 
 use anyhow::{Context, Result, bail};
-use thiserror::Error;
 
 use crate::config::Host;
+use crate::errors::CoopError;
 use crate::lock::with_lock;
 use crate::transport::Transport;
 use crate::wrapper::{Job, dispatch_script, new_id};
-
-#[derive(Debug, Error)]
-#[error("no control master for {host}\n  run: ssh -MNf -S {socket} -o ControlPersist=8h {target}")]
-pub struct NoMaster {
-    host: String,
-    socket: String,
-    target: String,
-}
 
 pub fn dispatch(
     transport: &dyn Transport,
@@ -36,7 +28,7 @@ pub fn dispatch_with_warnings(
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
     // one transport call deliberately outside the lock.
     if !transport.master_alive(host) {
-        return Err(NoMaster {
+        return Err(CoopError::NoMaster {
             host: host.name.clone(),
             socket: host.socket.display().to_string(),
             target: host.target.clone(),
