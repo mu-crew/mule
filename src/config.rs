@@ -1,0 +1,172 @@
+//! Host configuration: a hand-edited TOML file, not a state database.
+//!
+//! This reverses an early instinct to copy murmur's `peers` table. murmur's
+//! peers carry *discovered* state (snapshots, `fetched_at`, `last_error`),
+//! which is why they need a store. coop's hosts are pure user intent, so a
+//! file is editable, diffable, and needs no migration story.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
+
+/// Warn past this many running jobs on one host. Backpressure, not a queue.
+const DEFAULT_MAX_RUNNING: u32 = 4;
+
+/// Prune `done` jobs older than this. Generous on purpose: deleting a log
+/// someone still wants costs more than the disk it saves.
+const DEFAULT_KEEP_DAYS: u32 = 14;
+
+/// The private tmux server name. Jobs run under `tmux -L coop`, which does not
+/// appear in the user's `tmux ls`.
+const DEFAULT_TMUX_SOCKET: &str = "coop";
+
+/// A configured host, after name-derived defaults have been applied.
+///
+/// Every field is resolved here so no downstream code has to know a default:
+/// `socket` is `~`-expanded because it is handed to `ssh -S`, which does not
+/// expand it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    /// The config section name, and the handle the user passes to `--host`.
+    pub name: String,
+    /// The ssh target. Defaults to `name`.
+    pub target: String,
+    /// coop's *private* `ControlPath`. Everything else on the machine uses the
+    /// default `~/.ssh/control/...` and so cannot contend with it.
+    pub socket: PathBuf,
+    /// `tmux -L <this>`: a private server, invisible to the user's `tmux ls`.
+    pub tmux_socket: String,
+    /// Warn past this count; never block.
+    pub max_running: u32,
+    /// Where `run` starts, unless `--cwd`. `None` means the remote `$HOME`.
+    pub default_cwd: Option<String>,
+    /// Prune horizon for `done` jobs.
+    pub keep_days: u32,
+}
+
+/// The raw `[hosts.<name>]` table. Everything is optional; `Host` fills in the
+/// defaults that serde cannot, because serde cannot see the section name.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHost {
+    target: Option<String>,
+    socket: Option<String>,
+    tmux_socket: Option<String>,
+    max_running: Option<u32>,
+    default_cwd: Option<String>,
+    keep_days: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    /// `BTreeMap` rather than `HashMap` so `coop host list` does not reshuffle
+    /// between invocations.
+    #[serde(default)]
+    hosts: BTreeMap<String, RawHost>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    hosts: Vec<Host>,
+}
+
+/// Expand a leading `~/` against the real home directory.
+///
+/// Only a leading `~/` (or a bare `~`): `~user` is deliberately unsupported,
+/// since resolving another user's home is a different problem and silently
+/// treating it as a literal path would be worse than refusing.
+fn expand_tilde(raw: &str) -> Result<PathBuf> {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return Ok(PathBuf::from(raw));
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        bail!("cannot expand {raw:?}: only a leading `~/` is supported, not `~user`");
+    }
+    let home = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("cannot locate the home directory to expand {raw:?}"))?
+        .home_dir()
+        .to_path_buf();
+    Ok(home.join(rest.trim_start_matches('/')))
+}
+
+/// Where the config lives: `~/.config/coop/config.toml`.
+pub fn default_path() -> Result<PathBuf> {
+    let dirs =
+        directories::BaseDirs::new().ok_or_else(|| anyhow!("cannot locate a home directory"))?;
+    // `config_dir()` is `~/Library/Application Support` on macOS, which is not
+    // where a hand-edited dotfile belongs. coop is a terminal tool, so it uses
+    // the XDG layout on every platform and stays greppable.
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.home_dir().join(".config"));
+    Ok(base.join("coop").join("config.toml"))
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("in config {}", path.display()))
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        let raw: RawConfig = toml::from_str(text)?;
+        if raw.hosts.is_empty() {
+            bail!("no hosts configured; add a section like:\n\n  [hosts.dev]\n  target = \"dev\"");
+        }
+        let hosts = raw
+            .hosts
+            .into_iter()
+            .map(|(name, h)| {
+                let socket = match h.socket {
+                    Some(s) => expand_tilde(&s)?,
+                    None => expand_tilde(&format!("~/.ssh/coop/{name}.sock"))?,
+                };
+                Ok(Host {
+                    target: h.target.unwrap_or_else(|| name.clone()),
+                    socket,
+                    tmux_socket: h
+                        .tmux_socket
+                        .unwrap_or_else(|| DEFAULT_TMUX_SOCKET.to_string()),
+                    max_running: h.max_running.unwrap_or(DEFAULT_MAX_RUNNING),
+                    default_cwd: h.default_cwd,
+                    keep_days: h.keep_days.unwrap_or(DEFAULT_KEEP_DAYS),
+                    name,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { hosts })
+    }
+
+    pub fn hosts(&self) -> &[Host] {
+        &self.hosts
+    }
+
+    /// Resolve `--host`. `None` is the single configured host, or an error that
+    /// names the choices — the fix is one flag away, so the user should never
+    /// have to open the config to learn the names.
+    pub fn host(&self, name: Option<&str>) -> Result<&Host> {
+        let names = || {
+            self.hosts
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match name {
+            Some(n) => self
+                .hosts
+                .iter()
+                .find(|h| h.name == n)
+                .ok_or_else(|| anyhow!("unknown host {n:?}; configured: {}", names())),
+            None if self.hosts.len() == 1 => Ok(&self.hosts[0]),
+            None => Err(anyhow!(
+                "several hosts configured; pass --host <name>: {}",
+                names()
+            )),
+        }
+    }
+}

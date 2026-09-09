@@ -1,0 +1,22 @@
+[package]
+name = "coop"
+version = "0.1.0"
+edition = "2024"
+description = "Fire remote jobs down a private ssh channel nothing else can contend with."
+license = "MIT"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4", features = ["derive"] }
+
+# Config: hand-edited TOML, so serde + toml only. No state database.
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Errors: anyhow at the boundary, thiserror for the classified ssh failures
+# that callers switch on.
+anyhow = "1.0"
+thiserror = "2.0"
+
+# `~` expansion for socket paths, and the XDG state/config dirs.
+directories = "6.0"
