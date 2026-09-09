@@ -107,7 +107,7 @@ fn list_reports_unreachable_hosts_and_visits_live_hosts_sequentially() {
 #[test]
 fn kill_records_rc_before_destroying_the_session() {
     let fake = Fake::new();
-    kill(&fake, &host(), "abc123").unwrap();
+    kill(&fake, &host(), &"abc123".parse().unwrap()).unwrap();
 
     let script = &fake.scripts()[0];
     let rc = script.find("[ -f $d/rc ] || echo 137 > $d/rc").unwrap();

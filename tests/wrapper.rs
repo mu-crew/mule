@@ -20,7 +20,7 @@ fn host() -> Host {
 fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     let command = r#"printf '%s "quoted"' "$HOME/a b""#;
     let job = Job {
-        id: "a1b2c3".into(),
+        id: "a1b2c3".parse().unwrap(),
         cmd: command.into(),
         cwd: None,
     };
@@ -56,7 +56,7 @@ fn a_cwd_with_a_space_is_quoted() {
     // succeeds against the wrong directory. The command itself is base64'd and
     // safe; this was the one interpolation left.
     let job = Job {
-        id: "abc123".into(),
+        id: "abc123".parse().unwrap(),
         cmd: "echo hi".into(),
         cwd: Some("/tmp/my dir".into()),
     };

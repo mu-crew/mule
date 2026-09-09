@@ -67,7 +67,7 @@ impl TmuxServer {
             keep_days: 14,
         };
         let job = Job {
-            id: id.into(),
+            id: id.parse().unwrap(),
             cmd: command.into(),
             cwd: cwd.map(str::to_owned),
         };

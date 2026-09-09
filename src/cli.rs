@@ -81,7 +81,7 @@ pub enum Commands {
     },
     /// Print state, but no job output; prints nothing from the job; use coop tail <id>
     Poll {
-        id: String,
+        id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
         #[arg(long)]
@@ -89,7 +89,7 @@ pub enum Commands {
     },
     /// Block until done; prints nothing; use coop tail <id>
     Wait {
-        id: String,
+        id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
         #[arg(long, value_name = "S")]
@@ -97,7 +97,7 @@ pub enum Commands {
     },
     /// Print a job's merged stdout and stderr as raw bytes
     Tail {
-        id: String,
+        id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
         /// Follow until the job finishes
@@ -122,13 +122,13 @@ pub enum Commands {
     },
     /// Kill a running job
     Kill {
-        id: String,
+        id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
     },
     /// Drop a job's state directory
     Rm {
-        id: String,
+        id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
     },
@@ -214,7 +214,7 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn poll(t: &dyn Transport, host: &Host, id: &str, json: bool) -> Result<i32> {
+pub fn poll(t: &dyn Transport, host: &Host, id: &crate::wrapper::JobId, json: bool) -> Result<i32> {
     let result = probe(t, host, id, 0)?;
     if json {
         let (state, rc) = match result.state {
@@ -236,7 +236,12 @@ pub fn poll(t: &dyn Transport, host: &Host, id: &str, json: bool) -> Result<i32>
     Ok(0)
 }
 
-pub fn wait(t: &dyn Transport, host: &Host, id: &str, timeout: Option<u64>) -> Result<i32> {
+pub fn wait(
+    t: &dyn Transport,
+    host: &Host,
+    id: &crate::wrapper::JobId,
+    timeout: Option<u64>,
+) -> Result<i32> {
     crate::tail::wait_only(t, host, id, timeout)
 }
 
@@ -264,7 +269,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     } else {
                         crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
                     };
-                    result.map_err(|error| crate::errors::waiting(error, &id))
+                    result.map_err(|error| crate::errors::waiting(error, id.as_str()))
                 }
                 Err(error)
                     if matches!(
@@ -285,7 +290,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Poll { id, host, json } => poll(&Ssh, cfg.host(host.host.as_deref())?, &id, json),
         Commands::Wait { id, host, timeout } => {
             wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
-                .map_err(|error| crate::errors::waiting(error, &id))
+                .map_err(|error| crate::errors::waiting(error, id.as_str()))
         }
         Commands::Tail {
             id,

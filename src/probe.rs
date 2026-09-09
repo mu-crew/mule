@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Host;
 use crate::lock::with_lock;
 use crate::transport::Transport;
-use crate::wrapper::state_dir;
+use crate::wrapper::{JobId, state_dir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -47,7 +47,7 @@ impl From {
     }
 }
 
-pub fn probe(t: &dyn Transport, host: &Host, id: &str, from: impl Into<From>) -> Result<Probe> {
+pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) -> Result<Probe> {
     let dir = state_dir(id);
     let from = from.into();
     let script = format!(

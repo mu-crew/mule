@@ -7,7 +7,7 @@ use crate::config::Host;
 use crate::lock::with_lock;
 use crate::probe::{From as ProbeFrom, State, next_interval, probe};
 use crate::transport::Transport;
-use crate::wrapper::state_dir;
+use crate::wrapper::{JobId, state_dir};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
@@ -19,7 +19,7 @@ pub enum Selection {
 pub fn once(
     transport: &dyn Transport,
     host: &Host,
-    id: &str,
+    id: &JobId,
     selection: Selection,
     out: &mut dyn Write,
 ) -> Result<()> {
@@ -42,7 +42,7 @@ pub fn once(
 pub fn follow(
     transport: &dyn Transport,
     host: &Host,
-    id: &str,
+    id: &JobId,
     from: u64,
     out: &mut dyn Write,
 ) -> Result<i32> {
@@ -59,7 +59,7 @@ pub fn follow(
 pub fn follow_deferred(
     transport: &dyn Transport,
     host: &Host,
-    id: &str,
+    id: &JobId,
     out: &mut dyn Write,
 ) -> Result<i32> {
     let code = wait_only(transport, host, id, None)?;
@@ -70,7 +70,7 @@ pub fn follow_deferred(
 pub fn wait_only(
     transport: &dyn Transport,
     host: &Host,
-    id: &str,
+    id: &JobId,
     timeout: Option<u64>,
 ) -> Result<i32> {
     // Ask for state only: a plain wait wants rc, not output, so shipping the
@@ -88,7 +88,7 @@ pub fn wait_only(
 fn wait_loop(
     transport: &dyn Transport,
     host: &Host,
-    id: &str,
+    id: &JobId,
     mut from: ProbeFrom,
     mut out: Option<&mut dyn Write>,
     timeout: Option<Duration>,

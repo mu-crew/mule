@@ -49,7 +49,12 @@ fn maps_rc_and_session_presence_to_job_state() {
     for (reply, expected) in cases {
         let fake = Fake::new();
         fake.push(Output::ok(reply));
-        assert_eq!(probe(&fake, &host(), "abc123", 0).unwrap().state, expected);
+        assert_eq!(
+            probe(&fake, &host(), &"abc123".parse().unwrap(), 0)
+                .unwrap()
+                .state,
+            expected
+        );
     }
 }
 
@@ -60,7 +65,7 @@ fn preserves_arbitrary_log_bytes_after_the_header() {
     let fake = Fake::new();
     fake.push(Output::ok(bytes.as_slice()));
 
-    let result = probe(&fake, &host(), "abc123", 17).unwrap();
+    let result = probe(&fake, &host(), &"abc123".parse().unwrap(), 17).unwrap();
 
     assert_eq!(result.log_size, 22);
     assert_eq!(result.bytes, b"rc=9\nbytes:\n\xff\0tail");
@@ -75,7 +80,7 @@ fn probe_is_one_remote_round_trip() {
     let fake = Fake::new();
     fake.push(Output::ok("rc=\nalive=1\nsize=0\nbytes:\n"));
 
-    probe(&fake, &host(), "abc123", 0).unwrap();
+    probe(&fake, &host(), &"abc123".parse().unwrap(), 0).unwrap();
 
     assert_eq!(fake.scripts().len(), 1);
 }
@@ -119,7 +124,13 @@ fn state_only_fetches_no_log_bytes() {
     let fake = Fake::new();
     fake.push(Output::ok("rc=0\nalive=0\nsize=12\nbytes:\n"));
 
-    let result = probe(&fake, &host(), "abc123", coop::probe::From::StateOnly).unwrap();
+    let result = probe(
+        &fake,
+        &host(),
+        &"abc123".parse().unwrap(),
+        coop::probe::From::StateOnly,
+    )
+    .unwrap();
 
     assert_eq!(result.state, State::Done(0));
     assert!(result.bytes.is_empty());

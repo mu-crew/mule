@@ -6,14 +6,14 @@ use crate::config::Host;
 use crate::errors::CoopError;
 use crate::lock::with_lock;
 use crate::transport::Transport;
-use crate::wrapper::{Job, dispatch_script, new_id};
+use crate::wrapper::{Job, JobId, dispatch_script, new_id};
 
 pub fn dispatch(
     transport: &dyn Transport,
     host: &Host,
     cmd: &str,
     cwd: Option<&str>,
-) -> Result<String> {
+) -> Result<JobId> {
     dispatch_with_warnings(transport, host, cmd, cwd, &mut std::io::stderr())
 }
 
@@ -24,7 +24,7 @@ pub fn dispatch_with_warnings(
     cmd: &str,
     cwd: Option<&str>,
     warnings: &mut dyn Write,
-) -> Result<String> {
+) -> Result<JobId> {
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
     // one transport call deliberately outside the lock.
     if !transport.master_alive(host) {
@@ -37,7 +37,9 @@ pub fn dispatch_with_warnings(
     }
 
     let job = Job {
-        id: new_id(),
+        // Generated, so it parses by construction; the parse is what keeps a
+        // CLI-supplied id from reaching the remote shell unvalidated.
+        id: new_id().parse::<JobId>().expect("generated ids are valid"),
         cmd: cmd.to_owned(),
         cwd: cwd.map(str::to_owned),
     };

@@ -6,7 +6,7 @@ use crate::config::Host;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
-    pub id: String,
+    pub id: JobId,
     pub cmd: String,
     pub cwd: Option<String>,
 }
@@ -18,7 +18,7 @@ pub struct Job {
 /// `coop ls` report `dev.lock` as an orphaned job, and would have let prune
 /// delete a live lock. They collide whenever the orchestrator and the target
 /// are the same machine, which is exactly the local-sshd test setup.
-pub fn state_dir(id: &str) -> String {
+pub fn state_dir(id: &JobId) -> String {
     format!("{JOBS_ROOT}/{id}")
 }
 
@@ -54,6 +54,9 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         host.tmux_socket, job.id
     )
 }
+
+/// Width of a generated id, in hex digits.
+pub const ID_HEX_LEN: usize = 6;
 
 pub fn new_id() -> String {
     // Time plus pid avoids a dependency for a non-secret id; the odd step keeps
@@ -91,4 +94,45 @@ fn base64(input: &[u8]) -> String {
         });
     }
     output
+}
+
+/// A validated job id: exactly six lowercase hex digits.
+///
+/// Every verb takes an id from the command line and interpolates it into a
+/// remote path, a tmux target, and a shell script. Unvalidated, that is command
+/// injection: `coop poll 'x$(touch /tmp/pwn)y'` reached the remote shell as
+/// syntax and would have executed. Parsing at the boundary makes the unsafe
+/// value unrepresentable rather than relying on every call site to quote.
+///
+/// Hex also avoids `:` and `.`, which tmux's target grammar reserves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobId(String);
+
+impl JobId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for JobId {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let ok = raw.len() == ID_HEX_LEN
+            && raw
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !ok {
+            anyhow::bail!(
+                "invalid job id {raw:?}: expected {ID_HEX_LEN} lowercase hex digits, as printed by `coop run`"
+            );
+        }
+        Ok(Self(raw.to_string()))
+    }
+}
+
+impl std::fmt::Display for JobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }

@@ -4,7 +4,7 @@ use crate::config::{Config, Host};
 use crate::lock::with_lock;
 use crate::probe::State;
 use crate::transport::Transport;
-use crate::wrapper::{JOBS_ROOT, state_dir};
+use crate::wrapper::{JOBS_ROOT, JobId, state_dir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -107,7 +107,7 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
     Ok(())
 }
 
-pub fn kill(transport: &dyn Transport, host: &Host, id: &str) -> Result<()> {
+pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
     let dir = state_dir(id);
     let script = format!(
         "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; tmux -L {} kill-session -t coop-{id}",
@@ -116,7 +116,7 @@ pub fn kill(transport: &dyn Transport, host: &Host, id: &str) -> Result<()> {
     run_mutation(transport, host, &script, "kill")
 }
 
-pub fn rm(transport: &dyn Transport, host: &Host, id: &str) -> Result<()> {
+pub fn rm(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
     let dir = state_dir(id);
     let script = format!(
         "tmux -L {} kill-session -t coop-{id} 2>/dev/null || true; rm -rf {dir}",

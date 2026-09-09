@@ -39,11 +39,11 @@ fn dispatch_is_one_round_trip_and_returns_the_job_id() {
     let id = coop::run::dispatch(&fake, &host(), "echo hi", None).unwrap();
     let scripts = fake.scripts();
 
-    assert_eq!(id.len(), 6);
-    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(id.as_str().len(), 6);
+    assert!(id.as_str().bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(scripts.len(), 1, "dispatch must stay one round trip");
     assert!(scripts[0].contains("new-session -d"));
-    assert!(scripts[0].contains(&id));
+    assert!(scripts[0].contains(id.as_str()));
 }
 
 #[test]

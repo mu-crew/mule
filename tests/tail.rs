@@ -45,7 +45,7 @@ fn follow_streams_each_byte_once_and_returns_the_job_rc() {
     fake.push(reply("rc=3\nalive=0", 2, b""));
     let mut out = Cursor::new(Vec::new());
 
-    let code = follow(&fake, &host(), "abc123", 0, &mut out).unwrap();
+    let code = follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
 
     assert_eq!(code, 3);
     assert_eq!(out.into_inner(), b"ab");
@@ -63,7 +63,7 @@ fn follow_does_not_trust_an_overlapping_reported_size_as_the_offset() {
     fake.push(reply("rc=0\nalive=0", 20, b"b"));
     let mut out = Cursor::new(Vec::new());
 
-    follow(&fake, &host(), "abc123", 7, &mut out).unwrap();
+    follow(&fake, &host(), &"abc123".parse().unwrap(), 7, &mut out).unwrap();
 
     assert_eq!(out.into_inner(), b"ab");
     assert!(fake.scripts()[1].contains("tail -c +9"));
@@ -76,7 +76,7 @@ fn follow_reports_an_orphan_instead_of_inventing_an_exit_code() {
     fake.push(reply("rc=\nalive=0", 4, b"last"));
     let mut out = Cursor::new(Vec::new());
 
-    let error = follow(&fake, &host(), "dead42", 0, &mut out).unwrap_err();
+    let error = follow(&fake, &host(), &"dead42".parse().unwrap(), 0, &mut out).unwrap_err();
 
     assert!(error.to_string().contains("no rc will ever arrive"));
     assert_eq!(out.into_inner(), b"last");
@@ -90,7 +90,7 @@ fn follow_names_the_resume_command_after_a_connection_error() {
     fake.push(Output::fail(255, "connection reset"));
     let mut out = Cursor::new(Vec::new());
 
-    let error = follow(&fake, &host(), "abc123", 0, &mut out).unwrap_err();
+    let error = follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap_err();
 
     assert!(error.to_string().contains("coop tail abc123"));
 }
@@ -105,7 +105,7 @@ fn deferred_follow_writes_the_log_only_after_completion() {
     let mut out = Cursor::new(Vec::new());
 
     assert_eq!(
-        follow_deferred(&fake, &host(), "abc123", &mut out).unwrap(),
+        follow_deferred(&fake, &host(), &"abc123".parse().unwrap(), &mut out).unwrap(),
         0
     );
     assert_eq!(out.into_inner(), b"ab");
@@ -126,7 +126,14 @@ fn one_shot_tail_limits_the_remote_read_before_taking_stdout() {
         fake.push(Output::ok([0, 0xff, b'x']));
         let mut out = Cursor::new(Vec::new());
 
-        once(&fake, &host(), "abc123", selection, &mut out).unwrap();
+        once(
+            &fake,
+            &host(),
+            &"abc123".parse().unwrap(),
+            selection,
+            &mut out,
+        )
+        .unwrap();
 
         assert_eq!(out.into_inner(), [0, 0xff, b'x']);
         assert!(fake.scripts()[0].contains(command));
