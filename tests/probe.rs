@@ -104,3 +104,34 @@ fn polling_interval_backs_off_to_five_seconds_and_resets_on_output() {
         Duration::from_secs(1)
     );
 }
+
+#[test]
+fn state_only_fetches_no_log_bytes() {
+    // A plain `wait` wants rc, not output. Shipping the log to discard it would
+    // hold the lock for the transfer.
+    //
+    // This was a real bug: the caller expressed "no bytes" as an offset of
+    // u64::MAX, the +1 that `tail -c +N` needs overflowed, and the remote
+    // command became `tail -c +18446744073709551615` -> "Invalid argument".
+    // Every `--wait --no-tail` then failed with a spurious "lost contact while
+    // waiting", which reads as a network problem.
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(Output::ok("rc=0\nalive=0\nsize=12\nbytes:\n"));
+
+    let result = probe(&fake, &host(), "abc123", coop::probe::From::StateOnly).unwrap();
+
+    assert_eq!(result.state, State::Done(0));
+    assert!(result.bytes.is_empty());
+    let script = &fake.scripts()[0];
+    assert!(
+        !script.contains("tail -c"),
+        "a state-only probe must not ask for log bytes: {script}"
+    );
+    assert!(
+        !script.contains("18446744073709551615"),
+        "no sentinel offset may reach the remote shell: {script}"
+    );
+    // The size field still arrives, so a later tail knows where to start.
+    assert_eq!(result.log_size, 12);
+}

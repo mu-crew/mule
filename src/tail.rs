@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
 use crate::lock::with_lock;
-use crate::probe::{State, next_interval, probe};
+use crate::probe::{From as ProbeFrom, State, next_interval, probe};
 use crate::transport::Transport;
 use crate::wrapper::state_dir;
 
@@ -46,7 +46,14 @@ pub fn follow(
     from: u64,
     out: &mut dyn Write,
 ) -> Result<i32> {
-    wait_loop(transport, host, id, from, Some(out), None)
+    wait_loop(
+        transport,
+        host,
+        id,
+        ProbeFrom::Offset(from),
+        Some(out),
+        None,
+    )
 }
 
 pub fn follow_deferred(
@@ -66,13 +73,13 @@ pub fn wait_only(
     id: &str,
     timeout: Option<u64>,
 ) -> Result<i32> {
-    // Starting beyond any practical log avoids transferring output while a
-    // plain wait asks only for rc. The completed log remains the source of truth.
+    // Ask for state only: a plain wait wants rc, not output, so shipping the
+    // log to discard it would hold the lock for the transfer.
     wait_loop(
         transport,
         host,
         id,
-        u64::MAX,
+        ProbeFrom::StateOnly,
         None,
         timeout.map(Duration::from_secs),
     )
@@ -82,14 +89,14 @@ fn wait_loop(
     transport: &dyn Transport,
     host: &Host,
     id: &str,
-    mut offset: u64,
+    mut from: ProbeFrom,
     mut out: Option<&mut dyn Write>,
     timeout: Option<Duration>,
 ) -> Result<i32> {
     let started = Instant::now();
     let mut interval = Duration::from_secs(1);
     loop {
-        let result = probe(transport, host, id, offset).with_context(|| {
+        let result = probe(transport, host, id, from).with_context(|| {
             format!("lost contact while waiting; the job continues\n  resume: coop tail {id}")
         })?;
         let new_bytes = !result.bytes.is_empty();
@@ -97,8 +104,11 @@ fn wait_loop(
             writer.write_all(&result.bytes)?;
         }
         // Advance by bytes received, not the reported remote size: a truncated
-        // response must not create a permanent hole in streamed output.
-        offset = offset.saturating_add(result.bytes.len() as u64);
+        // response must not create a permanent hole in streamed output. A
+        // state-only wait has no offset to advance.
+        if let ProbeFrom::Offset(offset) = from {
+            from = ProbeFrom::Offset(offset.saturating_add(result.bytes.len() as u64));
+        }
 
         match result.state {
             State::Done(code) => return Ok(code),
