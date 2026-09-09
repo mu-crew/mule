@@ -9,5 +9,6 @@ pub mod config;
 pub mod lock;
 pub mod probe;
 pub mod run;
+pub mod tail;
 pub mod transport;
 pub mod wrapper;

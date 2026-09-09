@@ -3,13 +3,13 @@
 //! The command shapes are settled by the spec and declared up front so
 //! `--help` stays honest while each implementation lands.
 
-use std::time::{Duration, Instant};
+use std::io::Write;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
 use crate::config::{Config, Host};
-use crate::probe::{State, next_interval, probe};
+use crate::probe::{State, probe};
 use crate::transport::{Ssh, Transport};
 
 /// Exit code for "no ssh control master".
@@ -71,7 +71,7 @@ pub enum Commands {
         #[arg(long)]
         wait: bool,
         /// With --wait: print the log once at the end instead of streaming
-        #[arg(long)]
+        #[arg(long, requires = "wait")]
         no_tail: bool,
         /// The command to run
         #[arg(trailing_var_arg = true, required = true)]
@@ -89,12 +89,18 @@ pub enum Commands {
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
     },
-    /// Print a job's output
+    /// Print a job's merged stdout and stderr as raw bytes
     Tail {
         id: String,
         /// Follow until the job finishes
         #[arg(short, long)]
         follow: bool,
+        /// Print the whole log instead of the last 64KB
+        #[arg(long, conflicts_with_all = ["lines", "follow"])]
+        all: bool,
+        /// Print the last N lines instead of the last 64KB
+        #[arg(short = 'n', value_name = "LINES", conflicts_with_all = ["all", "follow"])]
+        lines: Option<u64>,
     },
     /// List jobs
     Ls {
@@ -215,28 +221,7 @@ pub fn poll(t: &dyn Transport, host: &Host, id: &str, json: bool) -> Result<i32>
 }
 
 pub fn wait(t: &dyn Transport, host: &Host, id: &str, timeout: Option<u64>) -> Result<i32> {
-    let started = Instant::now();
-    let timeout = timeout.map(Duration::from_secs);
-    let mut interval = Duration::from_secs(1);
-    let mut offset = 0;
-    loop {
-        let result = probe(t, host, id, offset)?;
-        match result.state {
-            State::Done(code) => return Ok(code),
-            State::Orphan => bail!("job {id} is orphaned; no rc will ever arrive"),
-            State::Running => {}
-        }
-        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            bail!("timed out waiting for job {id}; it is still running");
-        }
-        let new_bytes = !result.bytes.is_empty();
-        offset = offset.saturating_add(result.bytes.len() as u64);
-        let sleep = timeout
-            .map(|limit| interval.min(limit.saturating_sub(started.elapsed())))
-            .unwrap_or(interval);
-        std::thread::sleep(sleep);
-        interval = next_interval(interval, new_bytes);
-    }
+    crate::tail::wait_only(t, host, id, timeout)
 }
 
 pub fn dispatch(cli: Cli) -> Result<i32> {
@@ -249,15 +234,20 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             no_tail,
             cmd,
         } => {
-            if wait || no_tail {
-                anyhow::bail!("`run --wait` is not implemented yet");
-            }
-            let cfg = load_config(cli.config.as_deref())?;
             let host = cfg.host(host.host.as_deref())?;
             match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref()) {
                 Ok(id) => {
                     println!("{id}");
-                    Ok(0)
+                    std::io::stdout().flush()?;
+                    if !wait {
+                        return Ok(0);
+                    }
+                    let mut stdout = std::io::stdout().lock();
+                    if no_tail {
+                        crate::tail::follow_deferred(&Ssh, host, &id, &mut stdout)
+                    } else {
+                        crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
+                    }
                 }
                 Err(error) if error.downcast_ref::<crate::run::NoMaster>().is_some() => {
                     eprintln!("coop: {error}");
@@ -272,6 +262,26 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         }
         Commands::Poll { id, json } => poll(&Ssh, cfg.host(None)?, &id, json),
         Commands::Wait { id, timeout } => wait(&Ssh, cfg.host(None)?, &id, timeout),
+        Commands::Tail {
+            id,
+            follow,
+            all,
+            lines,
+        } => {
+            let host = cfg.host(None)?;
+            let mut stdout = std::io::stdout().lock();
+            if follow {
+                crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
+            } else {
+                let selection = match lines {
+                    Some(lines) => crate::tail::Selection::Lines(lines),
+                    None if all => crate::tail::Selection::All,
+                    None => crate::tail::Selection::LastBytes,
+                };
+                crate::tail::once(&Ssh, host, &id, selection, &mut stdout)?;
+                Ok(0)
+            }
+        }
         other => anyhow::bail!("`{}` is not implemented yet", verb_of(&other)),
     }
 }

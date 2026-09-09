@@ -1,0 +1,134 @@
+use std::io::Cursor;
+
+use coop::config::{Config, Host};
+use coop::tail::{Selection, follow, follow_deferred, once};
+use coop::transport::{Fake, Output};
+
+/// Point the lock directory at a temp dir for the whole test binary.
+///
+/// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes
+/// lock directories into the developer's real `~/.local/state/coop`, mixed in
+/// with live job state.
+///
+/// `set_var` is safe here because it runs once, before any thread reads it.
+fn isolate_state() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+    });
+}
+
+fn host() -> Host {
+    isolate_state();
+    Config::parse("[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/coop.sock\"\n")
+        .unwrap()
+        .host(None)
+        .unwrap()
+        .clone()
+}
+
+fn reply(state: &str, size: u64, bytes: &[u8]) -> Output {
+    let mut stdout = format!("{state}\nsize={size}\nbytes:\n").into_bytes();
+    stdout.extend_from_slice(bytes);
+    Output::ok(stdout)
+}
+
+#[test]
+fn follow_streams_each_byte_once_and_returns_the_job_rc() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=1", 1, b"a"));
+    fake.push(reply("rc=\nalive=1", 2, b"b"));
+    fake.push(reply("rc=3\nalive=0", 2, b""));
+    let mut out = Cursor::new(Vec::new());
+
+    let code = follow(&fake, &host(), "abc123", 0, &mut out).unwrap();
+
+    assert_eq!(code, 3);
+    assert_eq!(out.into_inner(), b"ab");
+    let scripts = fake.scripts();
+    assert!(scripts[0].contains("tail -c +1"));
+    assert!(scripts[1].contains("tail -c +2"));
+    assert!(scripts[2].contains("tail -c +3"));
+}
+
+#[test]
+fn follow_does_not_trust_an_overlapping_reported_size_as_the_offset() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=1", 20, b"a"));
+    fake.push(reply("rc=0\nalive=0", 20, b"b"));
+    let mut out = Cursor::new(Vec::new());
+
+    follow(&fake, &host(), "abc123", 7, &mut out).unwrap();
+
+    assert_eq!(out.into_inner(), b"ab");
+    assert!(fake.scripts()[1].contains("tail -c +9"));
+}
+
+#[test]
+fn follow_reports_an_orphan_instead_of_inventing_an_exit_code() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=0", 4, b"last"));
+    let mut out = Cursor::new(Vec::new());
+
+    let error = follow(&fake, &host(), "dead42", 0, &mut out).unwrap_err();
+
+    assert!(error.to_string().contains("no rc will ever arrive"));
+    assert_eq!(out.into_inner(), b"last");
+}
+
+#[test]
+fn follow_names_the_resume_command_after_a_connection_error() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=1", 1, b"a"));
+    fake.push(Output::fail(255, "connection reset"));
+    let mut out = Cursor::new(Vec::new());
+
+    let error = follow(&fake, &host(), "abc123", 0, &mut out).unwrap_err();
+
+    assert!(error.to_string().contains("coop tail abc123"));
+}
+
+#[test]
+fn deferred_follow_writes_the_log_only_after_completion() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=1", 1, b"a"));
+    fake.push(reply("rc=0\nalive=0", 2, b"b"));
+    fake.push(Output::ok("ab"));
+    let mut out = Cursor::new(Vec::new());
+
+    assert_eq!(
+        follow_deferred(&fake, &host(), "abc123", &mut out).unwrap(),
+        0
+    );
+    assert_eq!(out.into_inner(), b"ab");
+    assert!(fake.scripts()[2].contains("cat"));
+}
+
+#[test]
+fn one_shot_tail_limits_the_remote_read_before_taking_stdout() {
+    isolate_state();
+    let cases = [
+        (Selection::LastBytes, "tail -c 65536"),
+        (Selection::All, "cat"),
+        (Selection::Lines(12), "tail -n 12"),
+    ];
+
+    for (selection, command) in cases {
+        let fake = Fake::new();
+        fake.push(Output::ok([0, 0xff, b'x']));
+        let mut out = Cursor::new(Vec::new());
+
+        once(&fake, &host(), "abc123", selection, &mut out).unwrap();
+
+        assert_eq!(out.into_inner(), [0, 0xff, b'x']);
+        assert!(fake.scripts()[0].contains(command));
+    }
+}
