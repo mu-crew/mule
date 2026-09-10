@@ -247,6 +247,41 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
 }
 
 #[test]
+fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "dispatch-warning");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.coop(&config, &["run", "printf ok | tail -1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+    assert!(
+        id.len() == 6
+            && id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "stdout must contain only the job id: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("final head/tail pipeline"), "{stderr}");
+    assert!(stderr.contains("coop tail <id> -n 3"), "{stderr}");
+
+    let quiet = sshd.coop(&config, &["--quiet", "run", "printf ok | tail -1"]);
+    assert!(quiet.status.success());
+    assert!(quiet.stderr.is_empty(), "--quiet must suppress the warning");
+    let quiet_id = stdout(&quiet);
+
+    clean_jobs(&sshd, &[id, quiet_id]);
+}
+
+#[test]
 fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
     require_sshd!();
     let sshd = Sshd::start();
