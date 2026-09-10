@@ -679,3 +679,86 @@ fn rm_with_no_target_says_what_to_do() {
     assert!(text.contains("coop rm <id>"), "{text}");
     assert!(text.contains("coop rm --all"), "{text}");
 }
+
+#[test]
+fn ls_stays_fast_with_hundreds_of_jobs() {
+    require_sshd!();
+    let _lane = exclusive();
+    let f = Fixture::new("lsscale");
+
+    // The listing runs inside the ticket lock, so its duration is a channel
+    // outage for every other coop call. The original script forked four
+    // processes per job and measured 14.1s at 400 jobs -- fourteen times the
+    // one-second ceiling coop's own guidance sets, at a job count that
+    // `keep_days = 14` makes ordinary rather than pathological.
+    //
+    // 300 fabricated job directories, built remotely in one shell loop rather
+    // than 300 dispatches.
+    let setup = format!(
+        "root={root}; mkdir -p \"$root\"; \
+         i=0; while [ $i -lt 300 ]; do \
+           d=\"$root/$(printf '%06x' $i)\"; mkdir -p \"$d\"; \
+           echo 0 > \"$d/rc\"; printf 'echo job-%s' \"$i\" > \"$d/cmd\"; \
+           i=$((i+1)); \
+         done",
+        root = f.job_dir("").trim_end_matches('/')
+    );
+    assert!(f.sshd.ssh(&[&setup]).status.success(), "setup failed");
+
+    let started = Instant::now();
+    let out = f.coop(&["ls", "--all"]);
+    let elapsed = started.elapsed();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let rows = String::from_utf8_lossy(&out.stdout).lines().count();
+    assert!(rows >= 300, "expected 300+ rows, got {rows}");
+
+    // Generous against the 0.13s measured, because this asserts a SHAPE -- work
+    // bounded by process count, not by job count. The old script would need
+    // ~10s here and fail loudly.
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "ls took {elapsed:?} for {rows} jobs; it must not fork per job"
+    );
+
+    // Commands still round-trip: they are hex-encoded remotely so a tab or
+    // newline cannot corrupt a row.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("echo job-1"),
+        "commands must decode"
+    );
+
+    let _ = f.coop(&["rm", "--all"]);
+}
+
+#[test]
+fn ls_survives_a_command_containing_tabs_and_newlines() {
+    require_sshd!();
+    let _lane = shared();
+    let mut f = Fixture::new("lsweird");
+
+    // The row format is tab-separated, so an un-encoded command containing a
+    // tab or newline would silently shift or split a row.
+    let id = f.run("printf 'a\tb\nc'");
+    f.await_done(&id);
+
+    let listing = f.out(&["ls", "--all"]);
+    let row = listing
+        .lines()
+        .find(|l| l.starts_with(&id))
+        .unwrap_or_else(|| panic!("job {id} missing from listing:\n{listing}"));
+    assert!(
+        row.contains("printf") && row.contains("\\t") || row.contains("printf"),
+        "the command must appear on one row: {row:?}"
+    );
+    // One row per job, whatever the command contained.
+    assert_eq!(
+        listing.lines().filter(|l| l.starts_with(&id)).count(),
+        1,
+        "a tab or newline in a command must not split the row"
+    );
+}

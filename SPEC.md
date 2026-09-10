@@ -29,6 +29,7 @@ Five concurrent SSH calls to a capped connection produced the defining result: *
 | Empty tmux config matters in tests | One measured server start took **3.5s** with personal config and **0.02s** with `-f /dev/null`, a **175x** difference. |
 | Dispatch is cheap but not free | **125ms** per dispatch against **33ms** for a bare `ssh` over an existing master: ~65ms local startup, ~30ms round trip, ~25ms tmux. |
 | An unpinned tmux config is expensive | A cold server sourcing a personal `~/.tmux.conf` took **4518ms** to start against **30ms** with `-f /dev/null`, a **150x** difference. |
+| A per-job listing does not scale | 300 jobs: **14.1s** forking four processes per job, **0.13s** with three processes total. A 108x difference, paid inside the lock. |
 | Lock poll interval is paid per handoff | Four callers, five rounds, 50ms of work each. A 20ms poll gave a p50 of ~275ms and a worst case of **443ms**; a 5ms poll gave ~237ms and **261ms**. |
 
 ## Three invariants
@@ -204,6 +205,8 @@ The stable coop-specific exit codes are:
 A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `coop tail <id>` as the recovery command.
 
 ## Listing, load, and cleanup
+
+`ls` does a bounded amount of work per host -- one `tmux list-sessions`, one batched `stat`, one `awk` -- rather than work proportional to the job count. The listing runs inside the ticket lock, so its duration is a channel outage for everything else: a per-job version measured 14.1s at 300 jobs, fourteen times the one-second ceiling stated above, at a job count `keep_days` makes ordinary.
 
 `ls` checks configured hosts sequentially because every host call takes its own lock. It reports unreachable hosts instead of silently omitting them.
 

@@ -33,11 +33,12 @@ fn host() -> Host {
 #[test]
 fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     let fake = Fake::new();
-    // ages in seconds: running/12s, done/34s, orphan/56s
+    // ages in seconds: running/12s, done/34s, orphan/56s. `cmd` is hex, matching
+    // the remote encoding -- awk cannot base64 without a fork per job.
     fake.push(Output::ok(
-        "abc123\t12\t\t1\tZWNobyBoaQ==\n\
-         def456\t34\t9\t0\tZmFsc2U=\n\
-         fed987\t56\t\t0\tdHJ1ZQ==\n",
+        "abc123\t12\t\t1\t6563686f206869\n\
+         def456\t34\t9\t0\t66616c7365\n\
+         fed987\t56\t\t0\t74727565\n",
     ));
     let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
 
@@ -69,9 +70,9 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     // A week-old job in each state.
     let reply = format!(
-        "aaaaaa\t{week}\t\t1\tZWNobyBoaQ==\n\
-         bbbbbb\t{week}\t0\t0\tZmFsc2U=\n\
-         cccccc\t{week}\t\t0\tdHJ1ZQ==\n"
+        "aaaaaa\t{week}\t\t1\t6563686f206869\n\
+         bbbbbb\t{week}\t0\t0\t66616c7365\n\
+         cccccc\t{week}\t\t0\t74727565\n"
     );
 
     let fake = Fake::new();
@@ -102,7 +103,7 @@ impl Transport for HostsFake {
             .unwrap()
             .push((host.name.clone(), script.to_owned()));
         Ok(Output::ok(format!(
-            "{}01\t1\t\t1\tdHJ1ZQ==\n",
+            "{}01\t1\t\t1\t74727565\n",
             &host.name[..3]
         )))
     }
