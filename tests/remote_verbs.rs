@@ -774,8 +774,16 @@ fn ls_survives_a_command_containing_tabs_and_newlines() {
         .find(|l| l.starts_with(&id))
         .unwrap_or_else(|| panic!("job {id} missing from listing:\n{listing}"));
     assert!(
-        row.contains("printf") && row.contains("\\t") || row.contains("printf"),
+        row.contains("printf"),
         "the command must appear on one row: {row:?}"
+    );
+    // The table collapses whitespace so one job stays one scannable row. The
+    // tab and newline survive only on the machine surface -- a listing that
+    // dropped encoding would look identical in the table and lose them in JSON.
+    let json = f.out(&["ls", "--all", "--json"]);
+    assert!(
+        json.contains("\\t") && json.contains("\\n"),
+        "ls --json must keep the tab and newline: {json}"
     );
     // One row per job, whatever the command contained.
     assert_eq!(
