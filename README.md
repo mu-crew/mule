@@ -24,6 +24,20 @@ done
 
 Coop uses its own `ControlPath`, serializes every channel-opening call, and detaches the job before returning. Other tools use other connections, so neither side takes the other's session slot.
 
+## Which jobs belong here
+
+Dispatch costs about **125ms**, against **33ms** for a bare `ssh` over an existing master. Route a command through coop when its **duration** is the problem, not when its frequency is.
+
+| Command | Use coop? |
+| --- | --- |
+| Test suite, build, long rsync | Yes. Minutes of held channel starves every other tool. |
+| Anything you want to survive a dropped connection | Yes. That is the only way to get an exit code back later. |
+| Several long commands at once | Yes. Ungated, 1 of 5 concurrent calls succeeded. |
+| `git rev-parse`, a status poll, a state collector | No. Already sub-second, so 125ms buys nothing. |
+| A command needing a live terminal | No. Jobs are detached and read no input. |
+
+Rough threshold: **under a second, do not bother; over ten seconds, do.** Frequent short calls are better served by retrying on a refused channel, which is cheap and idempotent, than by paying dispatch each time.
+
 ## Install and configure
 
 Build and install with Cargo:

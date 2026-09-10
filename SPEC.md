@@ -27,6 +27,8 @@ Five concurrent SSH calls to a capped connection produced the defining result: *
 | Old artifacts misreport state | A leftover `rc` made a running job appear finished with the old code. |
 | Duplicate tmux names are unsafe | A second `tmux new-session` printed `duplicate session` while its wrapper reported success. |
 | Empty tmux config matters in tests | One measured server start took **3.5s** with personal config and **0.02s** with `-f /dev/null`, a **175x** difference. |
+| Dispatch is cheap but not free | **125ms** per dispatch against **33ms** for a bare `ssh` over an existing master: ~65ms local startup, ~30ms round trip, ~25ms tmux. |
+| An unpinned tmux config is expensive | A cold server sourcing a personal `~/.tmux.conf` took **4518ms** to start against **30ms** with `-f /dev/null`, a **150x** difference. |
 | Lock poll interval is paid per handoff | Four callers, five rounds, 50ms of work each. A 20ms poll gave a p50 of ~275ms and a worst case of **443ms**; a 5ms poll gave ~237ms and **261ms**. |
 
 ## Three invariants
@@ -260,6 +262,16 @@ The design separates four kinds of evidence:
 | 3b | The 2FA-specific error text and network latency | A capped host and a live master |
 
 Layer 2 uses a private tmux socket and no personal config. It catches quoting, `rc` writes, kill status **137**, and shell exit-code propagation that a fake transport cannot test. Layer 3 reproduces the channel cap without privileged setup. Layer 3b is the only layer that needs a token tap.
+
+## What belongs in a job
+
+Dispatch costs ~125ms against ~33ms for a bare `ssh` over an existing master, so the tool earns its overhead on **duration**, not frequency:
+
+- **Worth it:** anything holding the channel for a noticeable time — a test suite, a build, a large transfer — anything that must survive a dropped connection, and any group of long commands that would otherwise contend.
+- **Not worth it:** sub-second commands such as a `rev-parse`, a status poll, or a state collector. There is no long hold to remove, so the 125ms is pure cost. A refused channel on a cheap idempotent command is better retried than routed around.
+- **Impossible:** anything needing a live terminal. Jobs are detached and read no input.
+
+Rough threshold: under a second, do not bother; over ten seconds, do.
 
 ## Rejected alternatives
 
