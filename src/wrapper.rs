@@ -2,6 +2,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+
 use crate::config::Host;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +30,7 @@ pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
     let dir = state_dir(&job.id);
-    let command = base64(job.cmd.as_bytes());
+    let command = encode_command(job.cmd.as_bytes());
     let cwd = job
         .cwd
         .as_deref()
@@ -59,9 +61,12 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         // a space or a metacharacter in the path is still inert.
         Some(rest) => format!(
             "cd \"$HOME/$(printf %s {} | base64 -d)\"",
-            base64(rest.as_bytes())
+            encode_command(rest.as_bytes())
         ),
-        None => format!("cd \"$(printf %s {} | base64 -d)\"", base64(cwd.as_bytes())),
+        None => format!(
+            "cd \"$(printf %s {} | base64 -d)\"",
+            encode_command(cwd.as_bytes())
+        ),
     };
 
     let run = if job.max_secs == 0 {
@@ -89,7 +94,7 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
              if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
             socket = host.tmux_socket,
             id = job.id,
-            watchdog = base64(watchdog.as_bytes()),
+            watchdog = encode_command(watchdog.as_bytes()),
         )
     };
 
@@ -144,27 +149,8 @@ pub fn new_id() -> String {
     format!("{:06x}", value & 0x00ff_ffff)
 }
 
-fn base64(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let bits = u32::from(chunk[0]) << 16
-            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        output.push(ALPHABET[((bits >> 18) & 63) as usize] as char);
-        output.push(ALPHABET[((bits >> 12) & 63) as usize] as char);
-        output.push(if chunk.len() > 1 {
-            ALPHABET[((bits >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        output.push(if chunk.len() > 2 {
-            ALPHABET[(bits & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    output
+pub fn encode_command(input: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(input)
 }
 
 /// A validated job id: exactly six lowercase hex digits.

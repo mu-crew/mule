@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 
 use crate::config::{Config, Host};
 use crate::probe::State;
@@ -103,11 +104,10 @@ pub fn list_with_hidden(
 /// illegal option on macOS and `-f` means "file system" on Linux -- so the
 /// `||` fallback is required, not belt-and-braces.
 ///
-/// `cmd` is **hex**-encoded rather than base64. A command may contain a tab or
-/// a newline, either of which would corrupt the row format, so it must be
-/// encoded somehow; base64 would mean one `base64` fork per job, which is the
-/// single most expensive thing this rewrite removes. Hex costs a 256-entry
-/// lookup table in awk and decodes trivially on this side.
+/// `cmd` is base64-encoded inside awk. A command may contain a tab or newline,
+/// either of which would corrupt the row format. Keeping the encoder in the
+/// existing awk process avoids restoring the per-job `base64` forks that made
+/// listing take 14.1s.
 fn list_script(host: &Host) -> String {
     format!(
         "root={JOBS_ROOT}; [ -d \"$root\" ] || exit 0; \
@@ -118,10 +118,20 @@ fn list_script(host: &Host) -> String {
              BEGIN {{ \
                n = split(live, L, \"\\n\"); \
                for (i = 1; i <= n; i++) if (L[i] != \"\") alive[L[i]] = 1; \
-               for (i = 0; i < 256; i++) hex[sprintf(\"%c\", i)] = sprintf(\"%02x\", i); \
+               alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\"; \
+               for (i = 0; i < 256; i++) ord[sprintf(\"%c\", i)] = i; \
              }} \
-             function tohex(s,   out, i) {{ \
-               for (i = 1; i <= length(s); i++) out = out hex[substr(s, i, 1)]; \
+             function b64(s,   out, i, n, a, b, c) {{ \
+               for (i = 1; i <= length(s); i += 3) {{ \
+                 n = length(s) - i + 1; \
+                 a = ord[substr(s, i, 1)]; \
+                 b = n > 1 ? ord[substr(s, i + 1, 1)] : 0; \
+                 c = n > 2 ? ord[substr(s, i + 2, 1)] : 0; \
+                 out = out substr(alphabet, int(a / 4) + 1, 1); \
+                 out = out substr(alphabet, (a % 4) * 16 + int(b / 16) + 1, 1); \
+                 out = out (n > 1 ? substr(alphabet, (b % 16) * 4 + int(c / 64) + 1, 1) : \"=\"); \
+                 out = out (n > 2 ? substr(alphabet, c % 64 + 1, 1) : \"=\"); \
+               }} \
                return out; \
              }} \
              {{ \
@@ -133,7 +143,7 @@ fn list_script(host: &Host) -> String {
                while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
                close(dir \"/cmd\"); \
                printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", \
-                 id, now - mtime, rc, (id in alive) ? 1 : 0, tohex(cmd); \
+                 id, now - mtime, rc, (id in alive) ? 1 : 0, b64(cmd); \
              }}'",
         host.tmux_socket
     )
@@ -151,7 +161,10 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             .context("invalid age in ls reply")?;
         let rc_text = fields.next().context("invalid ls reply: missing rc")?;
         let alive = fields.next().context("invalid ls reply: missing alive")? == "1";
-        let cmd = decode_hex(fields.next().context("invalid ls reply: missing cmd")?)?;
+        let cmd = String::from_utf8_lossy(&decode_command(
+            fields.next().context("invalid ls reply: missing cmd")?,
+        )?)
+        .into_owned();
         let rc = if rc_text.is_empty() {
             None
         } else {
@@ -292,26 +305,8 @@ pub fn prune(host: &Host) -> String {
     )
 }
 
-/// Decode the hex `cmd` field from an `ls` reply.
-///
-/// Hex rather than base64 because the remote side encodes it in awk: base64
-/// would mean forking `base64` once per job, which was the most expensive part
-/// of the listing. A command can contain a tab or a newline, so it has to be
-/// encoded either way.
-fn decode_hex(input: &str) -> Result<String> {
-    if !input.len().is_multiple_of(2) {
-        bail!("invalid cmd encoding in ls reply: odd length");
-    }
-    let bytes = input
-        .as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            let text = std::str::from_utf8(pair).context("invalid cmd encoding in ls reply")?;
-            u8::from_str_radix(text, 16).context("invalid cmd encoding in ls reply")
-        })
-        .collect::<Result<Vec<u8>>>()?;
-    // Lossy only here: this is the display copy for a human-readable table, and
-    // a command that is not valid UTF-8 should still show as something rather
-    // than failing the whole listing.
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+pub fn decode_command(input: &str) -> Result<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .context("invalid command encoding in ls reply")
 }

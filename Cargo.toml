@@ -9,6 +9,10 @@ license = "MIT"
 # CLI parsing
 clap = { version = "4", features = ["derive"] }
 
+# Commands cross several shell parsers encoded; use the strict standard codec
+# at this injection boundary rather than maintaining complementary halves.
+base64 = "0.22"
+
 # Config: hand-edited TOML, so serde + toml only. No state database.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

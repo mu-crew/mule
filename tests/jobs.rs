@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use coop::config::{Config, Host};
-use coop::jobs::{kill, list, list_with_hidden, prune};
+use coop::jobs::{decode_command, kill, list, list_with_hidden, prune};
 use coop::probe::State;
 use coop::transport::{Fake, Output, Transport};
 
@@ -55,7 +55,7 @@ fn ls_json_is_stable_for_every_job_state() {
     let ssh = dir.join("ssh");
     std::fs::write(
         &ssh,
-        "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) exit 0;; esac\nprintf 'abc123\\t12\\t\\t1\\t6563686f206869\\ndef456\\t34\\t9\\t0\\t66616c7365\\nfed987\\t56\\t\\t0\\t74727565\\n'\n",
+        "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) exit 0;; esac\nprintf 'abc123\\t12\\t\\t1\\tZWNobyBoaQ==\\ndef456\\t34\\t9\\t0\\tZmFsc2U=\\nfed987\\t56\\t\\t0\\tdHJ1ZQ==\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -84,12 +84,12 @@ fn ls_json_is_stable_for_every_job_state() {
 #[test]
 fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     let fake = Fake::new();
-    // ages in seconds: running/12s, done/34s, orphan/56s. `cmd` is hex, matching
-    // the remote encoding -- awk cannot base64 without a fork per job.
+    // ages in seconds: running/12s, done/34s, orphan/56s. Commands use the
+    // same base64 protocol as dispatch.
     fake.push(Output::ok(
-        "abc123\t12\t\t1\t6563686f206869\n\
-         def456\t34\t9\t0\t66616c7365\n\
-         fed987\t56\t\t0\t74727565\n",
+        "abc123\t12\t\t1\tZWNobyBoaQ==\n\
+         def456\t34\t9\t0\tZmFsc2U=\n\
+         fed987\t56\t\t0\tdHJ1ZQ==\n",
     ));
     let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
 
@@ -109,6 +109,34 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     assert_eq!(rows[1].cmd, "false");
     assert_eq!(rows[2].state, State::Orphan);
     assert_eq!(rows[2].cmd, "true");
+}
+
+#[test]
+fn command_codec_round_trips_protocol_values() {
+    let values: &[&[u8]] = &[
+        b"",
+        b"a",
+        b"ab",
+        b"abc",
+        b"line one\nline two\tend",
+        &[0, 0xff, 0x80, b'\n'],
+        &[b'x'; 4097],
+    ];
+
+    for value in values {
+        let encoded = coop::wrapper::encode_command(value);
+        assert_eq!(decode_command(&encoded).unwrap(), *value);
+    }
+}
+
+#[test]
+fn command_decoder_rejects_malformed_input() {
+    for malformed in ["A=AA", "AA==AAAA", "AA==!", "AA$=", "AB==", "AAB="] {
+        assert!(
+            decode_command(malformed).is_err(),
+            "accepted malformed base64 {malformed:?}"
+        );
+    }
 }
 
 #[test]
@@ -198,9 +226,9 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     // A week-old job in each state.
     let reply = format!(
-        "aaaaaa\t{week}\t\t1\t6563686f206869\n\
-         bbbbbb\t{week}\t0\t0\t66616c7365\n\
-         cccccc\t{week}\t\t0\t74727565\n"
+        "aaaaaa\t{week}\t\t1\tZWNobyBoaQ==\n\
+         bbbbbb\t{week}\t0\t0\tZmFsc2U=\n\
+         cccccc\t{week}\t\t0\tdHJ1ZQ==\n"
     );
 
     let fake = Fake::new();
@@ -232,7 +260,7 @@ impl Transport for HostsFake {
             .unwrap()
             .push((host.name.clone(), script.to_owned()));
         Ok(Output::ok(format!(
-            "{}01\t1\t\t1\t74727565\n",
+            "{}01\t1\t\t1\tdHJ1ZQ==\n",
             &host.name[..3]
         )))
     }

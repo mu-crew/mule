@@ -27,6 +27,22 @@ fn default_jobs_root_stays_in_the_remote_home() {
 }
 
 #[test]
+fn dispatch_uses_canonical_padded_base64() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"", ""),
+        (b"a", "YQ=="),
+        (b"ab", "YWI="),
+        (b"abc", "YWJj"),
+        (b"line one\nline two\tend", "bGluZSBvbmUKbGluZSB0d28JZW5k"),
+        (&[0, 0xff, 0x80], "AP+A"),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(coop::wrapper::encode_command(input), *expected);
+    }
+}
+
+#[test]
 fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     let command = r#"printf '%s "quoted"' "$HOME/a b""#;
     let job = Job {
