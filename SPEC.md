@@ -82,13 +82,15 @@ The remote artifact is the only source of truth. There is no local job index. Th
 
 `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that coop did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
 
-A job wrapper has this shape:
+A job wrapper has this shape. The log is capped at `max_log_bytes`; `-f /dev/null` stops a personal `~/.tmux.conf` from inflating dispatch:
 
 ```sh
-tmux -L coop new-session -d -s coop-<id> \
-  'cd <cwd> && printf %s <base64> | base64 -d | sh > <state>/log 2>&1; \
-   echo $? > <state>/rc'
+tmux -L coop -f /dev/null new-session -d -s coop-<id> \
+  '{ cd ... && printf %s <b64> | base64 -d | sh; echo $? > <state>/rc; } \
+   | { head -c <max> > <state>/log; cat > <state>/.overflow; ... }'
 ```
+
+With `--max-secs` or `max_job_secs`, a second `watch-<id>` session writes **124** only if `rc` is still absent, then kills the job session. Normal completion destroys the watchdog and keeps the command's own rc.
 
 Both the command and a user-supplied working directory are base64-encoded. They cross the local argument parser, the remote shell, tmux argument parsing, and `sh`; layered quoting reopens injection and expansion bugs at each boundary. The `cmd` file is a display copy, not executable input.
 
