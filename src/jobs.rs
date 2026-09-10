@@ -142,14 +142,61 @@ pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
     run_mutation(transport, host, &script, "kill")
 }
 
-pub fn rm(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
+/// What `rm` was asked to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    One(JobId),
+    /// Every finished job, ignoring `keep_days`.
+    ///
+    /// Deliberately NOT "everything": `rm` never stops work. A running job is
+    /// spared, and so is an orphan -- it has no `rc`, and it is the one state
+    /// that cannot be reconstructed, so it is evidence rather than mud. `kill`
+    /// is the only verb that ends a job, which is what makes `--all` safe
+    /// enough to need no confirmation.
+    AllDone,
+}
+
+/// Remove job state. Returns the ids removed, so the caller can report them.
+///
+/// One round trip either way: enumeration and removal share a single remote
+/// script, because a list-then-delete pair would take the lock twice and could
+/// act on a job whose state changed in between.
+pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result<Vec<String>> {
     crate::errors::require_master(transport, host)?;
-    let dir = state_dir(id);
-    let script = format!(
-        "tmux -L {} kill-session -t coop-{id} 2>/dev/null || true; rm -rf {dir}",
-        host.tmux_socket
-    );
-    run_mutation(transport, host, &script, "rm")
+
+    let script = match target {
+        // A single id still kills first: the caller named this job, so ending
+        // it is the intent. Only the bulk path is non-destructive.
+        Target::One(id) => {
+            let dir = state_dir(id);
+            format!(
+                "tmux -L {} kill-session -t coop-{id} 2>/dev/null; \
+                 if [ -d {dir} ]; then rm -rf {dir} && echo {id}; fi; exit 0",
+                host.tmux_socket
+            )
+        }
+        // Presence of `rc` IS the definition of finished, the same test prune
+        // uses -- so this is "prune now, ignoring the horizon".
+        Target::AllDone => format!(
+            "root={JOBS_ROOT}; [ -d \"$root\" ] || exit 0; \
+             for d in \"$root\"/*; do \
+               [ -d \"$d\" ] && [ -f \"$d/rc\" ] || continue; \
+               rm -rf \"$d\" && echo \"${{d##*/}}\"; \
+             done; exit 0"
+        ),
+    };
+
+    let output = with_lock(&host.name, || transport.run(host, &script))??;
+    if output.code != 0 {
+        bail!("rm failed on {}: {}", host.name, output.stderr.trim());
+    }
+    Ok(output
+        .text()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn run_mutation(

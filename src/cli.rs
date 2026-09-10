@@ -139,7 +139,14 @@ pub enum Commands {
     },
     /// Drop a job's state directory
     Rm {
-        id: crate::wrapper::JobId,
+        /// The job to remove. Omit with --all.
+        id: Option<crate::wrapper::JobId>,
+        /// Remove every FINISHED job, ignoring keep_days.
+        ///
+        /// Running jobs and orphans are kept: `rm` never stops work, and an
+        /// orphan is evidence rather than mud. Use `coop kill` to end a job.
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
         #[command(flatten)]
         host: HostArg,
     },
@@ -362,8 +369,32 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             crate::jobs::kill(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
             Ok(0)
         }
-        Commands::Rm { id, host } => {
-            crate::jobs::rm(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
+        Commands::Rm { id, all, host } => {
+            let host = cfg.host(host.host.as_deref())?;
+            let target = match (id, all) {
+                (Some(id), _) => crate::jobs::Target::One(id),
+                (None, true) => crate::jobs::Target::AllDone,
+                // clap cannot express "one of these is required" across a
+                // positional and a flag, so say what to do rather than
+                // printing a bare usage error.
+                (None, false) => anyhow::bail!(
+                    "name a job, or pass --all to remove every finished one\n  \
+                     coop rm <id>\n  coop rm --all"
+                ),
+            };
+            let removed = crate::jobs::remove(&Ssh, host, &target)?;
+            // Report what happened: `--all` on a clean host is silent
+            // otherwise, which reads as a failure.
+            match removed.len() {
+                0 => eprintln!("coop: nothing to remove"),
+                1 => println!("{}", removed[0]),
+                n => {
+                    for id in &removed {
+                        println!("{id}");
+                    }
+                    eprintln!("coop: removed {n} finished jobs");
+                }
+            }
             Ok(0)
         }
     }

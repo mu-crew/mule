@@ -155,6 +155,8 @@ coop run -- ls --all
 
 `coop ls` shows the last 24 hours plus anything running or orphaned; `--all` reaches further back. Logs are capped at 100MB per job (`max_log_bytes`), and a truncated log says so.
 
+`coop rm <id>` drops one job; `coop rm --all` drops every **finished** one, ignoring `keep_days`. Neither stops work: a running job is spared, and so is an orphan, which is evidence rather than clutter. `coop kill` is the only verb that ends a job.
+
 Every job verb accepts `--host`. `poll` and `wait` do not print job output; use `tail`. A one-shot `tail` prints the last **64KB** by default; use `--all` or `-n LINES` to choose another range.
 
 See [SPEC.md](SPEC.md) for measurements, invariants, failure behavior, and the local `sshd` reproduction.

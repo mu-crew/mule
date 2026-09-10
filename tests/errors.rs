@@ -142,7 +142,7 @@ fn every_job_verb_demands_a_master_with_exit_three() {
         coop::cli::poll(&down, host, &id, false).unwrap_err(),
         coop::cli::wait(&down, host, &id, None).unwrap_err(),
         coop::jobs::kill(&down, host, &id).unwrap_err(),
-        coop::jobs::rm(&down, host, &id).unwrap_err(),
+        coop::jobs::remove(&down, host, &coop::jobs::Target::One(id.clone())).unwrap_err(),
         coop::tail::once(
             &down,
             host,

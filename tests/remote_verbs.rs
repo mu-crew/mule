@@ -16,6 +16,34 @@ use std::time::{Duration, Instant};
 
 use common::sshd::Sshd;
 
+/// Serialises tests that act on ALL jobs against ones that create their own.
+///
+/// `JOBS_ROOT` is a fixed `$HOME`-relative path, so every test in this binary
+/// shares one remote jobs directory. `rm --all` is global by definition, so
+/// running it beside a test that has just dispatched a job deletes that job
+/// mid-assertion -- three unrelated tests failed in parallel while all fourteen
+/// passed serially.
+///
+/// A lock rather than per-test isolation because the sharing is real: sshd
+/// derives HOME from the user database and ignores a client-sent override
+/// (verified -- `SetEnv HOME=` has no effect even with `AcceptEnv HOME`), so
+/// there is no way to give each test its own root without teaching coop a test
+/// hook, which is worse than a mutex in the test file.
+static GLOBAL_JOBS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the exclusive lane: this test acts on every job on the host.
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_JOBS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Take a shared lane: this test creates jobs others must not delete.
+///
+/// Same mutex, so it is strictly serial rather than reader/writer. The suite is
+/// 14 tests and about 30s serial, which is not worth a more precise primitive.
+fn shared() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_JOBS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A `touch -t` stamp N days in the past.
 ///
 /// Computed, not hardcoded: a literal date silently drifts past whichever
@@ -125,6 +153,7 @@ impl Drop for Fixture {
 #[test]
 fn probe_reports_every_state_from_real_artifacts() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("probe");
 
     // Running: no rc, session alive.
@@ -165,6 +194,7 @@ fn probe_reports_every_state_from_real_artifacts() {
 #[test]
 fn probe_survives_arbitrary_log_bytes() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("bytes");
 
     // The probe reply is a header followed by raw log bytes. Log content that
@@ -198,6 +228,7 @@ fn probe_survives_arbitrary_log_bytes() {
 #[test]
 fn kill_writes_rc_137_and_destroys_the_session() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("kill");
 
     let id = f.run("sleep 60");
@@ -233,6 +264,7 @@ fn kill_writes_rc_137_and_destroys_the_session() {
 #[test]
 fn kill_never_overwrites_a_real_exit_code() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("killrace");
 
     // The job may finish between the decision to kill and the kill itself. The
@@ -254,6 +286,7 @@ fn kill_never_overwrites_a_real_exit_code() {
 #[test]
 fn ls_enumerates_real_jobs_with_their_commands() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("ls");
 
     let done = f.run("echo listed; exit 2");
@@ -287,6 +320,7 @@ fn ls_enumerates_real_jobs_with_their_commands() {
 #[test]
 fn tail_reads_offsets_and_caps_against_a_real_log() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("tail");
 
     let id = f.run("printf 'alpha\\nbeta\\ngamma\\n'");
@@ -310,6 +344,7 @@ fn tail_reads_offsets_and_caps_against_a_real_log() {
 #[test]
 fn prune_removes_finished_jobs_and_spares_running_and_orphans() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("prune");
 
     // Three states, all aged well past keep_days (14) but inside the orphan
@@ -366,6 +401,7 @@ fn prune_removes_finished_jobs_and_spares_running_and_orphans() {
 #[test]
 fn rm_drops_state_and_tolerates_a_missing_job() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("rm");
 
     let id = f.run("echo bye");
@@ -393,6 +429,7 @@ fn rm_drops_state_and_tolerates_a_missing_job() {
 #[test]
 fn a_hostile_job_id_never_reaches_the_remote_shell() {
     require_sshd!();
+    let _lane = shared();
     let f = Fixture::new("hostile");
 
     // The end-to-end proof for the injection fix: this once produced
@@ -422,6 +459,7 @@ fn a_hostile_job_id_never_reaches_the_remote_shell() {
 #[test]
 fn run_wait_prints_the_output_of_an_instant_command() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("runwait");
 
     // `coop run --wait ls` printed the id and nothing else. `rc` and `log` are
@@ -483,6 +521,7 @@ fn run_wait_prints_the_output_of_an_instant_command() {
 #[test]
 fn a_trivially_successful_job_reports_rc_zero() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("rczero");
 
     // `coop run true` reported rc 1. The wrapper ended with
@@ -503,6 +542,7 @@ fn a_trivially_successful_job_reports_rc_zero() {
 #[test]
 fn a_coop_flag_after_the_command_warns_but_still_runs() {
     require_sshd!();
+    let _lane = shared();
     let mut f = Fixture::new("flagpos");
 
     // `coop run ls --wait` sends `--wait` to `ls`, which must stay true --
@@ -557,4 +597,85 @@ fn a_coop_flag_after_the_command_warns_but_still_runs() {
             "{args:?} must not warn"
         );
     }
+}
+
+#[test]
+fn rm_all_clears_finished_jobs_and_never_stops_work() {
+    require_sshd!();
+    let _lane = exclusive();
+    let mut f = Fixture::new("rmall");
+
+    let done_a = f.run("echo a");
+    let done_b = f.run("echo b");
+    f.await_done(&done_a);
+    f.await_done(&done_b);
+    let running = f.run("sleep 300");
+    let orphan = f.run("sleep 300");
+    std::thread::sleep(Duration::from_millis(600));
+    // An orphan: session gone, no rc. Killed directly so coop writes no 137.
+    let _ = f
+        .sshd
+        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
+
+    let out = f.coop(&["rm", "--all"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let removed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        removed.contains(&done_a) && removed.contains(&done_b),
+        "{removed}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("removed 2 finished jobs"),
+        "must report the count, or a bulk delete looks like a no-op"
+    );
+
+    assert!(!f.dir_exists(&done_a));
+    assert!(!f.dir_exists(&done_b));
+    // The two invariants that make --all safe without a confirmation prompt.
+    assert!(
+        f.dir_exists(&running),
+        "rm must never stop work -- that is `kill`'s job"
+    );
+    assert!(
+        f.dir_exists(&orphan),
+        "an orphan is evidence, not mud: it has no rc and cannot be reconstructed"
+    );
+
+    // Idempotent, and says so rather than being silently empty.
+    let again = f.coop(&["rm", "--all"]);
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("nothing to remove"),
+        "a no-op must be legible"
+    );
+
+    // `kill` first, then the job is finished and `--all` reaches it.
+    let _ = f.coop(&["kill", &running]);
+    std::thread::sleep(Duration::from_millis(400));
+    let after_kill = f.coop(&["rm", "--all"]);
+    assert!(
+        String::from_utf8_lossy(&after_kill.stdout).contains(&running),
+        "a killed job is finished (rc 137) and so is removable"
+    );
+
+    let _ = f.sshd.ssh(&[&format!("rm -rf {}", f.job_dir(&orphan))]);
+}
+
+#[test]
+fn rm_with_no_target_says_what_to_do() {
+    require_sshd!();
+    let _lane = shared();
+    let f = Fixture::new("rmnoarg");
+
+    // clap cannot express "one of a positional or a flag is required", so
+    // without this the user gets a bare usage dump for a reasonable command.
+    let out = f.coop(&["rm"]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("coop rm <id>"), "{text}");
+    assert!(text.contains("coop rm --all"), "{text}");
 }
