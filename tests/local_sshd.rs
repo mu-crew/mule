@@ -336,4 +336,23 @@ fn a_missing_master_exits_three_with_the_recovery_command() {
             "{verb:?} must keep stdout clean for scripting"
         );
     }
+
+    // The two exceptions, asserted rather than trusted: "which of my hosts can
+    // I use right now" is the question these verbs answer, so a down master is
+    // their ANSWER, not their failure. Exit 3 here would make `ls` useless in
+    // exactly the situation a caller reaches for it -- and both were covered
+    // only over `Fake`, which has no process and so no exit status to check.
+    for verb in [vec!["ls"], vec!["host", "list"]] {
+        let out = sshd.coop(&config, &verb);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{verb:?} reports a down master rather than failing on it"
+        );
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.contains("ssh -MNf"),
+            "{verb:?} must still name the fix: {text}"
+        );
+    }
 }
