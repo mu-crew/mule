@@ -111,8 +111,10 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         "one token tap per",
         "ControlPersist window",
         "NON-login, NON-interactive shell",
-        "stdout and stderr are MERGED into one log",
+        "stdout and stderr are merged into one log",
         "poll and wait print NO job output",
+        "do NOT pipe your command into head or tail",
+        "coop tail <id> -n 3",
         "coop tail <id>",
         "never lent to local",
         "commands like rsync or git fetch",
@@ -230,4 +232,53 @@ fn the_master_command_is_rendered_in_one_place() {
     assert!(rendered.contains("build.example"), "{rendered}");
     assert!(rendered.contains("ControlPersist=8h"), "{rendered}");
     std::fs::remove_dir_all("/tmp/coop-render").ok();
+}
+
+#[test]
+fn every_verb_that_touches_the_log_says_the_streams_are_merged() {
+    // The top-level help is the page a reader sees once and forgets. The
+    // sentence is reused VERBATIM rather than paraphrased per verb, so an
+    // agent grepping any one of these gets the same answer -- and so three
+    // copies cannot drift into three different claims.
+    isolate_state();
+    const MERGED: &str = "merged into one log, in the order the job wrote them";
+
+    for verb in ["run", "tail", "wait", "poll"] {
+        let help = Cli::command()
+            .find_subcommand_mut(verb)
+            .expect("verb exists")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains(MERGED),
+            "`coop {verb} --help` must state the merging:\n{help}"
+        );
+        assert!(
+            help.contains("redirect inside your command"),
+            "`coop {verb} --help` must say how to separate them:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn run_help_warns_that_piping_the_command_destroys_the_exit_code() {
+    // Observed from a real agent: `coop run 'lake build 2>&1 | tail -3 && ...'`.
+    // rc becomes the pipe's, so a failed build reports 0 and the `&&` proceeds.
+    // rc is the artifact the whole design rests on, so this is silent.
+    isolate_state();
+    let help = Cli::command()
+        .find_subcommand_mut("run")
+        .expect("run exists")
+        .render_long_help()
+        .to_string();
+
+    for text in [
+        "Do NOT pipe the command into head or tail",
+        "exits 0",
+        "coop tail <id> -n 3",
+        "set -o pipefail",
+        "not portable POSIX",
+    ] {
+        assert!(help.contains(text), "run help missing {text:?}:\n{help}");
+    }
 }

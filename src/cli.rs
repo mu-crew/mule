@@ -41,9 +41,12 @@ Operational facts:
     a job; ~/.bash_profile does not run, so a version manager's `activate` has
     not happened. Put its shims dir on PATH in ~/.bashrc, or source what you
     need in the command: coop run 'source ~/.zshrc && npm test'.
-  * stdout and stderr are MERGED into one log. Redirect inside your command if
-    you need them apart.
+  * stdout and stderr are merged into one log, in the order the job wrote them;
+    redirect inside your command to separate them.
   * poll and wait print NO job output; `coop tail <id>` is the output verb.
+  * do NOT pipe your command into head or tail. `rc` becomes the pipe's, so a
+    failed build reports 0 and every `&&` after it proceeds. coop already
+    shapes the output for you: `coop tail <id> -n 3` instead of `| tail -3`.
 
 Exit status:
   0   coop operation or job succeeded
@@ -90,10 +93,28 @@ pub enum Commands {
         /// own flags go BEFORE it: `coop run --wait ls`, not
         /// `coop run ls --wait`. Use `--` when the command takes flags coop
         /// also has: `coop run -- ls --all`.
+        ///
+        /// stdout and stderr are merged into one log, in the order the job
+        /// wrote them; redirect inside your command to separate them.
+        ///
+        /// Do NOT pipe the command into head or tail to keep the log small.
+        /// `rc` becomes the pipe's -- measured: `sh -c 'echo x; exit 1' |
+        /// tail -3` exits 0 -- so a failed job reports success and any `&&`
+        /// after it runs anyway, and `rc` is the artifact coop's whole design
+        /// rests on. Let the job be the work and let coop shape the output:
+        /// `coop tail <id> -n 3`, or plain `coop tail <id>`, which already
+        /// caps the read at 64KB. If your remote sh supports it,
+        /// `set -o pipefail` keeps a genuine pipeline honest; it is not
+        /// portable POSIX, so coop does not add it for you -- the command is
+        /// yours.
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
     /// Print state, but no job output; prints nothing from the job; use coop tail <id>
+    ///
+    /// What `coop tail` gives you is one log: stdout and stderr are merged into
+    /// one log, in the order the job wrote them; redirect inside your command
+    /// to separate them.
     Poll {
         id: crate::wrapper::JobId,
         #[command(flatten)]
@@ -102,6 +123,10 @@ pub enum Commands {
         json: bool,
     },
     /// Block until done; prints nothing; use coop tail <id>
+    ///
+    /// What `coop tail` gives you is one log: stdout and stderr are merged into
+    /// one log, in the order the job wrote them; redirect inside your command
+    /// to separate them.
     Wait {
         id: crate::wrapper::JobId,
         #[command(flatten)]
@@ -110,7 +135,14 @@ pub enum Commands {
         timeout: Option<u64>,
     },
     /// Print a job's merged stdout and stderr as raw bytes
+    ///
+    /// stdout and stderr are merged into one log, in the order the job wrote
+    /// them; redirect inside your command to separate them. There is one
+    /// artifact per job on purpose: splitting it would mean two files, two
+    /// probe offsets, and a lost interleaving, to serve a case a redirect in
+    /// your own command already covers.
     Tail {
+        /// The job whose log to print.
         id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,

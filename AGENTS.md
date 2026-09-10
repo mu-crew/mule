@@ -132,6 +132,15 @@ Consequences, each of which has cost someone real debugging time:
   and shims cover that.
 - **The remote artifact is the only source of truth.** No local job index. `rc`
   is the completion signal; poll the artifact, not the process.
+- **Never pipe a job's command into `head` or `tail`.** Observed from a real
+  agent: `coop run 'lake build 2>&1 | tail -3 && ./check'`. `rc` becomes the
+  pipe's -- measured, `sh -c 'echo x; exit 1' | tail -3` exits 0 -- so a failed
+  build reports success, and the `&&` then runs the next stage against a broken
+  tree. The instinct is right (logs get big) and coop already serves it better:
+  `coop tail <id> -n 3` shapes the output, `max_log_bytes` caps the write, and a
+  one-shot `tail` caps the read at 64KB. `set -o pipefail` inside your own
+  command is the escape hatch if the remote `sh` supports it; coop does not
+  inject it, because the command belongs to the caller.
 - **coop never opens the ssh master.** `ssh -MNf` needs a TTY for a hardware
   token and cannot prompt from a background call. Exit 3 and print the command.
 - **No daemon, and no process between invocations.** This is what makes coop

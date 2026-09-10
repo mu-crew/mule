@@ -49,9 +49,15 @@ pub fn once(
 
     if truncated {
         // stderr, so it cannot corrupt `out=$(coop tail id)`.
+        // Name the merging here too. This is the ONE runtime message about the
+        // log, so it reaches a reader who never opened `--help`, and someone
+        // parsing a truncated log is exactly the reader most likely to be
+        // surprised by stderr interleaved into it.
         eprintln!(
             "coop: log was capped at {} bytes; the job ran to completion but \
-             later output was discarded",
+             later output was discarded\n  \
+             the log holds stdout and stderr merged, in the order the job \
+             wrote them; redirect inside your command to separate them",
             host.max_log_bytes
         );
     }

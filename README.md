@@ -153,7 +153,10 @@ Three details from `coop --help` matter:
   `coop run 'source ~/.zshrc && npm test'`. There is deliberately no flag for
   it — a login shell measured 83ms against a 125ms dispatch and changed nothing
   but `PATH` length.
-- Standard output and standard error share one log. Redirect inside the command when you need separate files.
+- Standard output and standard error are merged into one log, in the order the
+  job wrote them; redirect inside your command to separate them. One artifact
+  per job is deliberate: two would mean two probe offsets and a lost
+  interleaving, to serve a case a redirect already covers.
 
 coop's own flags go **before** the command, because everything after the first
 word belongs to the command: `coop run --wait ls`, not `coop run ls --wait`.
@@ -169,5 +172,33 @@ coop run -- ls --all
 `coop rm <id>` drops one job; `coop rm --all` drops every **finished** one, ignoring `keep_days`. Neither stops work: a running job is spared, and so is an orphan, which is evidence rather than clutter. `coop kill` is the only verb that ends a job.
 
 Every job verb accepts `--host`. `poll` and `wait` do not print job output; use `tail`. A one-shot `tail` prints the last **64KB** by default; use `--all` or `-n LINES` to choose another range.
+
+### Do not pipe your command into `head` or `tail`
+
+Truncating output inside the job looks thrifty and silently breaks the one
+thing coop guarantees:
+
+```sh
+coop run 'lake build 2>&1 | tail -3 && ./check'   # WRONG
+```
+
+`rc` becomes the pipe's. Measured: `sh -c 'echo x; exit 1' | tail -3` exits
+**0**, so a failed build reports success — and because `rc` is 0, the `&&`
+proceeds and `./check` runs against a broken tree. `rc` is the artifact the
+whole design rests on, so this failure is invisible everywhere a caller looks.
+
+It is also redundant. coop already bounds the log at both ends: `max_log_bytes`
+caps the write at 100MB, and a one-shot `tail` caps the read at 64KB. Let the
+job be the work and let coop shape the output:
+
+```sh
+id=$(coop run 'lake build 2>&1 && ./check')
+coop wait "$id"; coop tail "$id" -n 3
+```
+
+If you genuinely want a pipeline, `set -o pipefail` inside your command keeps
+it honest — verified working in the remote `sh` on both macOS and Linux, but
+not portable POSIX, so coop will not inject it. Changing the meaning of every
+caller's command to fix some of them is not coop's call to make.
 
 See [SPEC.md](SPEC.md) for measurements, invariants, failure behavior, and the local `sshd` reproduction.
