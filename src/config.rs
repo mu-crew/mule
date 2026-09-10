@@ -23,7 +23,8 @@ const DEFAULT_KEEP_DAYS: u32 = 14;
 /// Nothing else bounds it: a verbose build was measured writing 35MB in 5s
 /// (~400MB/min), and a runaway `while :; do echo; done` has no ceiling but the
 /// disk. Filling the disk is worse than losing output, because the failing
-/// `rc` write then leaves an `orphan` that prune deliberately never reaps.
+/// `rc` write then leaves an `orphan` holding a large log. Orphans are kept
+/// longer than finished jobs (4× `keep_days`), not forever.
 const DEFAULT_MAX_LOG_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Jobs are unbounded unless the host or caller opts into a limit. A six-hour
