@@ -265,8 +265,9 @@ pub enum Commands {
         id: Option<crate::wrapper::JobId>,
         /// Remove every FINISHED job, ignoring keep_days.
         ///
-        /// Running jobs and orphans are kept: `rm` never stops work, and an
-        /// orphan is evidence rather than mud. Use `coop kill` to end a job.
+        /// Running jobs and orphans are kept: `--all` never stops work, and an
+        /// orphan is evidence rather than mud. Use `coop rm <id>` or `coop kill`
+        /// to end a named job.
         #[arg(long, conflicts_with = "id")]
         all: bool,
         #[command(flatten)]

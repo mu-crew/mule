@@ -219,7 +219,7 @@ Its default filter is **time-based, not state-based**: everything from the last 
 
 `max_running` is advisory. Dispatch counts sessions in the same round trip and warns after starting a job when the count exceeds the configured cap. A preflight count would double the round trips for a warning that does not block work.
 
-`rm` takes either a job id or `--all`, which removes every finished job while ignoring `keep_days`. It never stops work: a running job is spared, and so is an orphan, since an orphan has no `rc` and is the one state that cannot be reconstructed. `kill` is the only verb that ends a job, which is what makes `--all` safe without a confirmation prompt.
+`rm <id>` ends that job if it is still running, then removes its state directory. `rm --all` removes every finished job while ignoring `keep_days`. `--all` never stops work: a running job is spared, and so is an orphan, since an orphan has no `rc` and is the one state that cannot be reconstructed. That is what makes `--all` safe without a confirmation prompt. `kill` records **137** and keeps state; `kill --rm` ends and discards in one round trip.
 
 `run` prunes in the round trip it is already making, over two horizons. Finished jobs go after `keep_days`, default **14**. Orphans go after four times that, because an orphan is evidence — the host rebooted, or something killed the session — and since `kill` writes rc 137 it means strictly "not coop's doing". Running jobs are never pruned.
 

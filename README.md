@@ -176,7 +176,7 @@ distinguish it from an ordinary failure. This is separate from
 `coop wait --timeout S`, which only stops the local wait and leaves the job
 running.
 
-`coop rm <id>` drops one job; `coop rm --all` drops every **finished** one, ignoring `keep_days`. Neither stops work: a running job is spared, and so is an orphan, which is evidence rather than clutter. `coop kill` is the only verb that ends a job.
+`coop rm <id>` ends that job if it is still running, then removes its state. `coop rm --all` removes every **finished** job, ignoring `keep_days`, and leaves running jobs and orphans alone. Prefer `coop kill` when you want the exit code recorded as **137** without dropping state; use `kill --rm` to end and discard in one trip.
 
 Every job verb accepts `--host`. `poll` and `wait` do not print job output; use `tail`. A one-shot `tail` prints the last **64KB** by default; use `--all` or `-n LINES` to choose another range.
 

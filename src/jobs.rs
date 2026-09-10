@@ -231,11 +231,11 @@ pub enum Target {
     One(JobId),
     /// Every finished job, ignoring `keep_days`.
     ///
-    /// Deliberately NOT "everything": `rm` never stops work. A running job is
-    /// spared, and so is an orphan -- it has no `rc`, and it is the one state
-    /// that cannot be reconstructed, so it is evidence rather than mud. `kill`
-    /// is the only verb that ends a job, which is what makes `--all` safe
-    /// enough to need no confirmation.
+    /// Deliberately NOT "everything": `--all` never stops work. A running job
+    /// is spared, and so is an orphan -- it has no `rc`, and it is the one
+    /// state that cannot be reconstructed, so it is evidence rather than mud.
+    /// That is what makes `--all` safe enough to need no confirmation. `rm
+    /// <id>` ends the named job; only this bulk path is non-destructive.
     AllDone,
 }
 
