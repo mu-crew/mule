@@ -317,6 +317,54 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
 }
 
 #[test]
+fn dispatch_preserves_command_argument_boundaries() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "command-args");
+    let config = sshd.write_config(&tmux.name);
+    let cases = [
+        (
+            &["printf", "[%s]", "a b", "c"][..],
+            "[a b][c]",
+            "'printf' '[%s]' 'a b' 'c'",
+        ),
+        (
+            &["printf", "[%s]", "", "x"][..],
+            "[][x]",
+            "'printf' '[%s]' '' 'x'",
+        ),
+    ];
+    let mut ids = Vec::new();
+
+    for (args, expected_log, expected_cmd) in cases {
+        let mut run_args = vec!["run", "--wait"];
+        run_args.extend_from_slice(args);
+        let output = sshd.coop(&config, &run_args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (id, log) = stdout
+            .split_once('\n')
+            .expect("run --wait must print the id before the log");
+        assert_eq!(
+            log, expected_log,
+            "arguments must reach the remote shell intact"
+        );
+
+        let recorded = sshd.ssh(&["cat", &format!("$XDG_STATE_HOME/coop/jobs/{id}/cmd")]);
+        assert!(recorded.status.success());
+        assert_eq!(String::from_utf8_lossy(&recorded.stdout), expected_cmd);
+        ids.push(id.to_string());
+    }
+
+    clean_jobs(&sshd, &ids);
+}
+
+#[test]
 fn dispatch_returns_before_the_job_finishes() {
     require_sshd!();
     let sshd = Sshd::start();

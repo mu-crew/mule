@@ -597,7 +597,7 @@ fn a_coop_flag_after_the_command_warns_but_still_runs() {
 
     // The command really did receive it, so the warning is accurate.
     f.await_done(&id);
-    assert_eq!(f.artifact(&id, "cmd").trim(), "echo hi --wait");
+    assert_eq!(f.artifact(&id, "cmd").trim(), "'echo' 'hi' '--wait'");
 
     // `--` is the caller asserting the flags are the command's, so it silences
     // the warning. Without this the escape hatch would nag on every use.

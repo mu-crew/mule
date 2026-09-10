@@ -642,7 +642,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             if !std::env::args().any(|a| a == "--") {
                 warn_about_swallowed_flags(&cmd);
             }
-            match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref(), max_secs) {
+            let command = command_from_args(&cmd);
+            match crate::run::dispatch(&Ssh, host, &command, cwd.as_deref(), max_secs) {
                 Ok(id) => {
                     println!("{id}");
                     std::io::stdout().flush()?;
@@ -938,6 +939,21 @@ fn print_jobs(
     }
 }
 
+/// Preserve the two documented command forms: one argument is a shell string;
+/// multiple arguments are an argv-style command whose boundaries must survive
+/// the remote shell. The local shell has already removed the caller's quoting,
+/// so joining with spaces cannot distinguish `"a b"` from `a b`.
+fn command_from_args(args: &[String]) -> String {
+    match args {
+        [command] => command.clone(),
+        _ => args
+            .iter()
+            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// Warn when the command contains something that looks like a coop flag.
 ///
 /// `run` takes the command as trailing arguments, so `coop run ls --wait` sends
@@ -979,7 +995,7 @@ fn warn_about_swallowed_flags(cmd: &[String]) {
     );
     eprintln!(
         "  to silence this, separate them explicitly: coop run -- {}",
-        cmd.join(" ")
+        command_from_args(cmd)
     );
 }
 
@@ -1009,7 +1025,7 @@ fn display_command(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_command, host_info};
+    use super::{command_from_args, display_command, host_info};
     use crate::config::Config;
     use crate::transport::{Fake, Output};
 
@@ -1023,6 +1039,24 @@ mod tests {
         host_info(&cfg, &fake, None, true).unwrap();
 
         assert_eq!(fake.scripts().len(), 2);
+    }
+
+    #[test]
+    fn command_arguments_are_shell_quoted_without_changing_shell_strings() {
+        assert_eq!(
+            command_from_args(&["printf '[%s]' 'a b' c; echo".into()]),
+            "printf '[%s]' 'a b' c; echo"
+        );
+        assert_eq!(
+            command_from_args(&[
+                "printf".into(),
+                "[%s]".into(),
+                "a b".into(),
+                "".into(),
+                "it's".into(),
+            ]),
+            "'printf' '[%s]' 'a b' '' 'it'\\''s'"
+        );
     }
 
     #[test]
