@@ -20,23 +20,83 @@ done
 
 ## Why a plain SSH command fails
 
-`ssh host command` holds a session channel for the command's lifetime. With `MaxSessions 1`, five concurrent calls produced **1 success out of 5** without a gate and **5 out of 5** with a gate. A refused channel can appear as `Permission denied (keyboard-interactive)`, even though the credentials are valid.
+One connection to the host carries one session channel. A long command holds it
+for its whole run, and everything else is refused:
 
-Coop uses its own `ControlPath`, serializes every channel-opening call, and detaches the job before returning. Other tools use other connections, so neither side takes the other's session slot.
+```
+  your machine                        host (MaxSessions 1)
+  +--------------+                    +----------------------+
+  | ssh host make|===================>| make        (12 min) |
+  | git fetch    |--X refused         |                      |
+  | rsync        |--X refused         | one channel, in use  |
+  | collector    |--X refused         |                      |
+  +--------------+                    +----------------------+
+
+  the refusal reads as: Permission denied (keyboard-interactive)
+  which is about sessions, not credentials
+```
+
+Measured with `MaxSessions 1`: five concurrent calls produced **1 success out of
+5** ungated, **5 out of 5** gated.
+
+coop opens a *second* connection on its own `ControlPath` and uses it only for
+sub-second calls -- dispatch the job detached, then read the artifacts it leaves
+behind. The channel is free again before the work starts, and other tools are on
+other connections, so neither side takes the other's slot.
+
+```
+  your machine                        host (MaxSessions 1)
+  +--------------+                    +----------------------+
+  | coop run make|--- 125ms --------->| tmux -> make (12 min)|
+  |              |<-- job id ---------|          |           |
+  | git fetch    |===================>|          v           |
+  | rsync        |===================>|   log, rc on disk    |
+  | collector    |===================>|          |           |
+  | coop wait id |--- 125ms --------->|<---------+  reads rc |
+  +--------------+                    +----------------------+
+
+  ---> coop's own connection    ===> everyone else's, uncontended
+```
 
 ## Which jobs belong here
 
-Dispatch costs about **125ms**, against **33ms** for a bare `ssh` over an existing master. Route a command through coop when its **duration** is the problem, not when its frequency is.
+A job runs **on the host**, detached, with no terminal and no route back to you.
+That decides the fit, not the program:
+
+```
+  coop run 'rsync /data/a/ /data/b/'          OK   both ends on the host
+  coop run 'rsync /data/ other-host:/data/'   OK   host to a third machine
+  coop run 'rsync /data/ your-laptop:/data/'  NO   needs a route back to you
+  rsync host:/data/ ~/local/                  NO   not a job: one end is here
+```
+
+The last two are the same mistake. A job cannot reach the machine that
+dispatched it, because a laptop behind NAT has no inbound route -- which is why
+collection is always orchestrator-pull. Give `rsync`, `scp` and `git push` their
+own control master on their own `ControlPath`: two masters were measured
+carrying traffic concurrently, so they take nothing from coop and coop takes
+nothing from them.
+
+Dispatch costs about **125ms**, against **33ms** for a bare `ssh` over an
+existing master.
 
 | Command | Use coop? |
 | --- | --- |
-| Test suite, build, long rsync | Yes. Minutes of held channel starves every other tool. |
-| Anything you want to survive a dropped connection | Yes. That is the only way to get an exit code back later. |
+| Test suite, build, long-running script | Yes. Minutes of held channel starves every other tool. |
+| Anything that must survive a dropped connection | Yes. That is the only way to get an exit code back later. |
 | Several long commands at once | Yes. Ungated, 1 of 5 concurrent calls succeeded. |
+| A transfer between the host and a *third* machine | Yes. Both endpoints are remote. |
 | `git rev-parse`, a status poll, a state collector | No. Already sub-second, so 125ms buys nothing. |
+| A transfer to or from *this* machine | No. A job cannot reach its dispatcher. |
 | A command needing a live terminal | No. Jobs are detached and read no input. |
 
-Rough threshold: **under a second, do not bother; over ten seconds, do.** Frequent short calls are better served by retrying on a refused channel, which is cheap and idempotent, than by paying dispatch each time.
+**Threshold: roughly one second.** The cost of a long call is not paid by you --
+it is paid by every other tool that needs the channel while you hold it. So the
+question is not "is 125ms of dispatch worth it to me" but "how long am I willing
+to break `git fetch` for". One second is already a long outage.
+
+Below that, a direct call is cheaper, and a refused channel on a short
+idempotent command is better retried than routed around.
 
 ## Install and configure
 

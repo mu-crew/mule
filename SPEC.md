@@ -269,9 +269,13 @@ Dispatch costs ~125ms against ~33ms for a bare `ssh` over an existing master, so
 
 - **Worth it:** anything holding the channel for a noticeable time — a test suite, a build, a large transfer — anything that must survive a dropped connection, and any group of long commands that would otherwise contend.
 - **Not worth it:** sub-second commands such as a `rev-parse`, a status poll, or a state collector. There is no long hold to remove, so the 125ms is pure cost. A refused channel on a cheap idempotent command is better retried than routed around.
-- **Impossible:** anything needing a live terminal. Jobs are detached and read no input.
+- **Impossible:** anything needing a live terminal, and anything with an endpoint on the calling machine.
 
-Rough threshold: under a second, do not bother; over ten seconds, do.
+The endpoint rule is about topology, not about which program runs. A transfer whose endpoints are both remote — one host directory to another, or the host to a third machine — is an ordinary job. The same command aimed back at the dispatcher is not, because a job cannot reach the machine that dispatched it: a laptop behind NAT has no inbound route, which is also why collection is always orchestrator-pull. So `rsync host:/data ~/local` is not a job at all, and `coop run 'rsync /data host2:/data'` is a perfectly good one.
+
+**Threshold: roughly one second**, and the reasoning matters more than the number. Holding a capped channel is an externality: the cost falls on `git fetch`, a collector, a transfer — never on the caller doing the holding. Judging by whether 125ms of overhead feels worth it is therefore the wrong test and yields thresholds far too generous; an earlier draft of this section said ten seconds, which is ten times longer than anything else on the host should be made to wait. The right question is how long the rest of the host may be broken.
+
+Below a second, a direct call is cheaper and a refused channel is better retried than routed around.
 
 ## Rejected alternatives
 
