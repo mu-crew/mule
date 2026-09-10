@@ -18,7 +18,6 @@ pub struct Row {
     pub id: String,
     pub host: String,
     pub state: State,
-    pub rc: Option<i32>,
     pub age_secs: u64,
     pub cmd: String,
 }
@@ -178,7 +177,6 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
                 id: id.into(),
                 host: host.name.clone(),
                 state,
-                rc,
                 age_secs,
                 cmd,
             });

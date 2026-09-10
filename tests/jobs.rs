@@ -7,6 +7,9 @@ use coop::jobs::{kill, list, list_with_hidden, prune};
 use coop::probe::State;
 use coop::transport::{Fake, Output, Transport};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -33,6 +36,52 @@ fn host() -> Host {
 }
 
 #[test]
+fn ls_json_is_stable_for_every_job_state() {
+    let dir = std::env::temp_dir().join(format!(
+        "coop-jobs-json-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        "[hosts.dev]\ntarget = \"dev\"\nsocket = \"/tmp/coop.sock\"\n",
+    )
+    .unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) exit 0;; esac\nprintf 'abc123\\t12\\t\\t1\\t6563686f206869\\ndef456\\t34\\t9\\t0\\t66616c7365\\nfed987\\t56\\t\\t0\\t74727565\\n'\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["ls", "--json"])
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"{\"items\":[{\"id\":\"abc123\",\"host\":\"dev\",\"state\":\"running\",\"rc\":null,\"age_secs\":12,\"cmd\":\"echo hi\"},{\"id\":\"def456\",\"host\":\"dev\",\"state\":\"done\",\"rc\":9,\"age_secs\":34,\"cmd\":\"false\"},{\"id\":\"fed987\",\"host\":\"dev\",\"state\":\"orphan\",\"rc\":null,\"age_secs\":56,\"cmd\":\"true\"}],\"unreachable\":[]}\n"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     let fake = Fake::new();
     // ages in seconds: running/12s, done/34s, orphan/56s. `cmd` is hex, matching
@@ -54,11 +103,9 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     assert_eq!(rows[0].id, "abc123");
     assert_eq!(rows[0].host, "dev");
     assert_eq!(rows[0].state, State::Running);
-    assert_eq!(rows[0].rc, None);
     assert_eq!(rows[0].age_secs, 12);
     assert_eq!(rows[0].cmd, "echo hi");
     assert_eq!(rows[1].state, State::Done(9));
-    assert_eq!(rows[1].rc, Some(9));
     assert_eq!(rows[1].cmd, "false");
     assert_eq!(rows[2].state, State::Orphan);
     assert_eq!(rows[2].cmd, "true");
