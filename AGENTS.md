@@ -118,9 +118,13 @@ Consequences, each of which has cost someone real debugging time:
 - **User commands are base64-encoded**, never interpolated. They cross three
   expansion layers (ssh's shell, tmux's argument, `sh -c`) plus coop's appended
   redirect.
-- **Jobs get a non-login, non-interactive shell.** No sourcing remote dotfiles:
-  that would make every job depend on the host's config, and the failure mode is
-  "works when I ssh in, fails under coop".
+- **Jobs get a non-login, non-interactive shell.** Do not add a flag to source
+  login files: that would make a job depend on the host's config, and the
+  failure mode is "works when I ssh in, fails under coop". Measured and
+  rejected — see SPEC.md § Sourcing login files is out of scope. Note bash does
+  source `~/.bashrc` over ssh, so a `PATH` set there already reaches jobs; what
+  is missing is only `.bash_profile`, i.e. an environment manager's `activate`,
+  and shims cover that.
 - **The remote artifact is the only source of truth.** No local job index. `rc`
   is the completion signal; poll the artifact, not the process.
 - **coop never opens the ssh master.** `ssh -MNf` needs a TTY for a hardware

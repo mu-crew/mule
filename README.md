@@ -141,7 +141,18 @@ Exit 3 is a distinct code so that a script can recognise this one case and escal
 Three details from `coop --help` matter:
 
 - Coop never opens the SSH master because a background call cannot handle a hardware-token prompt.
-- Jobs use a non-login, non-interactive shell. Source environment setup in the command when needed.
+- Jobs use a non-login, non-interactive shell, so login profiles do not run and
+  a job cannot depend on your dotfiles. Bash is a partial exception: it sources
+  `~/.bashrc` even for a non-interactive command over ssh, so a `PATH` set
+  there does reach a job. `.bash_profile` — where an environment manager's
+  `activate` usually lives — does not run.
+
+  In practice that is enough: put your version manager's shims directory on
+  `PATH` in `.bashrc` and jobs resolve the same tool versions a login shell
+  would. If you need activation itself, ask for it in the command:
+  `coop run 'source ~/.zshrc && npm test'`. There is deliberately no flag for
+  it — a login shell measured 83ms against a 125ms dispatch and changed nothing
+  but `PATH` length.
 - Standard output and standard error share one log. Redirect inside the command when you need separate files.
 
 coop's own flags go **before** the command, because everything after the first

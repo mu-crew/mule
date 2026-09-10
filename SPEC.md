@@ -91,7 +91,25 @@ Both the command and a user-supplied working directory are base64-encoded. They 
 
 ## Shell and working directory
 
-Jobs use a non-login, non-interactive shell. Remote profile files do not run, so commands do not inherit tools added to `PATH` by those files. This avoids host-specific behavior where an interactive command works but a dispatched command fails.
+Jobs use a non-login, non-interactive shell, so login profiles do not run. A command therefore does not inherit whatever an interactive session would have set up, which is what stops a job depending on a host's dotfiles: an irreproducible job fails as "works when I ssh in, fails under coop", and the person debugging it is rarely the person who edited the dotfile.
+
+**Bash is a partial exception, and it matters in practice.** Bash sources `~/.bashrc` even for a non-interactive command when its input is a network connection — the historical rshd/sshd case. So a `PATH` set in `.bashrc`, above that file's usual interactive bail-out, does reach a job. What does *not* run is `.bash_profile`, which is where an environment manager's `activate` normally lives.
+
+That distinction is the whole of it, and it is usually enough. Measured on a host using `mise`: with the shims directory added to `PATH` in `.bashrc`, a job resolved `node`, `cargo`, `npm`, `python3` and `git` at the same versions a login shell gave. Shims exist precisely so activation is not required.
+
+### Sourcing login files is out of scope
+
+Considered and rejected: a config key or flag to run jobs under a login or interactive shell, for the full environment.
+
+Measured per invocation on a real host: `sh -c` **1ms**, `bash -ic` **58ms**, `bash -lc` **83ms**, `zsh -ic` **97ms**. Against a ~125ms dispatch, a login shell is a ~65% increase on the operation this design exists to keep short — and it bought nothing on the host tested, because every tool already resolved through shims. The only observable difference was `PATH` length and shim-versus-activated paths, at identical versions.
+
+A caller who genuinely needs activation can ask for it, explicitly and visibly in `coop ls`:
+
+```sh
+coop run 'source ~/.zshrc && npm test'
+```
+
+A finer-grained key — "bash plus this one manager" — is worse still: it is a small environment DSL inside a dispatcher, and the managers already answer it with shims. If a host ever proves it needs this, the honest shape is one opaque `shell` key holding the command to run, not a boolean and not a list of managers. Adding it before a host demands it would mean building, testing and maintaining a key nobody asked for.
 
 `run --cwd <dir>` sets the working directory. Otherwise coop uses the host's `default_cwd`, then the remote home directory. A failed `cd` fails the job instead of running in the wrong directory. Callers that need an environment manager must source it in the command.
 
@@ -328,9 +346,9 @@ The lock protects sub-second SSH operations, while jobs run concurrently outside
 
 A hardware-token prompt needs a terminal. Coop cannot open the master reliably from a background call, so it prints the command instead.
 
-### Use a login shell
+### Use a login shell, or add a flag for one
 
-Remote dotfiles would make job behavior depend on interactive host configuration. Commands must source any required environment explicitly.
+Remote dotfiles would make job behaviour depend on interactive host configuration. Measured at 83ms per invocation against a ~125ms dispatch, and it changed nothing on the host tested. See § Sourcing login files is out of scope for the numbers and the alternative.
 
 ### Quote commands through every shell layer
 

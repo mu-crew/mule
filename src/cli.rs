@@ -36,8 +36,11 @@ Operational facts:
     operator to run the printed command. Do not retry, do not run `ssh -MNf`
     yourself, and do not fall back to `ssh host command` -- that holds a session
     channel for the whole job, which is the failure coop exists to remove.
-  * jobs run in a NON-login, NON-interactive shell: no ~/.profile, so no nvm or
-    cargo on PATH unless your command sources it.
+  * jobs run in a NON-login, NON-interactive shell, so login profiles do not
+    run. Bash still sources ~/.bashrc over ssh, so a PATH set there does reach
+    a job; ~/.bash_profile does not run, so a version manager's `activate` has
+    not happened. Put its shims dir on PATH in ~/.bashrc, or source what you
+    need in the command: coop run 'source ~/.zshrc && npm test'.
   * stdout and stderr are MERGED into one log. Redirect inside your command if
     you need them apart.
   * poll and wait print NO job output; `coop tail <id>` is the output verb.
