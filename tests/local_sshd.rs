@@ -331,7 +331,18 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     let tmux = Tmux::new(&sshd, "job-fast");
     let config = sshd.write_config(&tmux.name);
 
-    let out = sshd.coop(&config, &["run", "--max-secs", "2", "exit 7"]);
+    // The cap must be long enough that DISPATCH cannot outlast it. At
+    // `--max-secs 2` this test failed intermittently inside its own file with
+    // `orphan` instead of rc 7: under a parallel suite the round trip alone
+    // exceeded two seconds, so the watchdog killed the job before `exit 7`
+    // ever ran. That is the machine, not the watchdog -- the property here is
+    // "a job finishing inside its cap is untouched", and a cap the harness
+    // itself can breach tests the harness instead.
+    const CAP_SECS: u64 = 5;
+    let out = sshd.coop(
+        &config,
+        &["run", "--max-secs", &CAP_SECS.to_string(), "exit 7"],
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -346,10 +357,23 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     }
     assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "7");
 
-    // Wait beyond the original cap: a surviving watchdog would overwrite the
-    // rc or recreate timeout state after the command had already finished.
-    std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "7");
+    // Now outlive the cap. This is the assertion the test exists for, and it
+    // cannot be replaced by checking that the watchdog session is gone: the
+    // watchdog exits on its own once `sleep` returns, so its absence AFTER the
+    // cap is equally true whether or not cancellation works. Verified by
+    // deleting the `kill-session` cancel from dispatch_script -- an absence
+    // check still passed, this one is what fails.
+    //
+    // Deliberately a short cap despite the dispatch race above: the wait has
+    // to outlast the cap, so a 20s cap would mean a 20s test. 5s is the
+    // smallest value that comfortably clears a loaded dispatch.
+    std::thread::sleep(Duration::from_secs(CAP_SECS + 2));
+    assert_eq!(
+        stdout(&sshd.coop(&config, &["poll", &id])),
+        "7",
+        "the watchdog fired after the command had already finished and \
+         overwrote its rc"
+    );
     let sessions = sshd.ssh(&[
         "tmux",
         "-L",
