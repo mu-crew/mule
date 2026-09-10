@@ -230,6 +230,13 @@ pub enum Commands {
         /// Emit machine-readable rows with complete, unmodified commands
         #[arg(long)]
         json: bool,
+        /// Print each command in full instead of truncating it to fit one line
+        ///
+        /// The table shortens a long command so one job stays one scannable
+        /// row. This prints the whole thing, for reading rather than
+        /// scanning; `--json` remains the machine surface.
+        #[arg(long, conflicts_with = "json")]
+        full: bool,
     },
     /// Kill a running job
     Kill {
@@ -736,10 +743,15 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Ok(0)
             }
         }
-        Commands::Ls { host, all, json } => {
+        Commands::Ls {
+            host,
+            all,
+            json,
+            full,
+        } => {
             let (rows, unreachable, hidden) =
                 crate::jobs::list_with_hidden(&cfg, &Ssh, host.host.as_deref(), all)?;
-            print_jobs(&rows, &unreachable, hidden, json, quiet);
+            print_jobs(&rows, &unreachable, hidden, json, full, quiet);
             Ok(0)
         }
         Commands::Kill { id, host } => {
@@ -837,6 +849,7 @@ fn print_jobs(
     unreachable: &[crate::jobs::Unreachable],
     hidden: usize,
     json: bool,
+    full: bool,
     quiet: bool,
 ) {
     for host in unreachable {
@@ -923,7 +936,11 @@ fn print_jobs(
                     state.to_string(),
                     rc,
                     format_age(row.age_secs),
-                    display_command(&row.cmd),
+                    if full {
+                        collapse_whitespace(&row.cmd)
+                    } else {
+                        display_command(&row.cmd)
+                    },
                 ]
             })
             .collect::<Vec<_>>(),
@@ -1013,7 +1030,7 @@ fn format_age(secs: u64) -> String {
 fn display_command(command: &str) -> String {
     const WIDTH: usize = 80;
 
-    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapse_whitespace(command);
     if collapsed.chars().count() <= WIDTH {
         return collapsed;
     }
@@ -1021,9 +1038,18 @@ fn display_command(command: &str) -> String {
     collapsed.chars().take(WIDTH - 1).chain(['…']).collect()
 }
 
+/// Whitespace collapsed, but nothing dropped.
+///
+/// Newlines and tabs still cannot reach the table -- an embedded newline would
+/// break one job across several rows that look like separate jobs -- but the
+/// text itself is complete. This is what `--full` prints.
+fn collapse_whitespace(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{command_from_args, display_command, host_info};
+    use super::{collapse_whitespace, command_from_args, display_command, host_info};
     use crate::config::Config;
     use crate::transport::{Fake, Output};
 
@@ -1074,5 +1100,31 @@ mod tests {
     fn display_command_collapses_whitespace() {
         assert_eq!(display_command("one\n\ttwo   three"), "one two three");
         assert_eq!(display_command(""), "");
+    }
+
+    /// `--full` exists so a person can read a long command without JSON.
+    ///
+    /// The table truncates at 80 characters so one job stays one scannable
+    /// row, which is right for scanning and wrong for "what did this actually
+    /// run". Before this, the only way to recover the text was `--json`, so a
+    /// human debugging their own command had to pipe coop through a parser.
+    ///
+    /// Both paths still collapse whitespace: an embedded newline would split
+    /// one job across rows that look like separate jobs. `--full` keeps every
+    /// character, it does not keep the layout.
+    #[test]
+    fn full_keeps_the_whole_command_while_the_default_truncates() {
+        let long = format!("echo {}", "x".repeat(120));
+
+        let truncated = display_command(&long);
+        assert!(truncated.ends_with('\u{2026}'), "{truncated:?}");
+        assert_eq!(truncated.chars().count(), 80);
+
+        let complete = collapse_whitespace(&long);
+        assert_eq!(complete, long, "--full must not drop anything");
+        assert!(!complete.contains('\u{2026}'));
+
+        // Whitespace still collapses on the full path.
+        assert_eq!(collapse_whitespace("a\n\tb  c"), "a b c");
     }
 }
