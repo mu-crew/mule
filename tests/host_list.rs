@@ -157,3 +157,116 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
         assert!(flat.contains("ProxyCommand=none"), "{flat}");
     }
 }
+
+/// Every human table coop prints has a header and aligned columns.
+///
+/// `host list` had neither: it printed bare rows, so a reader had to know that
+/// the second field was master state and the fourth a socket path. And
+/// `host info` printed a FIXED-WIDTH header over unpadded rows, so the two
+/// disagreed about where each column began as soon as a value was wider than
+/// its title -- which is every real hostname.
+///
+/// `coop ls` had already solved this with one width-measuring renderer. This
+/// asserts the other two use it too.
+#[test]
+fn human_tables_have_a_header_with_aligned_columns() {
+    let dir = std::env::temp_dir().join(format!("coop-table-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    // A short name beside a long one: the long row is what exposes a
+    // fixed-width header.
+    std::fs::write(
+        &config,
+        "[hosts.a]\ntarget = \"short\"\n\
+         [hosts.a-much-longer-name]\ntarget = \"a-considerably-longer-target\"\n",
+    )
+    .unwrap();
+
+    // Start of each whitespace-separated column, so a header and a row can be
+    // compared without knowing the widths.
+    fn starts(line: &str) -> Vec<usize> {
+        line.char_indices()
+            .filter(|(i, c)| *c != ' ' && (*i == 0 || line.as_bytes()[i - 1] == b' '))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    for verb in [vec!["host", "list"], vec!["host", "info"]] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+            .arg("--config")
+            .arg(&config)
+            .args(&verb)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+
+        let header = lines
+            .next()
+            .unwrap_or_else(|| panic!("{verb:?} printed no header"));
+        assert!(
+            header.starts_with("NAME"),
+            "{verb:?} must lead with a NAME column: {header:?}"
+        );
+        for column in ["MASTER", "TARGET"] {
+            assert!(
+                header.contains(column),
+                "{verb:?} header must name {column}: {header:?}"
+            );
+        }
+
+        let want = starts(header);
+        for row in lines {
+            assert_eq!(
+                starts(row),
+                want,
+                "{verb:?} column starts must match the header\n  header: {header:?}\n  row:    {row:?}"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A next-step hint offers the surface the caller actually used.
+///
+/// `host list` hardcoded `--json`, so a human who had just read a table was
+/// told to run the machine format. The verb is the same either way; only the
+/// rendering differs, and the hint should follow the caller.
+#[test]
+fn the_host_list_hint_matches_the_callers_surface() {
+    let dir = std::env::temp_dir().join(format!("coop-hint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[hosts.dev]\ntarget = \"h\"\n").unwrap();
+
+    let run = |args: &[&str]| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+
+    let table = run(&["host", "list"]);
+    assert!(
+        table.contains("next: coop host info for"),
+        "a table reader gets the table form: {table:?}"
+    );
+
+    let json = run(&["host", "list", "--json"]);
+    assert!(
+        json.contains("next: coop host info --json for"),
+        "a JSON reader gets the JSON form: {json:?}"
+    );
+
+    // --quiet still silences both.
+    assert!(
+        !run(&["--quiet", "host", "list"]).contains("next:"),
+        "--quiet must suppress the hint"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

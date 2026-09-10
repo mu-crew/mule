@@ -664,8 +664,11 @@ fn host_info_probes_real_capabilities_and_reports_a_down_master() {
 
     let list = sshd.coop(&config, &["host", "list"]);
     assert!(list.status.success());
+    // The hint names the verb, in the surface the caller asked for -- a table
+    // reader gets the table form. `--json` is asserted against `host list
+    // --json` in tests/host_list.rs, where both branches are covered.
     assert!(
-        String::from_utf8_lossy(&list.stderr).contains("coop host info --json"),
+        String::from_utf8_lossy(&list.stderr).contains("coop host info"),
         "host list must point agents at the opt-in probe"
     );
 

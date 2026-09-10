@@ -328,17 +328,20 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    let name_w = rows.iter().map(|(h, _)| h.name.len()).max().unwrap_or(4);
-    let target_w = rows.iter().map(|(h, _)| h.target.len()).max().unwrap_or(6);
-    for (h, up) in &rows {
-        println!(
-            "{:<name_w$}  {:<4}  {:<target_w$}  {}",
-            h.name,
-            if *up { "up" } else { "down" },
-            h.target,
-            h.socket.display(),
-        );
-    }
+    print_table(
+        &["NAME", "MASTER", "TARGET", "SOCKET"],
+        &rows
+            .iter()
+            .map(|(h, up)| {
+                vec![
+                    h.name.clone(),
+                    if *up { "up" } else { "down" }.to_string(),
+                    h.target.clone(),
+                    h.socket.display().to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
     if rows.iter().any(|(_, up)| !up) {
         eprintln!(
             "\nsome hosts have no control master. coop cannot open one \
@@ -438,23 +441,71 @@ fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: b
         return Ok(());
     }
 
-    println!("NAME  MASTER  OS  ARCH  CORES  RAM  GPU  TARGET");
-    for row in &rows {
-        println!(
-            "{}  {}  {}  {}  {}  {}  {}  {}",
-            row.host.name,
-            if row.master { "up" } else { "down" },
-            row.os,
-            row.arch,
-            row.cores
-                .map_or_else(|| "unknown".into(), |n| n.to_string()),
-            row.ram_gb
-                .map_or_else(|| "unknown".into(), |n| format!("{n}GB")),
-            row.gpu,
-            row.host.target,
-        );
-    }
+    print_table(
+        &[
+            "NAME", "MASTER", "OS", "ARCH", "CORES", "RAM", "GPU", "TARGET",
+        ],
+        &rows
+            .iter()
+            .map(|row| {
+                vec![
+                    row.host.name.clone(),
+                    if row.master { "up" } else { "down" }.to_string(),
+                    row.os.clone(),
+                    row.arch.clone(),
+                    row.cores
+                        .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    row.ram_gb
+                        .map_or_else(|| "unknown".into(), |n| format!("{n}GB")),
+                    row.gpu.clone(),
+                    row.host.target.clone(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
     Ok(())
+}
+
+/// One aligned table with a header, for every human-readable listing.
+///
+/// There were three renderers and two of them were wrong: `host list` printed
+/// bare rows with no header, so the reader had to know that field two was the
+/// master state, and `host info` printed a FIXED-WIDTH header over unpadded
+/// rows -- so the header and the data disagreed about where a column began as
+/// soon as a value was wider than its title, which is every real hostname.
+/// `ls` was the only correct one, and this is its logic, shared.
+///
+/// The last column is never padded, so it can run long without trailing
+/// whitespace on every line. Widths count CHARACTERS, not bytes: a command or
+/// a hostname can be non-ASCII, and byte widths would misalign it.
+fn print_table(head: &[&str], rows: &[Vec<String>]) {
+    let mut width: Vec<usize> = head.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (w, cell) in width.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+
+    let render = |cells: &[String]| {
+        let last = cells.len().saturating_sub(1);
+        let mut line = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i == last {
+                line.push_str(cell);
+            } else {
+                line.push_str(&format!("{cell:<width$}  ", width = width[i]));
+            }
+        }
+        line
+    };
+
+    println!(
+        "{}",
+        render(&head.iter().map(|h| (*h).to_string()).collect::<Vec<_>>())
+    );
+    for row in rows {
+        println!("{}", render(row));
+    }
 }
 
 /// One portable best-effort script. Every platform-specific command falls
@@ -637,7 +688,16 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Host(HostCmd::List { json }) => {
             host_list(&cfg, &Ssh, json)?;
             if !quiet {
-                eprintln!("next: coop host info --json for OS, cores, RAM, and GPU");
+                // Mirror the surface the caller actually asked for. Handing
+                // `--json` to someone who just read a table gives a human a
+                // machine format, and dropping it for someone parsing JSON
+                // gives a parser a table. Same verb either way.
+                let next = if json {
+                    "coop host info --json"
+                } else {
+                    "coop host info"
+                };
+                eprintln!("next: {next} for OS, cores, RAM, and GPU");
             }
             Ok(0)
         }
@@ -846,48 +906,29 @@ fn print_jobs(
     // the reader counting fields to work out which number was the exit code and
     // which the age -- and `--json` already covers the machine case, so this
     // one is for a person.
-    let cells: Vec<[String; 6]> = rows
-        .iter()
-        .map(|row| {
-            let (state, rc) = match row.state {
-                State::Running => ("running", "-".to_string()),
-                State::Done(code) => ("done", code.to_string()),
-                State::Orphan => ("orphan", "-".to_string()),
-            };
-            [
-                row.id.clone(),
-                row.host.clone(),
-                state.to_string(),
-                rc,
-                format_age(row.age_secs),
-                display_command(&row.cmd),
-            ]
-        })
-        .collect();
-
-    let head = ["ID", "HOST", "STATE", "RC", "AGE", "COMMAND"];
-    // Width the first five columns; the command is last so it can run long
-    // without padding the line.
-    let mut width = head.map(str::len);
-    for row in &cells {
-        for (w, cell) in width.iter_mut().zip(row) {
-            *w = (*w).max(cell.chars().count());
-        }
-    }
-
-    let render = |cols: &[String; 6]| {
-        let mut line = String::new();
-        for (i, cell) in cols.iter().enumerate().take(5) {
-            line.push_str(&format!("{:<width$}  ", cell, width = width[i]));
-        }
-        line.push_str(&cols[5]);
-        line
-    };
-
-    println!("{}", render(&head.map(String::from)));
-    for row in &cells {
-        println!("{}", render(row));
-    }
+    // COMMAND is last so it can run long without padding every line -- which
+    // is why `print_table` never pads its final column.
+    print_table(
+        &["ID", "HOST", "STATE", "RC", "AGE", "COMMAND"],
+        &rows
+            .iter()
+            .map(|row| {
+                let (state, rc) = match row.state {
+                    State::Running => ("running", "-".to_string()),
+                    State::Done(code) => ("done", code.to_string()),
+                    State::Orphan => ("orphan", "-".to_string()),
+                };
+                vec![
+                    row.id.clone(),
+                    row.host.clone(),
+                    state.to_string(),
+                    rc,
+                    format_age(row.age_secs),
+                    display_command(&row.cmd),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
     if !quiet {
         let id = &rows[0].id;
         eprintln!("next: coop poll {id}; coop tail {id}");
