@@ -232,7 +232,7 @@ pub enum Commands {
     Ls {
         #[command(flatten)]
         host: HostArg,
-        /// Include finished jobs
+        /// Include finished jobs older than the default 24-hour window
         #[arg(long)]
         all: bool,
         /// Emit machine-readable rows with complete, unmodified commands
