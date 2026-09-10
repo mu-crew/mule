@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+mod dispatch_warn;
 pub mod errors;
 pub mod jobs;
 pub mod lock;
