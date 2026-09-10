@@ -133,6 +133,37 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
 }
 
 #[test]
+fn watchdog_writes_124_only_when_rc_is_absent() {
+    // The job path writes rc only if it is missing, so a concurrent kill's 137
+    // survives. The watchdog used to overwrite unconditionally after
+    // has-session, so a kill/timeout overlap replaced 137 (or the job's own
+    // code) with 124.
+    let script = dispatch_script(
+        &host(),
+        &Job {
+            id: "abc123".parse().unwrap(),
+            cmd: "true".into(),
+            cwd: None,
+            max_secs: 30,
+        },
+    );
+    let watch = script
+        .split_once("watch-abc123")
+        .expect("capped jobs start a watch session")
+        .1;
+    let rest = watch
+        .split_once("printf %s ")
+        .expect("watchdog is base64-encoded")
+        .1;
+    let b64 = rest.split_whitespace().next().expect("watchdog payload");
+    let payload = String::from_utf8(coop::jobs::decode_command(b64).unwrap()).unwrap();
+    assert!(
+        payload.contains("if [ ! -f") && payload.contains("echo 124"),
+        "124 must be gated on a missing rc: {payload}"
+    );
+}
+
+#[test]
 fn every_spelling_of_the_home_directory_expands() {
     // The cwd is encoded so a space or metacharacter is inert -- but encoding
     // also stops `~` and `$HOME` expanding, and only the REMOTE shell knows the

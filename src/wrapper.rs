@@ -78,10 +78,12 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         // background `sleep` inside the job session would keep that session
         // alive after a fast command exits. Whichever path finishes first
         // destroys the other session. 124 follows GNU timeout and is distinct
-        // from coop kill's 137.
+        // from coop kill's 137. Write 124 only when rc is missing, matching
+        // the job path, so a concurrent kill's 137 is not overwritten.
         let watchdog = format!(
             "sleep {secs}; if tmux -L {socket} has-session -t coop-{id} 2>/dev/null; then \
-             echo 124 > {dir}/rc; tmux -L {socket} kill-session -t coop-{id}; fi",
+             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
+             tmux -L {socket} kill-session -t coop-{id}; fi",
             socket = host.tmux_socket,
             id = job.id,
             secs = job.max_secs,
