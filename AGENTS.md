@@ -121,9 +121,10 @@ Consequences, each of which has cost someone real debugging time:
   provided method that takes the lock, and implementations supply only
   `run_unlocked`. Never call `run_unlocked` outside `src/transport.rs` -- doing
   so opens a session channel the fairness gate cannot see.
-- **User commands are base64-encoded**, never interpolated. They cross three
-  expansion layers (ssh's shell, tmux's argument, `sh -c`) plus coop's appended
-  redirect.
+- **User commands are base64-encoded**, never interpolated. They cross the
+  local argv join, the remote shell, tmux's argument parse, and the final `sh`
+  (SPEC.md, Job identity and remote state). Base64 keeps the command inert
+  until that last decode.
 - **Jobs get a non-login, non-interactive shell.** Do not add a flag to source
   login files: that would make a job depend on the host's config, and the
   failure mode is "works when I ssh in, fails under coop". Measured and

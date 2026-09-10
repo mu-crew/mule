@@ -38,7 +38,7 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         .unwrap_or("$HOME");
 
     // The cwd is encoded for the same reason the command is: it is user input
-    // crossing the same three expansion layers. Interpolated raw, a path with a
+    // crossing the same four expansion layers. Interpolated raw, a path with a
     // space splits into two words and `cd` either fails or -- worse -- succeeds
     // against the wrong directory. `$HOME` is the one value coop supplies
     // itself, and it must stay unencoded so the remote shell expands it.
