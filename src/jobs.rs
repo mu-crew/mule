@@ -298,17 +298,21 @@ pub fn prune(host: &Host) -> String {
     // cannot express "has rc OR is much older" in one predicate without
     // becoming unreadable.
     //
-    // A `running` job is matched by neither: it has no `rc`, and its session is
-    // alive, so it is skipped regardless of age. Directory mtime updates when
-    // `rc` is written, so a long job's clock effectively starts when it
-    // finishes rather than when it was dispatched.
+    // A `running` job has no `rc`, so the orphan pass would match it by age
+    // alone. Skip live `coop-{id}` sessions: keep_days can be 1, which makes
+    // the orphan horizon four days, and a multi-day job is legitimate work.
     format!(
         "root={JOBS_ROOT}; [ ! -d \"$root\" ] || {{ \
+         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null); \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{} \
            -exec test -f '{{}}/rc' \\; -exec rm -rf '{{}}' + ; \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days} \
-           -exec test ! -f '{{}}/rc' \\; -exec rm -rf '{{}}' + ; }}",
-        host.keep_days
+           -exec test ! -f '{{}}/rc' \\; -print | while IFS= read -r d; do \
+             id=\"${{d##*/}}\"; \
+             echo \"$live\" | grep -qx \"coop-$id\" && continue; \
+             rm -rf \"$d\"; \
+           done; }}",
+        host.tmux_socket, host.keep_days
     )
 }
 

@@ -338,6 +338,10 @@ fn prune_uses_two_horizons_and_never_touches_running_jobs() {
         script.contains("-exec test ! -f '{}/rc'"),
         "the second pass must select rc-LESS directories"
     );
+    assert!(
+        script.contains("list-sessions"),
+        "a running job has no rc, so age alone would prune it; skip live sessions"
+    );
 
     assert!(script.contains("-exec rm -rf '{}'"));
     assert!(
@@ -346,9 +350,9 @@ fn prune_uses_two_horizons_and_never_touches_running_jobs() {
     );
 
     // A running job has no `rc`, so only the orphan pass can match it -- and
-    // that is safe only because the orphan horizon is far beyond the ordinary
-    // one. Derive both from the same host config rather than restating them, so
-    // a change to keep_days cannot silently narrow the gap.
+    // that pass must skip live sessions. Derive both horizons from the same
+    // host config rather than restating them, so a change to keep_days cannot
+    // silently narrow the gap.
     let doubled = prune(&Host {
         keep_days: 30,
         ..host()

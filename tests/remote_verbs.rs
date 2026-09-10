@@ -401,6 +401,14 @@ fn prune_removes_finished_jobs_and_spares_running_and_orphans() {
             .sshd
             .ssh(&[&format!("touch -t {stamp} {}", f.job_dir(id))]);
     }
+    // Past the orphan horizon too. Without a live-session check this is
+    // indistinguishable from an ancient orphan, and prune would delete the
+    // artifact under a still-running job.
+    let ancient_running = own_stamp(120);
+    let _ = f.sshd.ssh(&[&format!(
+        "touch -t {ancient_running} {}",
+        f.job_dir(&running)
+    )]);
 
     // Prune runs inside the next dispatch's round trip.
     let trigger = f.run("true");
