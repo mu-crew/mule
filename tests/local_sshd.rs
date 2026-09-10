@@ -247,6 +247,76 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
 }
 
 #[test]
+fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "missing-path-hint");
+    let config = sshd.write_config(&tmux.name);
+
+    let failed = sshd.coop(
+        &config,
+        &["run", "--wait", "coop_definitely_missing_binary 2>&1"],
+    );
+    assert_eq!(failed.status.code(), Some(127));
+    let failed_stdout = String::from_utf8_lossy(&failed.stdout);
+    let mut lines = failed_stdout.lines();
+    let failed_id = lines.next().expect("run must print its recovery id");
+    assert_eq!(failed_id.len(), 6);
+    let log_lines = lines.collect::<Vec<_>>();
+    assert_eq!(
+        log_lines.len(),
+        1,
+        "the hint must not alter stdout: {failed_stdout:?}"
+    );
+    assert!(
+        log_lines[0].contains("coop_definitely_missing_binary: command not found"),
+        "{failed_stdout:?}"
+    );
+    let hint = String::from_utf8_lossy(&failed.stderr);
+    assert!(hint.contains("shell is non-login"), "{hint}");
+    assert!(hint.contains("If this is a missing tool"), "{hint}");
+    assert!(hint.contains("export PATH=$HOME/.elan/bin:$PATH"), "{hint}");
+
+    let quiet = sshd.coop(
+        &config,
+        &[
+            "--quiet",
+            "run",
+            "--wait",
+            "coop_definitely_missing_binary 2>&1",
+        ],
+    );
+    assert_eq!(quiet.status.code(), Some(127));
+    assert!(
+        quiet.stderr.is_empty(),
+        "--quiet must suppress the PATH hint: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_id = stdout(&quiet)
+        .lines()
+        .next()
+        .expect("run must print its recovery id")
+        .to_string();
+
+    let successful = sshd.coop(&config, &["run", "--wait", "printf 'not found on PATH\\n'"]);
+    assert!(successful.status.success());
+    let successful_stdout = String::from_utf8_lossy(&successful.stdout);
+    let mut lines = successful_stdout.lines();
+    let successful_id = lines.next().expect("run must print its recovery id");
+    assert_eq!(lines.collect::<Vec<_>>(), ["not found on PATH"]);
+    assert!(
+        !String::from_utf8_lossy(&successful.stderr).contains("shell is non-login"),
+        "a successful job must not scan its log or draw the hint"
+    );
+
+    clean_jobs(
+        &sshd,
+        &[failed_id.to_string(), quiet_id, successful_id.to_string()],
+    );
+}
+
+#[test]
 fn dispatch_does_not_wait_for_the_job() {
     require_sshd!();
     let sshd = Sshd::start();

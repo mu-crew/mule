@@ -3,6 +3,7 @@
 //! The command shapes are settled by the spec and declared up front so
 //! `--help` stays honest while each implementation lands.
 
+use std::collections::VecDeque;
 use std::io::Write;
 
 use anyhow::Result;
@@ -386,15 +387,23 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         }
                         return Ok(0);
                     }
-                    let mut stdout = std::io::stdout().lock();
+                    let stdout = std::io::stdout().lock();
+                    let mut output = HintWriter::new(stdout);
                     let result = if no_tail {
-                        crate::tail::follow_deferred(&Ssh, host, &id, &mut stdout)
+                        crate::tail::follow_deferred(&Ssh, host, &id, &mut output)
                     } else {
-                        crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
+                        crate::tail::follow(&Ssh, host, &id, 0, &mut output)
                     }
                     .map_err(|error| crate::errors::waiting(error, id.as_str()));
-                    if result.is_ok() && !quiet {
-                        eprintln!("next: coop rm {id} to drop its state");
+                    if let Ok(code) = result {
+                        // The exit code is the cheap gate. Only a failed job
+                        // earns even the bounded log-tail scan below.
+                        if code != 0 && !quiet {
+                            missing_tool_hint(&output.tail());
+                        }
+                        if !quiet {
+                            eprintln!("next: coop rm {id} to drop its state");
+                        }
                     }
                     result
                 }
@@ -488,6 +497,57 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
+    }
+}
+
+const HINT_SCAN_BYTES: usize = 64 * 1024;
+
+struct HintWriter<W> {
+    inner: W,
+    tail: VecDeque<u8>,
+}
+
+impl<W> HintWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            tail: VecDeque::with_capacity(HINT_SCAN_BYTES),
+        }
+    }
+
+    fn tail(&self) -> Vec<u8> {
+        self.tail.iter().copied().collect()
+    }
+}
+
+impl<W: Write> Write for HintWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.tail.extend(&bytes[..written]);
+        if self.tail.len() > HINT_SCAN_BYTES {
+            self.tail.drain(..self.tail.len() - HINT_SCAN_BYTES);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn missing_tool_hint(log_tail: &[u8]) {
+    let text = String::from_utf8_lossy(log_tail).to_ascii_lowercase();
+    if [
+        "command not found",
+        "not found on path",
+        "no such file or directory",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+    {
+        eprintln!(
+            "coop: the job's shell is non-login, so ~/.bash_profile did not run. If this is a missing tool, put its shims dir on PATH: coop run 'export PATH=$HOME/.elan/bin:$PATH; <cmd>'"
+        );
     }
 }
 
