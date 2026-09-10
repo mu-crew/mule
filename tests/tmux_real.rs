@@ -90,11 +90,13 @@ impl TmuxServer {
             default_cwd: None,
             keep_days: 14,
             max_log_bytes,
+            max_job_secs: 0,
         };
         let job = Job {
             id: id.parse().unwrap(),
             cmd: command.into(),
             cwd: cwd.map(str::to_owned),
+            max_secs: 0,
         };
         let script = dispatch_script(&host, &job).replace(
             &format!("{}/{id}", coop::wrapper::JOBS_ROOT),

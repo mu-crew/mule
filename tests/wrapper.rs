@@ -14,6 +14,7 @@ fn host() -> Host {
         default_cwd: None,
         keep_days: 14,
         max_log_bytes: 100 * 1024 * 1024,
+        max_job_secs: 0,
     }
 }
 
@@ -24,6 +25,7 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
         id: "a1b2c3".parse().unwrap(),
         cmd: command.into(),
         cwd: None,
+        max_secs: 0,
     };
 
     let script = dispatch_script(&host(), &job);
@@ -68,6 +70,7 @@ fn a_cwd_with_a_space_is_quoted() {
         id: "abc123".parse().unwrap(),
         cmd: "echo hi".into(),
         cwd: Some("/tmp/my dir".into()),
+        max_secs: 0,
     };
     let script = dispatch_script(&host(), &job);
     assert!(
@@ -89,6 +92,7 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
             id: "abc123".parse().unwrap(),
             cmd: "true".into(),
             cwd: None,
+            max_secs: 0,
         },
     );
     assert!(
@@ -159,6 +163,7 @@ fn script_for(cwd: &str) -> String {
             id: "abc123".parse().unwrap(),
             cmd: "true".into(),
             cwd: Some(cwd.into()),
+            max_secs: 0,
         },
     )
 }

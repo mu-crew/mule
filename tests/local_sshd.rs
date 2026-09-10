@@ -242,6 +242,91 @@ fn dispatch_does_not_wait_for_the_job() {
 }
 
 #[test]
+fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "job-timeout");
+    let config = sshd.write_config(&tmux.name);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("max_job_secs = 1\n");
+    std::fs::write(&config, text).unwrap();
+
+    let out = sshd.coop(&config, &["run", "trap '' TERM; sleep 30"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+        assert!(Instant::now() < deadline, "timed-out job never finished");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "124");
+
+    let sessions = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        "timed-out job left its tmux session alive"
+    );
+
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
+fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "job-fast");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.coop(&config, &["run", "--max-secs", "2", "exit 7"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+        assert!(Instant::now() < deadline, "fast job never finished");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "7");
+
+    // Wait beyond the original cap: a surviving watchdog would overwrite the
+    // rc or recreate timeout state after the command had already finished.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "7");
+    let sessions = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        "fast job left its tmux session or watchdog alive"
+    );
+
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
 fn a_job_survives_the_loss_of_its_tmux_server() {
     require_sshd!();
     let sshd = Sshd::start();

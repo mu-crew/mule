@@ -35,6 +35,7 @@ fn minimal_host_entry_gets_defaults() {
     assert_eq!(h.tmux_socket, "coop");
     assert_eq!(h.max_running, 4);
     assert_eq!(h.keep_days, 14);
+    assert_eq!(h.max_job_secs, 0);
     assert_eq!(h.default_cwd, None);
 
     let sock = h.socket.to_string_lossy();
@@ -67,6 +68,7 @@ tmux_socket = "mine"
 max_running = 9
 default_cwd = "~/work"
 keep_days   = 30
+max_job_secs = 7200
 "#,
     );
     let c = Config::load(&p).unwrap();
@@ -77,6 +79,7 @@ keep_days   = 30
     assert_eq!(h.max_running, 9);
     assert_eq!(h.default_cwd.as_deref(), Some("~/work"));
     assert_eq!(h.keep_days, 30);
+    assert_eq!(h.max_job_secs, 7200);
     std::fs::remove_dir_all(tmp("over")).ok();
 }
 

@@ -11,8 +11,9 @@ pub fn dispatch(
     host: &Host,
     cmd: &str,
     cwd: Option<&str>,
+    max_secs: Option<u64>,
 ) -> Result<JobId> {
-    dispatch_with_warnings(transport, host, cmd, cwd, &mut std::io::stderr())
+    dispatch_with_warnings(transport, host, cmd, cwd, max_secs, &mut std::io::stderr())
 }
 
 #[doc(hidden)]
@@ -21,6 +22,7 @@ pub fn dispatch_with_warnings(
     host: &Host,
     cmd: &str,
     cwd: Option<&str>,
+    max_secs: Option<u64>,
     warnings: &mut dyn Write,
 ) -> Result<JobId> {
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
@@ -35,6 +37,7 @@ pub fn dispatch_with_warnings(
         id: new_id().parse::<JobId>().expect("generated ids are valid"),
         cmd: cmd.to_owned(),
         cwd: cwd.map(str::to_owned),
+        max_secs: max_secs.unwrap_or(host.max_job_secs),
     };
     let script = format!(
         "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",

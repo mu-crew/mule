@@ -26,6 +26,11 @@ const DEFAULT_KEEP_DAYS: u32 = 14;
 /// `rc` write then leaves an `orphan` that prune deliberately never reaps.
 const DEFAULT_MAX_LOG_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Jobs are unbounded unless the host or caller opts into a limit. A six-hour
+/// build is legitimate work, and an arbitrary default would make coop the
+/// process that unexpectedly kills it.
+const DEFAULT_MAX_JOB_SECS: u64 = 0;
+
 /// The private tmux server name. Jobs run under `tmux -L coop`, which does not
 /// appear in the user's `tmux ls`.
 const DEFAULT_TMUX_SOCKET: &str = "coop";
@@ -54,6 +59,8 @@ pub struct Host {
     pub keep_days: u32,
     /// Bytes of log kept per job; the rest is discarded and flagged.
     pub max_log_bytes: u64,
+    /// Maximum remote runtime in seconds; zero means unbounded.
+    pub max_job_secs: u64,
 }
 
 /// The raw `[hosts.<name>]` table. Everything is optional; `Host` fills in the
@@ -68,6 +75,7 @@ struct RawHost {
     default_cwd: Option<String>,
     keep_days: Option<u32>,
     max_log_bytes: Option<u64>,
+    max_job_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -123,6 +131,7 @@ pub const TEMPLATE: &str = "\
 # default_cwd = \"~/work\"                   # where `run` starts, unless --cwd
 # keep_days   = 14                         # prune finished jobs older than this
 # max_log_bytes = 104857600                # 100MB; longer logs are truncated
+# max_job_secs = 0                         # remote runtime cap; 0 is unbounded
 #
 # Then open the control master, once per ControlPersist window. This may ask
 # you to touch a hardware key; coop cannot do it for you:
@@ -218,6 +227,7 @@ impl Config {
                     default_cwd: h.default_cwd,
                     keep_days: h.keep_days.unwrap_or(DEFAULT_KEEP_DAYS),
                     max_log_bytes: h.max_log_bytes.unwrap_or(DEFAULT_MAX_LOG_BYTES),
+                    max_job_secs: h.max_job_secs.unwrap_or(DEFAULT_MAX_JOB_SECS),
                     name,
                 })
             })

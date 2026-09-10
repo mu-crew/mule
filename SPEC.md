@@ -143,9 +143,10 @@ tmux_socket = "coop"
 max_running = 4
 default_cwd = "~/work/project"
 keep_days = 14
+max_job_secs = 0
 ```
 
-Only the section and target are required. The socket defaults to `~/.ssh/coop/<name>.sock`, the tmux socket to `coop`, `max_running` to **4**, and `keep_days` to **14**.
+Only the section and target are required. The socket defaults to `~/.ssh/coop/<name>.sock`, the tmux socket to `coop`, `max_running` to **4**, `keep_days` to **14**, and `max_job_secs` to **0** (unbounded). There is no nonzero default because legitimate builds can run for six hours; an arbitrary cap would make coop kill correct work unexpectedly.
 
 Every job verb accepts `--host`. The flag is optional when exactly one host is configured.
 
@@ -177,7 +178,7 @@ One tap unblocks every job for the life of the `ControlPersist` window, so the e
 ## Commands and output
 
 ```text
-coop run [--host H] [--cwd D] [--wait] [--no-tail] <cmd>
+coop run [--host H] [--cwd D] [--max-secs S] [--wait] [--no-tail] <cmd>
 coop poll <id> [--host H] [--json]
 coop wait <id> [--host H] [--timeout S]
 coop tail <id> [--host H] [-f] [--all | -n LINES]
@@ -188,6 +189,8 @@ coop host list [--json]
 ```
 
 `poll` prints `running`, `orphan`, or the exit code. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
+
+`run --max-secs S` overrides the host's `max_job_secs` for that job; zero means unbounded. A portable watchdog runs in a separate private tmux session, so it needs no `timeout(1)` (absent on stock macOS), does not hold SSH, and cannot leave its `sleep` keeping a fast job alive. At the cap it writes **124**, GNU `timeout`'s established code, then destroys the job session and its process tree. Normal completion destroys the watchdog and preserves the command's own rc. This remote runtime bound is deliberately distinct from `wait --timeout`, which only stops the local caller waiting and leaves the job running.
 
 `tail` writes raw bytes because lossy UTF-8 conversion would corrupt the artifact. Standard output and standard error stay merged to preserve their order. A caller that needs separate streams can redirect them inside the submitted command.
 

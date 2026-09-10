@@ -9,6 +9,7 @@ pub struct Job {
     pub id: JobId,
     pub cmd: String,
     pub cwd: Option<String>,
+    pub max_secs: u64,
 }
 
 /// Remote per-job state, as a shell string (never a local `PathBuf`).
@@ -63,10 +64,39 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         None => format!("cd \"$(printf %s {} | base64 -d)\"", base64(cwd.as_bytes())),
     };
 
+    let run = if job.max_secs == 0 {
+        format!("{cd} && printf %s {command} | base64 -d | sh; echo $? > {dir}/rc")
+    } else {
+        // POSIX sh has no portable process-group primitive, so the inner tmux
+        // session supplies one: `kill-session` terminates the command and all
+        // descendants. The watchdog runs in a separate tmux session, because a
+        // background `sleep` inside the job session would keep that session
+        // alive after a fast command exits. Whichever path finishes first
+        // destroys the other session. 124 follows GNU timeout and is distinct
+        // from coop kill's 137.
+        let watchdog = format!(
+            "sleep {secs}; if tmux -L {socket} has-session -t coop-{id} 2>/dev/null; then \
+             echo 124 > {dir}/rc; tmux -L {socket} kill-session -t coop-{id}; fi",
+            socket = host.tmux_socket,
+            id = job.id,
+            secs = job.max_secs,
+        );
+        format!(
+            "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
+             \"printf %s {watchdog} | base64 -d | sh\"; \
+             {cd} && printf %s {command} | base64 -d | sh; rc=$?; \
+             tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
+             if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
+            socket = host.tmux_socket,
+            id = job.id,
+            watchdog = base64(watchdog.as_bytes()),
+        )
+    };
+
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
          tmux -L {} -f /dev/null new-session -d -s coop-{} \
-         '{{ {cd} && printf %s {command} | base64 -d | sh; echo $? > {dir}/rc; }} \
+         '{{ {run}; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
                if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
                rm -f {dir}/.overflow; }}'",

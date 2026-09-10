@@ -81,7 +81,10 @@ pub enum Commands {
         /// Directory to run in (default: the host's default_cwd, else $HOME)
         #[arg(long, value_name = "D")]
         cwd: Option<String>,
-        /// Block until the job finishes, tailing output, and exit with its code
+        /// Kill the remote job after S seconds (0 means unbounded)
+        #[arg(long, value_name = "S")]
+        max_secs: Option<u64>,
+        /// Block locally until the job finishes; unlike --max-secs, this does not kill it
         #[arg(long)]
         wait: bool,
         /// With --wait: print the log once at the end instead of streaming
@@ -131,6 +134,7 @@ pub enum Commands {
         id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
+        /// Stop waiting locally after S seconds; the remote job keeps running
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
     },
@@ -327,6 +331,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Run {
             host,
             cwd,
+            max_secs,
             wait,
             no_tail,
             cmd,
@@ -338,7 +343,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             if !std::env::args().any(|a| a == "--") {
                 warn_about_swallowed_flags(&cmd);
             }
-            match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref()) {
+            match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref(), max_secs) {
                 Ok(id) => {
                     println!("{id}");
                     std::io::stdout().flush()?;
@@ -545,7 +550,15 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
 /// So this warns rather than erroring: the command really might want the flag,
 /// and refusing would break `coop run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
-    const COOP_FLAGS: [&str; 6] = ["--wait", "--no-tail", "--cwd", "--host", "--json", "--all"];
+    const COOP_FLAGS: [&str; 7] = [
+        "--wait",
+        "--no-tail",
+        "--max-secs",
+        "--cwd",
+        "--host",
+        "--json",
+        "--all",
+    ];
     let found: Vec<&str> = cmd
         .iter()
         .skip(1)
