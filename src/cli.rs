@@ -81,7 +81,12 @@ pub enum Commands {
         /// With --wait: print the log once at the end instead of streaming
         #[arg(long, requires = "wait")]
         no_tail: bool,
-        /// The command to run
+        /// The command to run.
+        ///
+        /// Everything after the first word is part of the command, so coop's
+        /// own flags go BEFORE it: `coop run --wait ls`, not
+        /// `coop run ls --wait`. Use `--` when the command takes flags coop
+        /// also has: `coop run -- ls --all`.
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
@@ -285,6 +290,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             cmd,
         } => {
             let host = cfg.host(host.host.as_deref())?;
+            // `--` is the caller saying "everything after this is the
+            // command", so an explicit separator silences the warning. clap
+            // strips it, so look at the raw arguments.
+            if !std::env::args().any(|a| a == "--") {
+                warn_about_swallowed_flags(&cmd);
+            }
             match crate::run::dispatch(&Ssh, host, &cmd.join(" "), cwd.as_deref()) {
                 Ok(id) => {
                     println!("{id}");
@@ -454,6 +465,42 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
     for row in &cells {
         println!("{}", render(row));
     }
+}
+
+/// Warn when the command contains something that looks like a coop flag.
+///
+/// `run` takes the command as trailing arguments, so `coop run ls --wait` sends
+/// `--wait` to `ls` rather than to coop. That has to be true -- otherwise you
+/// could not run a command that takes flags -- but it fails silently: the job
+/// dispatches, no output appears because `--wait` never reached coop, and the
+/// exit code is whatever the command made of the stray argument. `ls` exits 1
+/// on an unknown flag, which reads as a coop bug.
+///
+/// So this warns rather than erroring: the command really might want the flag,
+/// and refusing would break `coop run -- rsync --delete ...`.
+fn warn_about_swallowed_flags(cmd: &[String]) {
+    const COOP_FLAGS: [&str; 6] = ["--wait", "--no-tail", "--cwd", "--host", "--json", "--all"];
+    let found: Vec<&str> = cmd
+        .iter()
+        .skip(1)
+        .filter_map(|arg| COOP_FLAGS.iter().find(|f| *f == arg).copied())
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    eprintln!(
+        "coop: warning: {} went to the command, not to coop",
+        found.join(", ")
+    );
+    eprintln!(
+        "  coop flags go before the command: coop run {} {}",
+        found.join(" "),
+        cmd.first().map(String::as_str).unwrap_or("<cmd>")
+    );
+    eprintln!(
+        "  to silence this, separate them explicitly: coop run -- {}",
+        cmd.join(" ")
+    );
 }
 
 /// Compact relative age: `45s`, `12m`, `3h`, `2d`.

@@ -144,6 +144,15 @@ Three details from `coop --help` matter:
 - Jobs use a non-login, non-interactive shell. Source environment setup in the command when needed.
 - Standard output and standard error share one log. Redirect inside the command when you need separate files.
 
+coop's own flags go **before** the command, because everything after the first
+word belongs to the command: `coop run --wait ls`, not `coop run ls --wait`.
+The second form sends `--wait` to `ls`, and coop warns when it spots one of its
+flags there. Use `--` when the command takes a flag coop also has:
+
+```sh
+coop run -- ls --all
+```
+
 `coop ls` shows the last 24 hours plus anything running or orphaned; `--all` reaches further back. Logs are capped at 100MB per job (`max_log_bytes`), and a truncated log says so.
 
 Every job verb accepts `--host`. `poll` and `wait` do not print job output; use `tail`. A one-shot `tail` prints the last **64KB** by default; use `--all` or `-n LINES` to choose another range.

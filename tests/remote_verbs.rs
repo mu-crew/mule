@@ -499,3 +499,62 @@ fn a_trivially_successful_job_reports_rc_zero() {
         );
     }
 }
+
+#[test]
+fn a_coop_flag_after_the_command_warns_but_still_runs() {
+    require_sshd!();
+    let mut f = Fixture::new("flagpos");
+
+    // `coop run ls --wait` sends `--wait` to `ls`, which must stay true --
+    // otherwise no command could take a flag coop also has. But it failed
+    // silently: the job dispatched, no output appeared because `--wait` never
+    // reached coop, and `ls` exited 1 on the unknown flag, which reads as a
+    // coop bug rather than a usage mistake.
+    let out = f.coop(&["run", "echo", "hi", "--wait"]);
+    assert!(out.status.success());
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    f.ids.push(id.clone());
+
+    let warning = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        warning.contains("--wait went to the command"),
+        "must warn about the swallowed flag: {warning}"
+    );
+    assert!(
+        warning.contains("coop run --wait echo"),
+        "must show the corrected form: {warning}"
+    );
+
+    // The command really did receive it, so the warning is accurate.
+    f.await_done(&id);
+    assert_eq!(f.artifact(&id, "cmd").trim(), "echo hi --wait");
+
+    // `--` is the caller asserting the flags are the command's, so it silences
+    // the warning. Without this the escape hatch would nag on every use.
+    let explicit = f.coop(&["run", "--", "echo", "hi", "--wait"]);
+    let id2 = String::from_utf8_lossy(&explicit.stdout).trim().to_string();
+    f.ids.push(id2);
+    assert!(
+        !String::from_utf8_lossy(&explicit.stderr).contains("went to the command"),
+        "an explicit -- must silence the warning"
+    );
+
+    // Correct usage stays silent, and a flag coop does not own is not its
+    // business.
+    for args in [
+        vec!["run", "--wait", "echo", "quiet"],
+        vec!["run", "ls", "-la"],
+    ] {
+        let quiet = f.coop(&args);
+        let text = String::from_utf8_lossy(&quiet.stdout);
+        if let Some(line) = text.lines().next()
+            && line.len() == 6
+        {
+            f.ids.push(line.to_string());
+        }
+        assert!(
+            !String::from_utf8_lossy(&quiet.stderr).contains("went to the command"),
+            "{args:?} must not warn"
+        );
+    }
+}
