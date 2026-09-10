@@ -216,6 +216,50 @@ fn a_capped_log_truncates_without_killing_the_job() {
 }
 
 #[test]
+fn home_relative_cwds_actually_land_in_the_home_directory() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let server = TmuxServer::start();
+
+    // Executed, not inspected. The string-level test proves the script SHAPE;
+    // this proves the shell agrees -- which is the half that was wrong before,
+    // where `cd "~/"` looked reasonable and failed at runtime with rc 1 and an
+    // empty log.
+    let home = std::env::var("HOME").unwrap();
+    for (i, cwd) in ["~", "~/", "$HOME", "${HOME}"].iter().enumerate() {
+        let dir = server.run(&format!("00002{i}"), "pwd", Some(cwd));
+        assert_eq!(
+            read(dir.join("rc")).trim(),
+            "0",
+            "cwd {cwd:?} must not fail the job"
+        );
+        assert_eq!(
+            read(dir.join("log")).trim(),
+            home,
+            "cwd {cwd:?} must land in the home directory"
+        );
+    }
+
+    // A home-relative SUB-path, including one with a space: expansion and
+    // quoting must both hold at once.
+    let spaced = std::path::Path::new(&home).join("coop test dir");
+    fs::create_dir_all(&spaced).unwrap();
+    for (i, cwd) in ["~/coop test dir", "$HOME/coop test dir"]
+        .iter()
+        .enumerate()
+    {
+        let dir = server.run(&format!("00003{i}"), "pwd", Some(cwd));
+        assert_eq!(read(dir.join("rc")).trim(), "0", "cwd {cwd:?} failed");
+        assert!(
+            read(dir.join("log")).trim().ends_with("/coop test dir"),
+            "cwd {cwd:?} must land in the spaced sub-directory"
+        );
+    }
+    fs::remove_dir_all(&spaced).ok();
+}
+
+#[test]
 fn a_short_log_is_untouched_and_unflagged() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;

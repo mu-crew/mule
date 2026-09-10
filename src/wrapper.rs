@@ -39,33 +39,29 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
     // space splits into two words and `cd` either fails or -- worse -- succeeds
     // against the wrong directory. `$HOME` is the one value coop supplies
     // itself, and it must stay unencoded so the remote shell expands it.
-    let cd = match cwd {
-        "$HOME" => "cd \"$HOME\"".to_string(),
-        path => format!(
-            "cd \"$(printf %s {} | base64 -d)\"",
-            base64(path.as_bytes())
+    // The cwd is a PATH, not a shell expression, and those two goals conflict:
+    // encoding it keeps a space or a `$(...)` from being interpreted, but it
+    // also stops `~` and `$HOME` from expanding. Since only the remote shell
+    // knows the remote home, a home-relative path has to be emitted as an
+    // unquoted `$HOME` with the remainder still encoded.
+    //
+    // Previously only the exact string `$HOME` was special-cased, so every
+    // other spelling became a literal directory name that cannot exist: `cd`
+    // failed, the `&&` short-circuited, and the job reported rc 1 with an empty
+    // log. Measured as broken: `~/`, `~/work`, `$HOME/work`, `${HOME}/work` --
+    // and coop's own config template suggested `~/work`, so following the
+    // documentation produced a host where nothing ran.
+    let cd = match home_relative(cwd) {
+        // Nothing after the home directory.
+        Some("") => "cd \"$HOME\"".to_string(),
+        // `$HOME` unquoted so the remote shell expands it; the rest encoded so
+        // a space or a metacharacter in the path is still inert.
+        Some(rest) => format!(
+            "cd \"$HOME/$(printf %s {} | base64 -d)\"",
+            base64(rest.as_bytes())
         ),
+        None => format!("cd \"$(printf %s {} | base64 -d)\"", base64(cwd.as_bytes())),
     };
-
-    // Cap the log, and do it in three specific ways that all matter.
-    //
-    // `{ ...; echo $? > rc; }` puts the rc capture INSIDE the pipeline's left
-    // side, because `sh` has no PIPESTATUS: after `cmd | head`, `$?` is head's.
-    // Naively piping would have reported 0 for every failing job.
-    //
-    // `cat > /dev/null` after `head` keeps a reader on the pipe once the cap is
-    // reached. Without it the job is killed by SIGPIPE the moment it writes
-    // past the limit -- measured: rc 141 instead of the job's own 4. A cap must
-    // truncate the log, never terminate the work.
-    //
-    // The marker records that truncation happened, so `tail` can say the log is
-    // capped rather than presenting a partial log as complete.
-    //
-    // `if [ -s ... ]; then ...; fi` rather than `[ -s ... ] && ...`: the test is
-    // the last command in the pipeline's right-hand side, so with an empty
-    // overflow file the `&&` form exits 1 -- and that became the exit status of
-    // the whole wrapper. Every successful job reported `rc 1`, including
-    // `coop run true`.
 
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
@@ -76,6 +72,28 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
                rm -f {dir}/.overflow; }}'",
         host.tmux_socket, job.id, host.max_log_bytes
     )
+}
+
+/// The part of `path` after the user's home directory, if it is home-relative.
+///
+/// Recognises the spellings people actually write. Deliberately a fixed set
+/// rather than general shell expansion: expanding arbitrary `$(...)` in a
+/// configured path would hand the shell back the injection surface the base64
+/// encoding exists to remove.
+fn home_relative(path: &str) -> Option<&str> {
+    for prefix in ["~", "$HOME", "${HOME}"] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            // `~foo` is another user's home, a different problem; `$HOMEDIR` is
+            // simply a different variable. Neither is home-relative.
+            if rest.is_empty() {
+                return Some("");
+            }
+            if let Some(rest) = rest.strip_prefix('/') {
+                return Some(rest.trim_end_matches('/'));
+            }
+        }
+    }
+    None
 }
 
 /// Width of a generated id, in hex digits.

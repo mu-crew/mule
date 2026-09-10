@@ -100,3 +100,65 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
         "a trailing && test leaks its status into the job's rc: {script}"
     );
 }
+
+#[test]
+fn every_spelling_of_the_home_directory_expands() {
+    // The cwd is encoded so a space or metacharacter is inert -- but encoding
+    // also stops `~` and `$HOME` expanding, and only the REMOTE shell knows the
+    // remote home. Previously only the exact string `$HOME` was handled, so
+    // every other spelling became a literal directory name that cannot exist:
+    // `cd` failed, the `&&` short-circuited, and the job reported rc 1 with an
+    // empty log. Measured broken: `~/`, `~/work`, `$HOME/work`, `${HOME}/work`.
+    for cwd in ["~", "~/", "$HOME", "${HOME}", "${HOME}/"] {
+        let script = script_for(cwd);
+        assert!(
+            script.contains("cd \"$HOME\""),
+            "cwd {cwd:?} must cd to the remote home: {script}"
+        );
+    }
+
+    // A sub-path keeps `$HOME` unquoted (so the remote shell expands it) while
+    // the remainder stays encoded (so a space cannot split it). Both properties
+    // have to hold together -- an earlier fix for one broke the other.
+    for cwd in ["~/sub dir", "$HOME/sub dir", "${HOME}/sub dir"] {
+        let script = script_for(cwd);
+        assert!(
+            script.contains("cd \"$HOME/$(printf %s"),
+            "cwd {cwd:?} must expand $HOME and encode the rest: {script}"
+        );
+        assert!(
+            !script.contains("sub dir"),
+            "cwd {cwd:?} must not interpolate the remainder raw: {script}"
+        );
+    }
+
+    // A quoted tilde or literal $HOME never expands, so neither may survive
+    // into the script.
+    for cwd in ["~/work", "$HOME/work"] {
+        let script = script_for(cwd);
+        assert!(!script.contains("cd \"~"), "{cwd}: {script}");
+        assert!(!script.contains("cd \"$HOME/work"), "{cwd}: {script}");
+    }
+
+    // Not home-relative: another user's home, a different variable, and an
+    // absolute path all stay fully encoded.
+    for cwd in ["~other/work", "$HOMEDIR/work", "/abs/path"] {
+        let script = script_for(cwd);
+        assert!(
+            script.contains("cd \"$(printf %s"),
+            "cwd {cwd:?} must be treated as a literal path: {script}"
+        );
+        assert!(!script.contains("$HOME/$("), "{cwd}: {script}");
+    }
+}
+
+fn script_for(cwd: &str) -> String {
+    dispatch_script(
+        &host(),
+        &Job {
+            id: "abc123".parse().unwrap(),
+            cmd: "true".into(),
+            cwd: Some(cwd.into()),
+        },
+    )
+}

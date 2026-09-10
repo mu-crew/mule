@@ -95,6 +95,10 @@ Jobs use a non-login, non-interactive shell. Remote profile files do not run, so
 
 `run --cwd <dir>` sets the working directory. Otherwise coop uses the host's `default_cwd`, then the remote home directory. A failed `cd` fails the job instead of running in the wrong directory. Callers that need an environment manager must source it in the command.
 
+The directory is a **path, not a shell expression**, and those two requirements pull against each other. Encoding it keeps a space or a `$(...)` from being interpreted; encoding it also stops `~` and `$HOME` expanding, and only the remote shell knows the remote home. So a home-relative path is emitted as an unquoted `$HOME` with the remainder still encoded, which satisfies both: `~/dir with space` expands *and* cannot split.
+
+`~`, `~/`, `$HOME` and `${HOME}` are all recognised, with or without a sub-path. `~user` is not, and neither is `$HOMEDIR` — the first is a different problem, the second a different variable, and both are treated as literal paths. General expansion is refused deliberately: evaluating arbitrary `$(...)` in a configured path would hand back the injection surface the encoding exists to remove.
+
 ## Configuration
 
 The first run without a config file writes a commented template to the default
