@@ -183,11 +183,26 @@ A refused session channel is classified instead of exposing the misleading authe
 
 ## Listing, load, and cleanup
 
-`ls` checks configured hosts sequentially because every host call takes its own lock. It reports unreachable hosts instead of silently omitting them. Finished jobs appear only with `--all`.
+`ls` checks configured hosts sequentially because every host call takes its own lock. It reports unreachable hosts instead of silently omitting them.
+
+Its default filter is **time-based, not state-based**: everything from the last 24 hours, plus every running or orphaned job at any age. `--all` adds older finished jobs. Filtering on state instead treated finished work as noise the caller had already seen — true for a job watched with `--wait`, false for every job dispatched and walked away from, which is the mode the tool exists for. A short command is already finished when the caller first looks, so a state filter emptied `ls` exactly when it was the documented recovery path for a lost id.
 
 `max_running` is advisory. Dispatch counts sessions in the same round trip and warns after starting a job when the count exceeds the configured cap. A preflight count would double the round trips for a warning that does not block work.
 
-`run` removes only completed jobs older than `keep_days`, which defaults to **14**. It keeps running jobs and orphans because their logs can still be needed.
+`run` prunes in the round trip it is already making, over two horizons. Finished jobs go after `keep_days`, default **14**. Orphans go after four times that, because an orphan is evidence — the host rebooted, or something killed the session — and since `kill` writes rc 137 it means strictly "not coop's doing". Running jobs are never pruned.
+
+Orphans are kept long, but not forever. An unconditional exemption interacted badly with a full disk: the failing `rc` write leaves an orphan holding the largest log on the host, and those were precisely the directories prune refused to touch, so the residue could only be cleared by hand.
+
+## Log size
+
+A single job's log is capped at `max_log_bytes`, default **100MB**. Nothing else bounds it: a verbose build was measured writing 35MB in 5 seconds, and a runaway loop has no ceiling but the disk.
+
+The cap is applied in the remote wrapper, which is the only place it can be enforced without holding a connection, and its shape is dictated by two measured traps:
+
+- **`sh` has no `PIPESTATUS`.** After `cmd | head -c N`, `$?` is head's status, so a naive pipe reported success for every failing job. The `rc` capture therefore sits inside the pipeline's left-hand side.
+- **`head` alone kills the job.** Once the cap is reached it closes the pipe and the writer dies of SIGPIPE — measured as rc 141 in place of the job's own 4. A reader must stay on the pipe afterwards, so the cap truncates output rather than terminating work.
+
+Truncation is recorded in a marker file and reported on stderr by `tail`, because a silently shortened log is worse than a short one: it presents partial output as complete.
 
 ## Failure behavior
 

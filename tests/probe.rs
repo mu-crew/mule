@@ -32,6 +32,7 @@ fn host() -> Host {
         max_running: 4,
         default_cwd: None,
         keep_days: 14,
+        max_log_bytes: 100 * 1024 * 1024,
     }
 }
 

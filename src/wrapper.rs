@@ -47,11 +47,28 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         ),
     };
 
+    // Cap the log, and do it in three specific ways that all matter.
+    //
+    // `{ ...; echo $? > rc; }` puts the rc capture INSIDE the pipeline's left
+    // side, because `sh` has no PIPESTATUS: after `cmd | head`, `$?` is head's.
+    // Naively piping would have reported 0 for every failing job.
+    //
+    // `cat > /dev/null` after `head` keeps a reader on the pipe once the cap is
+    // reached. Without it the job is killed by SIGPIPE the moment it writes
+    // past the limit -- measured: rc 141 instead of the job's own 4. A cap must
+    // truncate the log, never terminate the work.
+    //
+    // The marker records that truncation happened, so `tail` can say the log is
+    // capped rather than presenting a partial log as complete.
+
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
          tmux -L {} -f /dev/null new-session -d -s coop-{} \
-         '{cd} && printf %s {command} | base64 -d | sh > {dir}/log 2>&1; echo $? > {dir}/rc'",
-        host.tmux_socket, job.id
+         '{{ {cd} && printf %s {command} | base64 -d | sh; echo $? > {dir}/rc; }} \
+          | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
+               [ -s {dir}/.overflow ] && echo 1 > {dir}/truncated; \
+               rm -f {dir}/.overflow; }}'",
+        host.tmux_socket, job.id, host.max_log_bytes
     )
 }
 

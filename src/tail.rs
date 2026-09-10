@@ -32,11 +32,30 @@ pub fn once(
         Selection::All => format!("cat {dir}/log"),
         Selection::Lines(lines) => format!("tail -n {lines} {dir}/log"),
     };
-    let output = with_lock(&host.name, || transport.run(host, &read))??;
+    // Ask about truncation in the SAME round trip -- a second call would take
+    // the lock twice to answer a question that is one byte on disk.
+    let script = format!("{read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\"");
+    let output = with_lock(&host.name, || transport.run(host, &script))??;
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
     }
-    out.write_all(&output.stdout)?;
+
+    // Split on the unit separator: log bytes are arbitrary, so the marker must
+    // be a byte the log cannot contain ambiguously at the very end.
+    let (body, truncated) = match output.stdout.iter().rposition(|&b| b == 0x1f) {
+        Some(i) => (&output.stdout[..i], output.stdout[i + 1..] == *b"1"),
+        None => (&output.stdout[..], false),
+    };
+    out.write_all(body)?;
+
+    if truncated {
+        // stderr, so it cannot corrupt `out=$(coop tail id)`.
+        eprintln!(
+            "coop: log was capped at {} bytes; the job ran to completion but \
+             later output was discarded",
+            host.max_log_bytes
+        );
+    }
     Ok(())
 }
 

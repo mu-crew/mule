@@ -6,6 +6,14 @@ use crate::probe::State;
 use crate::transport::Transport;
 use crate::wrapper::{JOBS_ROOT, JobId, state_dir};
 
+/// How far back `ls` reaches for finished jobs, absent `--all`.
+///
+/// Long enough that a job you fired and forgot is still listed when you come
+/// back to it, short enough that the default view does not become an archive.
+/// Anything prune will eventually delete was therefore visible for its first
+/// day.
+const DEFAULT_LS_WINDOW_SECS: u64 = 24 * 60 * 60;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
@@ -93,7 +101,17 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             None if alive => State::Running,
             None => State::Orphan,
         };
-        if all || !matches!(state, State::Done(_)) {
+        // Time-based, not state-based. Filtering on `done` treated finished
+        // work as noise the caller had already seen -- true for a job watched
+        // with `--wait`, false for every job dispatched and walked away from,
+        // which is the mode this tool exists for. A short command is ALREADY
+        // done when the user first looks, so a state filter made `ls` empty
+        // exactly when it is the documented recovery path for a lost id.
+        //
+        // `running` and `orphan` are never hidden at any age: one is live, the
+        // other is evidence.
+        let recent = age_secs < DEFAULT_LS_WINDOW_SECS;
+        if all || recent || !matches!(state, State::Done(_)) {
             rows.push(Row {
                 id: id.into(),
                 host: host.name.clone(),
@@ -140,11 +158,32 @@ fn run_mutation(
     Ok(())
 }
 
+/// How much longer an `orphan` is kept than a finished job.
+///
+/// An orphan is evidence -- the host rebooted, or something killed the session
+/// -- and since `kill` writes rc 137, it means strictly "not coop's doing". So
+/// it outlives ordinary output by a wide margin. But not forever: a disk-full
+/// incident produces orphans holding the largest logs on the host, and those
+/// were exactly the directories an unconditional exemption refused to touch,
+/// leaving permanent residue only a human could clear.
+const ORPHAN_KEEP_MULTIPLIER: u32 = 4;
+
 pub fn prune(host: &Host) -> String {
+    let orphan_days = host.keep_days.saturating_mul(ORPHAN_KEEP_MULTIPLIER);
+    // Two passes, because the two states have different horizons and `find`
+    // cannot express "has rc OR is much older" in one predicate without
+    // becoming unreadable.
+    //
+    // A `running` job is matched by neither: it has no `rc`, and its session is
+    // alive, so it is skipped regardless of age. Directory mtime updates when
+    // `rc` is written, so a long job's clock effectively starts when it
+    // finishes rather than when it was dispatched.
     format!(
-        "root={JOBS_ROOT}; [ ! -d \"$root\" ] || \
+        "root={JOBS_ROOT}; [ ! -d \"$root\" ] || {{ \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{} \
-         -exec test -f '{{}}/rc' \\; -exec rm -rf '{{}}' +",
+           -exec test -f '{{}}/rc' \\; -exec rm -rf '{{}}' + ; \
+         find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days} \
+           -exec test ! -f '{{}}/rc' \\; -exec rm -rf '{{}}' + ; }}",
         host.keep_days
     )
 }

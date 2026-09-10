@@ -18,6 +18,14 @@ const DEFAULT_MAX_RUNNING: u32 = 4;
 /// someone still wants costs more than the disk it saves.
 const DEFAULT_KEEP_DAYS: u32 = 14;
 
+/// Cap on a single job's log.
+///
+/// Nothing else bounds it: a verbose build was measured writing 35MB in 5s
+/// (~400MB/min), and a runaway `while :; do echo; done` has no ceiling but the
+/// disk. Filling the disk is worse than losing output, because the failing
+/// `rc` write then leaves an `orphan` that prune deliberately never reaps.
+const DEFAULT_MAX_LOG_BYTES: u64 = 100 * 1024 * 1024;
+
 /// The private tmux server name. Jobs run under `tmux -L coop`, which does not
 /// appear in the user's `tmux ls`.
 const DEFAULT_TMUX_SOCKET: &str = "coop";
@@ -44,6 +52,8 @@ pub struct Host {
     pub default_cwd: Option<String>,
     /// Prune horizon for `done` jobs.
     pub keep_days: u32,
+    /// Bytes of log kept per job; the rest is discarded and flagged.
+    pub max_log_bytes: u64,
 }
 
 /// The raw `[hosts.<name>]` table. Everything is optional; `Host` fills in the
@@ -57,6 +67,7 @@ struct RawHost {
     max_running: Option<u32>,
     default_cwd: Option<String>,
     keep_days: Option<u32>,
+    max_log_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -111,6 +122,7 @@ pub const TEMPLATE: &str = "\
 # max_running = 4                          # warn past this; not a queue
 # default_cwd = \"~/work\"                   # where `run` starts, unless --cwd
 # keep_days   = 14                         # prune finished jobs older than this
+# max_log_bytes = 104857600                # 100MB; longer logs are truncated
 #
 # Then open the control master, once per ControlPersist window. This may ask
 # you to touch a hardware key; coop cannot do it for you:
@@ -205,6 +217,7 @@ impl Config {
                     max_running: h.max_running.unwrap_or(DEFAULT_MAX_RUNNING),
                     default_cwd: h.default_cwd,
                     keep_days: h.keep_days.unwrap_or(DEFAULT_KEEP_DAYS),
+                    max_log_bytes: h.max_log_bytes.unwrap_or(DEFAULT_MAX_LOG_BYTES),
                     name,
                 })
             })

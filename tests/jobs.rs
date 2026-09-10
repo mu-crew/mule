@@ -26,12 +26,14 @@ fn host() -> Host {
         max_running: 4,
         default_cwd: None,
         keep_days: 14,
+        max_log_bytes: 100 * 1024 * 1024,
     }
 }
 
 #[test]
-fn list_parses_remote_jobs_and_excludes_done_by_default() {
+fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     let fake = Fake::new();
+    // ages in seconds: running/12s, done/34s, orphan/56s
     fake.push(Output::ok(
         "abc123\t12\t\t1\tZWNobyBoaQ==\n\
          def456\t34\t9\t0\tZmFsc2U=\n\
@@ -42,21 +44,50 @@ fn list_parses_remote_jobs_and_excludes_done_by_default() {
     let (rows, unreachable) = list(&cfg, &fake, None, false).unwrap();
 
     assert!(unreachable.is_empty());
-    assert_eq!(rows.len(), 2);
+    // All three are recent, so the default view shows the finished one too.
+    // This is the fix: a short job is already `done` when the user first looks,
+    // and `ls` is the documented recovery path for a lost id.
+    assert_eq!(rows.len(), 3, "a recent finished job must not be hidden");
     assert_eq!(rows[0].id, "abc123");
     assert_eq!(rows[0].host, "dev");
     assert_eq!(rows[0].state, State::Running);
     assert_eq!(rows[0].rc, None);
     assert_eq!(rows[0].age_secs, 12);
     assert_eq!(rows[0].cmd, "echo hi");
-    assert_eq!(rows[1].state, State::Orphan);
-    assert_eq!(rows[1].cmd, "true");
+    assert_eq!(rows[1].state, State::Done(9));
+    assert_eq!(rows[1].rc, Some(9));
+    assert_eq!(rows[1].cmd, "false");
+    assert_eq!(rows[2].state, State::Orphan);
+    assert_eq!(rows[2].cmd, "true");
+}
+
+#[test]
+fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
+    isolate_state();
+    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
+    let week = 7 * 24 * 60 * 60;
+
+    // A week-old job in each state.
+    let reply = format!(
+        "aaaaaa\t{week}\t\t1\tZWNobyBoaQ==\n\
+         bbbbbb\t{week}\t0\t0\tZmFsc2U=\n\
+         cccccc\t{week}\t\t0\tdHJ1ZQ==\n"
+    );
+
+    let fake = Fake::new();
+    fake.push(Output::ok(reply.clone()));
+    let (rows, _) = list(&cfg, &fake, None, false).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["aaaaaa", "cccccc"],
+        "an old `done` job needs --all; running and orphan are never hidden"
+    );
 
     let all = Fake::new();
-    all.push(Output::ok("def456\t34\t9\t0\tZmFsc2U=\n"));
+    all.push(Output::ok(reply));
     let (rows, _) = list(&cfg, &all, None, true).unwrap();
-    assert_eq!(rows[0].state, State::Done(9));
-    assert_eq!(rows[0].rc, Some(9));
+    assert_eq!(rows.len(), 3, "--all shows the old finished job");
 }
 
 #[derive(Default)]
@@ -116,11 +147,39 @@ fn kill_records_rc_before_destroying_the_session() {
 }
 
 #[test]
-fn prune_selects_only_old_directories_with_an_rc() {
+fn prune_uses_two_horizons_and_never_touches_running_jobs() {
     let script = prune(&host());
 
+    // Finished jobs: the ordinary horizon.
     assert!(script.contains("-mtime +14"));
     assert!(script.contains("-exec test -f '{}/rc'"));
+
+    // Orphans: kept four times as long, because an orphan is evidence -- but
+    // bounded, since a disk-full incident leaves orphans holding the biggest
+    // logs on the host and an outright exemption made that residue permanent.
+    assert!(
+        script.contains("-mtime +56"),
+        "orphans need a longer horizon"
+    );
+    assert!(
+        script.contains("-exec test ! -f '{}/rc'"),
+        "the second pass must select rc-LESS directories"
+    );
+
     assert!(script.contains("-exec rm -rf '{}'"));
-    assert!(!script.contains("log"));
+    assert!(
+        !script.contains("log"),
+        "prune must not look at log contents"
+    );
+
+    // A running job has no `rc`, so only the orphan pass can match it -- and
+    // that is safe only because the orphan horizon is far beyond the ordinary
+    // one. Derive both from the same host config rather than restating them, so
+    // a change to keep_days cannot silently narrow the gap.
+    let doubled = prune(&Host {
+        keep_days: 30,
+        ..host()
+    });
+    assert!(doubled.contains("-mtime +30"), "{doubled}");
+    assert!(doubled.contains("-mtime +120"), "{doubled}");
 }
