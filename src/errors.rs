@@ -70,12 +70,6 @@ pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Optio
     })
 }
 
-// CLI call sites still route wait failures through this adapter. Keep it as a
-// pass-through so only typed errors from the wait loop can select stable codes.
-pub fn waiting(error: AnyhowError, _id: &str) -> AnyhowError {
-    error
-}
-
 pub fn exit_code(error: &AnyhowError) -> i32 {
     match error.downcast_ref::<CoopError>() {
         Some(CoopError::NoMaster { .. }) => EXIT_NO_MASTER,

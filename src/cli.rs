@@ -660,8 +660,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         crate::tail::follow_deferred(&Ssh, host, &id, &mut output)
                     } else {
                         crate::tail::follow(&Ssh, host, &id, 0, &mut output)
-                    }
-                    .map_err(|error| crate::errors::waiting(error, id.as_str()));
+                    };
                     if let Ok(code) = result {
                         // The exit code is the cheap gate. Only a failed job
                         // earns even the bounded log-tail scan below.
@@ -710,8 +709,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             poll_with_hint(&Ssh, cfg.host(host.host.as_deref())?, &id, json, quiet)
         }
         Commands::Wait { id, host, timeout } => {
-            let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
-                .map_err(|error| crate::errors::waiting(error, id.as_str()));
+            let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout);
             if result.is_ok() && !quiet {
                 eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state");
             }
