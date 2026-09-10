@@ -69,6 +69,17 @@ a real capped host and none is reachable from a plain unit test.
 | 3 | a local non-root `sshd` with `MaxSessions 1` on a loopback port | `sshd` |
 | 3b | a real capped host | `$COOP_TEST_HOST` + a live master |
 
+Layer 3 lives in `tests/local_sshd.rs`, on the fixture in `tests/common/sshd.rs`.
+It re-runs the measurements the design rests on — channel refusal, isolation in
+both directions, five concurrent gated dispatches, detached dispatch latency,
+artifact durability across a destroyed tmux server, private-server invisibility,
+and exit 3 on every verb — in about 3s, with no token and no remote host.
+
+Anything that builds a remote script belongs here rather than behind `Fake`. A
+`Fake` returns canned output regardless of the script it was handed, so it
+cannot see a wrong script; every bug of that class so far was found by driving a
+real sshd.
+
 Layers 1–3 are unattended and part of `cargo test`; each skips with a printed
 note if its binary is missing. Only 3b needs a human (one hardware-token tap to
 open the master), and it holds only what a local sshd cannot show: the real

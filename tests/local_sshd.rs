@@ -38,27 +38,32 @@ impl Drop for Tmux<'_> {
         // killing alone litters one file per run in the user's tmux directory.
         // Ask tmux where the socket is rather than reconstructing it: on macOS
         // `$TMPDIR` is per-user while tmux uses `/tmp`, so guessing misses.
+        // Ask tmux for the socket path BEFORE killing, and fall back to the
+        // conventional location when the server is already gone -- which is the
+        // common case here, because a tmux server exits with its last job, so
+        // by cleanup time `display-message` fails and returns nothing while the
+        // socket FILE remains. Asking a dead server leaked four files per run
+        // with every test still passing.
+        //
         // One quoted shell string, not separate argv entries: ssh joins its
         // arguments and the REMOTE shell re-parses them, so an unquoted
-        // `#{socket_path}` arrives with the braces stripped and tmux prints the
-        // window list instead of the path. The socket then never gets removed,
-        // which is how this leaked four files per run while every test passed.
+        // `#{socket_path}` arrives with its braces stripped and tmux prints the
+        // window list instead of a path.
         let script = format!(
             "p=$(tmux -L {name} display-message -p '#{{socket_path}}' 2>/dev/null); \
              tmux -L {name} kill-server 2>/dev/null; \
-             [ -n \"$p\" ] && rm -f \"$p\"",
+             for c in \"$p\" \"${{TMUX_TMPDIR:-/tmp}}/tmux-$(id -u)/{name}\"; do \
+               [ -n \"$c\" ] && [ -S \"$c\" ] && rm -f \"$c\"; \
+             done; exit 0",
             name = self.name
         );
         let out = self.sshd.ssh(&[&script]);
-        if std::env::var_os("COOP_TEST_DEBUG_CLEANUP").is_some() {
-            eprintln!(
-                "cleanup {}: status={:?} out={:?} err={:?}",
-                self.name,
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+        assert!(
+            out.status.success(),
+            "tmux cleanup failed for {}: {}",
+            self.name,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
