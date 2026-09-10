@@ -228,7 +228,8 @@ pub enum Commands {
     /// List jobs
     ///
     /// The human table collapses whitespace and truncates commands to keep one
-    /// job on one scannable line. Use --json for each complete command.
+    /// job on one scannable line. Use --full to read a long command, --json for
+    /// the machine surface.
     Ls {
         #[command(flatten)]
         host: HostArg,

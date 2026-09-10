@@ -184,10 +184,11 @@ coop run [--host H] [--cwd D] [--max-secs S] [--wait] [--no-tail] <cmd>
 coop poll <id> [--host H] [--json]
 coop wait <id> [--host H] [--timeout S]
 coop tail <id> [--host H] [-f] [--all | -n LINES]
-coop ls [--host H] [--all] [--json]
-coop kill <id> [--host H]
-coop rm <id> [--host H]
+coop ls [--host H] [--all] [--json] [--full]
+coop kill <id> [--host H] [--rm]
+coop rm [<id> | --all] [--host H]
 coop host list [--json]
+coop host info [--host H] [--json]
 ```
 
 `poll` prints `running`, `orphan`, or the exit code. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
