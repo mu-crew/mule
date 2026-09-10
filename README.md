@@ -8,9 +8,7 @@ Long remote commands occupy an SSH session; on a `MaxSessions 1` connection, con
 cargo install coop-cli
 ```
 
-The crate is `coop-cli` because the bare `coop` name has been an unused
-placeholder on crates.io since 2022. **The binary is `coop`** — every command
-below is what you type.
+The binary is `coop`, which is what every command below uses.
 
 From source:
 

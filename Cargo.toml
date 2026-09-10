@@ -1,9 +1,7 @@
 [package]
-# The bare `coop` name has been a placeholder on crates.io since 2022 ("Reserved.
-# Cooperation for safe applications & libraries", one version, never updated), so
-# the crate takes the conventional `-cli` suffix. The BINARY is still `coop` --
-# see [[bin]] below -- so `cargo install coop-cli` puts `coop` on PATH and
-# nothing a user types changes.
+# `coop` is taken on crates.io, so the package takes the conventional `-cli`
+# suffix. Both targets below are still named `coop`, so nothing a user types
+# changes.
 name = "coop-cli"
 version = "0.1.0"
 edition = "2024"

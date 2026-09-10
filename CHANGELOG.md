@@ -5,8 +5,7 @@
 First release. `coop` fires jobs at a remote host over its own ssh control
 channel, hands back a job id, and holds no connection while the job runs.
 
-Published as **`coop-cli`** on crates.io because the bare `coop` name has been
-an unused placeholder there since 2022. The binary is `coop`.
+Published as `coop-cli` on crates.io. The binary is `coop`.
 
 ```sh
 cargo install coop-cli
