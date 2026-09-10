@@ -39,8 +39,9 @@ Rules:
   the task that makes it pass, red first (see TDD below).
 - Never commit with `--no-verify`.
 
-`cargo test` must pass **with no network and no ssh**. Test layers 1 and 2 (see
-below) are the default suite precisely so this holds on a plane.
+`cargo test` must pass **without a remote host or internet**. Layers 1–3 are
+the default suite precisely so this holds on a plane. Layer 3 uses a local
+`sshd` on loopback when available and skips otherwise.
 
 ## If the master is down, stop and ask
 
@@ -59,15 +60,15 @@ It needs no master and no token.
 
 ## Testing layers
 
-Three layers, because every invariant this design rests on was measured against
-a real capped host and none is reachable from a plain unit test.
+Four evidence layers, because every invariant this design rests on was measured
+against a real capped host and none is reachable from a plain unit test.
 
 | layer | what | needs |
 | --- | --- | --- |
 | 1 | pure logic over the `Transport` trait with `Fake` | nothing |
 | 2 | the real wrapper against `tmux -L coop-test-<pid> -f /dev/null` | `tmux` |
 | 3 | a local non-root `sshd` with `MaxSessions 1` on a loopback port | `sshd` |
-| 3b | a real capped host | `$COOP_TEST_HOST` + a live master |
+| 3b | a real capped host | operator-chosen host + a live coop master |
 
 Layer 3 lives in `tests/local_sshd.rs`, on the fixture in `tests/common/sshd.rs`.
 It re-runs the measurements the design rests on — channel refusal, isolation in
