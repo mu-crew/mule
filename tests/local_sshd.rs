@@ -71,7 +71,7 @@ impl Drop for Tmux<'_> {
 /// state is this machine's real state directory.
 fn clean_jobs(sshd: &Sshd, ids: &[String]) {
     for id in ids {
-        let _ = sshd.ssh(&["rm", "-rf", &format!("$HOME/.local/state/coop/jobs/{id}")]);
+        let _ = sshd.ssh(&["rm", "-rf", &format!("$XDG_STATE_HOME/coop/jobs/{id}")]);
     }
 }
 
@@ -84,7 +84,7 @@ fn the_cap_refuses_a_second_session_on_one_connection() {
     require_sshd!();
     let sshd = Sshd::start();
     let socket = sshd.dir.join("probe.sock");
-    sshd.open_master(&socket);
+    let _master = sshd.open_master(&socket);
 
     // Occupy the single channel.
     let mut holder = std::process::Command::new(sshd.dir.join("ssh"))
@@ -121,8 +121,8 @@ fn a_second_connection_is_unaffected_by_a_starved_first() {
     let sshd = Sshd::start();
     let first = sshd.dir.join("first.sock");
     let second = sshd.dir.join("second.sock");
-    sshd.open_master(&first);
-    sshd.open_master(&second);
+    let _first_master = sshd.open_master(&first);
+    let _second_master = sshd.open_master(&second);
 
     // Invariant 1, the whole basis of the design: the cap is per CONNECTION,
     // not per user. Starve one socket and the other must answer normally in the
@@ -165,7 +165,7 @@ fn a_second_connection_is_unaffected_by_a_starved_first() {
 fn concurrent_dispatches_all_succeed_through_the_gate() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "gate");
     let config = sshd.write_config(&tmux.name);
 
@@ -210,7 +210,7 @@ fn concurrent_dispatches_all_succeed_through_the_gate() {
 fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "run-hint");
     let config = sshd.write_config(&tmux.name);
 
@@ -250,7 +250,7 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
 fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "missing-path-hint");
     let config = sshd.write_config(&tmux.name);
 
@@ -320,7 +320,7 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
 fn dispatch_returns_before_the_job_finishes() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "latency");
     let config = sshd.write_config(&tmux.name);
     let release = sshd.dir.join("release-job");
@@ -376,7 +376,7 @@ fn dispatch_returns_before_the_job_finishes() {
 fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "job-timeout");
     let config = sshd.write_config(&tmux.name);
     let mut text = std::fs::read_to_string(&config).unwrap();
@@ -418,7 +418,7 @@ fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
 fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "job-fast");
     let config = sshd.write_config(&tmux.name);
 
@@ -485,7 +485,7 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
 fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "multiline-ls");
     let config = sshd.write_config(&tmux.name);
     let command = "python3 -c \"print('ok')\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\n#\ttabbed\"";
@@ -529,7 +529,7 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
 fn a_job_survives_the_loss_of_its_tmux_server() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "durable");
     let config = sshd.write_config(&tmux.name);
 
@@ -561,7 +561,7 @@ fn a_job_survives_the_loss_of_its_tmux_server() {
 fn the_private_tmux_server_is_invisible_to_the_default_one() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "private");
     let config = sshd.write_config(&tmux.name);
 
@@ -649,7 +649,7 @@ fn a_missing_master_exits_three_with_the_recovery_command() {
 fn host_info_probes_real_capabilities_and_reports_a_down_master() {
     require_sshd!();
     let sshd = Sshd::start();
-    sshd.open_master(&sshd.socket);
+    let _master = sshd.open_master(&sshd.socket);
     let config = sshd.dir.join("host-info.toml");
     std::fs::write(
         &config,

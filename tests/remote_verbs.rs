@@ -14,7 +14,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::sshd::Sshd;
+use common::sshd::{Master, Sshd};
 
 /// Serialises tests that act on ALL jobs against ones that create their own.
 ///
@@ -58,6 +58,9 @@ fn own_stamp(days_ago: u64) -> String {
 }
 
 struct Fixture {
+    // Fields drop in declaration order: close the master before its ssh shim
+    // and daemon owner remove the fixture directory.
+    _master: Master,
     sshd: Sshd,
     config: PathBuf,
     tmux: String,
@@ -67,10 +70,11 @@ struct Fixture {
 impl Fixture {
     fn new(tag: &str) -> Self {
         let sshd = Sshd::start();
-        sshd.open_master(&sshd.socket);
+        let master = sshd.open_master(&sshd.socket);
         let tmux = format!("coop-rv-{}-{tag}", std::process::id());
         let config = sshd.write_config(&tmux);
         Self {
+            _master: master,
             sshd,
             config,
             tmux,
@@ -109,7 +113,7 @@ impl Fixture {
     }
 
     fn job_dir(&self, id: &str) -> String {
-        format!("$HOME/.local/state/coop/jobs/{id}")
+        format!("$XDG_STATE_HOME/coop/jobs/{id}")
     }
 
     /// Read a job artifact, or empty when absent.
@@ -713,7 +717,7 @@ fn ls_explains_empty_and_hidden_results() {
     let mut f = Fixture::new("lshints");
     assert!(
         f.sshd
-            .ssh(&["rm -rf $HOME/.local/state/coop/jobs"])
+            .ssh(&["rm -rf $XDG_STATE_HOME/coop/jobs"])
             .status
             .success()
     );

@@ -19,6 +19,14 @@ fn host() -> Host {
 }
 
 #[test]
+fn default_jobs_root_stays_in_the_remote_home() {
+    assert_eq!(
+        coop::wrapper::JOBS_ROOT,
+        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs"
+    );
+}
+
+#[test]
 fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     let command = r#"printf '%s "quoted"' "$HOME/a b""#;
     let job = Job {
@@ -44,7 +52,10 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     // Under `jobs/`, not the state dir root: the ticket lock keeps
     // `<host>.lock` in that tree, and sharing one parent made `coop ls` report
     // `dev.lock` as an orphaned job.
-    assert_eq!(state_dir(&job.id), "$HOME/.local/state/coop/jobs/a1b2c3");
+    assert_eq!(
+        state_dir(&job.id),
+        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs/a1b2c3"
+    );
 }
 
 #[test]

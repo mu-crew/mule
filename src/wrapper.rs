@@ -24,7 +24,7 @@ pub fn state_dir(id: &JobId) -> String {
 }
 
 /// Parent of every job's state directory.
-pub const JOBS_ROOT: &str = "$HOME/.local/state/coop/jobs";
+pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
     let dir = state_dir(&job.id);

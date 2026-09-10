@@ -31,7 +31,24 @@ pub struct Sshd {
     pub port: u16,
     /// coop's private `ControlPath`, once [`Sshd::open_master`] has run.
     pub socket: PathBuf,
+    pub state_root: PathBuf,
     pid: Option<u32>,
+}
+
+/// Owns one control master and closes it even when a test unwinds.
+pub struct Master {
+    ssh: PathBuf,
+    socket: PathBuf,
+}
+
+impl Drop for Master {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.ssh)
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["-O", "exit", "127.0.0.1"])
+            .output();
+    }
 }
 
 /// Is this environment able to run the layer at all?
@@ -109,7 +126,8 @@ impl Sshd {
              UsePAM no\n\
              StrictModes no\n\
              PasswordAuthentication no\n\
-             KbdInteractiveAuthentication no\n",
+             KbdInteractiveAuthentication no\n\
+             AcceptEnv XDG_STATE_HOME\n",
             dir = dir.display()
         );
         let config_path = dir.join("sshd_config");
@@ -137,8 +155,9 @@ impl Sshd {
                 "#!/bin/sh\n\
                  exec /usr/bin/ssh -F /dev/null -i {dir}/id \\\n\
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\\n\
-                 -p {port} \"$@\"",
-                dir = dir.display()
+                 -o SetEnv=XDG_STATE_HOME={state} -p {port} \"$@\"",
+                dir = dir.display(),
+                state = dir.join("state").display()
             )
             .unwrap();
         }
@@ -146,6 +165,7 @@ impl Sshd {
 
         let mut sshd = Self {
             socket: dir.join("coop.sock"),
+            state_root: dir.join("state"),
             dir,
             port,
             pid: None,
@@ -206,7 +226,7 @@ impl Sshd {
     }
 
     /// Open a control master on `socket` and wait for it to answer.
-    pub fn open_master(&self, socket: &Path) {
+    pub fn open_master(&self, socket: &Path) -> Master {
         run(Command::new(self.dir.join("ssh"))
             .args(["-M", "-N", "-f", "-S"])
             .arg(socket)
@@ -215,6 +235,10 @@ impl Sshd {
         while !self.master_alive(socket) {
             assert!(std::time::Instant::now() < deadline, "master never came up");
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Master {
+            ssh: self.dir.join("ssh"),
+            socket: socket.to_owned(),
         }
     }
 
@@ -253,6 +277,7 @@ impl Sshd {
             .arg(config)
             .args(args)
             .env("PATH", self.path_env())
+            .env("XDG_STATE_HOME", &self.state_root)
             .stdin(Stdio::null())
             .output()
             .expect("coop failed to spawn")
@@ -261,14 +286,6 @@ impl Sshd {
 
 impl Drop for Sshd {
     fn drop(&mut self) {
-        // Close the master first: it holds a session on the daemon we are about
-        // to kill, and a leaked master outlives the test and poisons the next
-        // run with a socket that answers but cannot serve.
-        let _ = Command::new(self.dir.join("ssh"))
-            .arg("-S")
-            .arg(&self.socket)
-            .args(["-O", "exit", "127.0.0.1"])
-            .output();
         if let Some(pid) = self.pid {
             let _ = Command::new("kill").arg(pid.to_string()).output();
         }

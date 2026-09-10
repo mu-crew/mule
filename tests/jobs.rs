@@ -118,7 +118,10 @@ fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    let script = script.replace("$HOME/.local/state/coop/jobs", jobs.to_str().unwrap());
+    let script = script.replace(
+        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs",
+        jobs.to_str().unwrap(),
+    );
     let out = std::process::Command::new("sh")
         .args(["-c", &script])
         .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
