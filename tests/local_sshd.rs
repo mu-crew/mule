@@ -116,6 +116,43 @@ fn the_cap_refuses_a_second_session_on_one_connection() {
 }
 
 #[test]
+fn coop_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "busy");
+    let config = sshd.write_config(&tmux.name);
+
+    // Occupy the single MaxSessions slot outside coop's lock. The next coop
+    // verb still takes the lock, then ssh, and must classify the refusal
+    // rather than dump Permission denied (keyboard-interactive).
+    let mut holder = std::process::Command::new(sshd.dir.join("ssh"))
+        .arg("-S")
+        .arg(&sshd.socket)
+        .args(["-o", "BatchMode=yes", "127.0.0.1", "sleep", "8"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+
+    let out = sshd.coop(&config, &["poll", "abc123"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("one slot is held") || err.contains("master is down"),
+        "must surface SessionChannelBusy, not raw ssh: {err}"
+    );
+    assert!(
+        !err.contains("Permission denied") || err.contains("slot"),
+        "must not dump unclassified credentials-looking stderr alone: {err}"
+    );
+
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+#[test]
 fn a_second_connection_is_unaffected_by_a_starved_first() {
     require_sshd!();
     let sshd = Sshd::start();
