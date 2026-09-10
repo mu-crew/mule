@@ -60,13 +60,35 @@ impl Output {
 }
 
 pub trait Transport {
-    /// Run a shell script on the host. Sub-second by construction: a detached
-    /// dispatch or an artifact read, never the job itself.
-    fn run(&self, host: &Host, script: &str) -> Result<Output>;
+    /// Run a shell script on the host, WITHOUT taking the ticket lock.
+    ///
+    /// Callers outside this module want [`Transport::run`], which is the same
+    /// thing with the lock held. This is the unlocked primitive an
+    /// implementation provides; calling it directly opens a session channel
+    /// that coop's own fairness gate cannot see, which on a `MaxSessions 1`
+    /// host recreates the contention the whole tool exists to remove.
+    fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output>;
 
     /// Is there a usable multiplexing socket? `ssh -O check` only — it takes no
-    /// session channel, so this probe never competes with anything.
+    /// session channel, so this probe never competes with anything, and it is
+    /// the one call deliberately exempt from the lock.
     fn master_alive(&self, host: &Host) -> bool;
+
+    /// Run a shell script on the host, holding the host's ticket lock.
+    ///
+    /// **This is the only way callers should reach a host.** The lock covers
+    /// every ssh coop issues except `master_alive`, because two concurrent
+    /// reads hit exactly the cap that motivated the tool -- but until now that
+    /// was prose, enforced by six call sites each remembering to wrap
+    /// `run_unlocked` in `with_lock`. A seventh that forgot would compile,
+    /// pass every test, and quietly reintroduce the contention.
+    ///
+    /// Provided rather than required, so no implementation can weaken it: the
+    /// lock is applied here, once, and an implementor supplies only the
+    /// unlocked primitive.
+    fn run(&self, host: &Host, script: &str) -> Result<Output> {
+        crate::lock::with_lock(&host.name, || self.run_unlocked(host, script))?
+    }
 }
 
 /// Every ssh coop runs, configured so it can never prompt.
@@ -129,7 +151,7 @@ fn base_command(host: &Host) -> Command {
 pub struct Ssh;
 
 impl Transport for Ssh {
-    fn run(&self, host: &Host, script: &str) -> Result<Output> {
+    fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output> {
         let out = base_command(host)
             .arg(script)
             .output()
@@ -195,7 +217,7 @@ impl Fake {
 }
 
 impl Transport for Fake {
-    fn run(&self, _host: &Host, script: &str) -> Result<Output> {
+    fn run_unlocked(&self, _host: &Host, script: &str) -> Result<Output> {
         self.scripts.lock().unwrap().push(script.to_string());
         Ok(self
             .outputs

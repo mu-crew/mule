@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, Host};
-use crate::lock::with_lock;
 use crate::probe::State;
 use crate::transport::Transport;
 use crate::wrapper::{JOBS_ROOT, JobId, state_dir};
@@ -60,7 +59,7 @@ pub fn list(
             });
             continue;
         }
-        let output = with_lock(&host.name, || transport.run(host, &list_script(host)))??;
+        let output = transport.run(host, &list_script(host))?;
         if output.code != 0 {
             bail!(
                 "listing jobs on {} failed: {}",
@@ -230,7 +229,7 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
         ),
     };
 
-    let output = with_lock(&host.name, || transport.run(host, &script))??;
+    let output = transport.run(host, &script)?;
     if output.code != 0 {
         bail!("rm failed on {}: {}", host.name, output.stderr.trim());
     }
@@ -249,7 +248,7 @@ fn run_mutation(
     script: &str,
     operation: &str,
 ) -> Result<()> {
-    let output = with_lock(&host.name, || transport.run(host, script))??;
+    let output = transport.run(host, script)?;
     if output.code != 0 {
         bail!("{operation} failed: {}", output.stderr.trim());
     }

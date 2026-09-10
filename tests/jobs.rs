@@ -97,7 +97,7 @@ struct HostsFake {
 }
 
 impl Transport for HostsFake {
-    fn run(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
+    fn run_unlocked(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
         self.scripts
             .lock()
             .unwrap()

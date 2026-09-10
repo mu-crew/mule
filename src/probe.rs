@@ -3,7 +3,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
-use crate::lock::with_lock;
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
 
@@ -61,7 +60,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
             None => "true".to_string(),
         }
     );
-    let mut output = with_lock(&host.name, || t.run(host, &script))??;
+    let mut output = t.run(host, &script)?;
     if output.code != 0 {
         bail!("probe failed: {}", output.stderr.trim());
     }

@@ -115,6 +115,11 @@ Consequences, each of which has cost someone real debugging time:
 - **The lock covers every ssh except `ssh -O check`.** Two concurrent `poll`s
   hit the same cap that motivated the tool. `-O check` is exempt because it was
   measured at 0s and opens no session channel.
+
+  This is enforced by the type, not by discipline: `Transport::run` is a
+  provided method that takes the lock, and implementations supply only
+  `run_unlocked`. Never call `run_unlocked` outside `src/transport.rs` -- doing
+  so opens a session channel the fairness gate cannot see.
 - **User commands are base64-encoded**, never interpolated. They cross three
   expansion layers (ssh's shell, tmux's argument, `sh -c`) plus coop's appended
   redirect.

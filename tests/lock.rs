@@ -20,9 +20,23 @@ fn isolate_state() {
     });
 }
 
+/// Serialises the timing-sensitive lock tests against each other.
+///
+/// Two tests here deliberately create lock contention, and running them
+/// concurrently means each measures the other's load rather than the lock's
+/// fairness. That is not a flaky assertion, it is the wrong experiment: the
+/// property under test is per-host queue behaviour, so a second unrelated queue
+/// running beside it is noise.
+static TIMING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn timing_lane() -> std::sync::MutexGuard<'static, ()> {
+    TIMING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn four_concurrent_callers_all_wait_bounded() {
     isolate_state();
+    let _lane = timing_lane();
     let host = format!("locktest-bounded-{}", std::process::id());
     let mut hs = vec![];
     for _ in 0..4 {
@@ -199,4 +213,75 @@ fn waiter_files_do_not_accumulate() {
         .collect();
     std::fs::remove_dir_all(&dir).ok();
     assert!(strays.is_empty(), "leaked waiter files: {strays:?}");
+}
+
+#[test]
+fn the_transport_locks_without_the_caller_asking() {
+    isolate_state();
+    let _lane = timing_lane();
+    // The lock covers every ssh coop issues except `master_alive`. That used to
+    // be prose, enforced by six call sites each remembering to wrap the
+    // transport in `with_lock` -- a seventh that forgot would compile, pass
+    // every test, and quietly reintroduce the contention the tool exists to
+    // remove. Now `Transport::run` is a provided method that takes the lock
+    // itself, so forgetting is not expressible.
+    //
+    // Proven by observation rather than inspection: a transport whose unlocked
+    // primitive blocks lets us check that a second caller cannot get in.
+    use coop::transport::{Output, Transport};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Blocking {
+        inside: AtomicUsize,
+        peak: AtomicUsize,
+    }
+    impl Transport for Blocking {
+        fn run_unlocked(
+            &self,
+            _host: &coop::config::Host,
+            _script: &str,
+        ) -> anyhow::Result<Output> {
+            let n = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(40));
+            self.inside.fetch_sub(1, Ordering::SeqCst);
+            Ok(Output::ok(""))
+        }
+        fn master_alive(&self, _host: &coop::config::Host) -> bool {
+            true
+        }
+    }
+
+    let cfg = coop::config::Config::parse(&format!(
+        "[hosts.locktest-transport-{}]\ntarget = \"h\"\n",
+        std::process::id()
+    ))
+    .unwrap();
+    let host = cfg.host(None).unwrap();
+    let transport = Arc::new(Blocking {
+        inside: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+
+    let mut handles = vec![];
+    for _ in 0..4 {
+        let t = Arc::clone(&transport);
+        let h = host.clone();
+        handles.push(std::thread::spawn(move || {
+            t.run(&h, "echo hi").unwrap();
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert_eq!(
+        transport.peak.load(Ordering::SeqCst),
+        1,
+        "Transport::run must serialise: four callers overlapped inside the \
+         unlocked primitive, so the lock is not being applied"
+    );
+
+    let dir = coop::lock::lock_path(&host.name);
+    std::fs::remove_dir_all(&dir).ok();
 }

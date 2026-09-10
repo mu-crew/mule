@@ -37,7 +37,7 @@ fn a_down_master_is_reported_not_fatal() {
 fn every_configured_host_is_probed() {
     struct Counting(std::cell::Cell<usize>);
     impl Transport for Counting {
-        fn run(
+        fn run_unlocked(
             &self,
             _h: &coop::config::Host,
             _s: &str,

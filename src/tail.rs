@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
-use crate::lock::with_lock;
 use crate::probe::{From as ProbeFrom, State, next_interval, probe};
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
@@ -35,7 +34,7 @@ pub fn once(
     // Ask about truncation in the SAME round trip -- a second call would take
     // the lock twice to answer a question that is one byte on disk.
     let script = format!("{read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\"");
-    let output = with_lock(&host.name, || transport.run(host, &script))??;
+    let output = transport.run(host, &script)?;
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
     }

@@ -3,7 +3,6 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
-use crate::lock::with_lock;
 use crate::transport::Transport;
 use crate::wrapper::{Job, JobId, dispatch_script, new_id};
 
@@ -47,7 +46,7 @@ pub fn dispatch_with_warnings(
     // The retrospective count shares the measured 0s dispatch round trip. A
     // pre-flight warning would double both ssh round trips and lock cycles for
     // advisory backpressure.
-    let output = with_lock(&host.name, || transport.run(host, &script))??;
+    let output = transport.run(host, &script)?;
     if output.code != 0 {
         bail!(
             "dispatch failed for {}: {}",
