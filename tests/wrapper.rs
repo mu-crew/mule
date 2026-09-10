@@ -27,7 +27,15 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
 
     let script = dispatch_script(&host(), &job);
 
-    assert!(script.contains("tmux -L coop new-session -d -s coop-a1b2c3"));
+    assert!(script.contains("tmux -L coop -f /dev/null new-session -d -s coop-a1b2c3"));
+    // `-f /dev/null` is not cosmetic: a cold server that sources the user's
+    // ~/.tmux.conf took 4.5s to start against 0.03s with an empty config,
+    // measured. Every job pays it, and status hooks that shell out are the
+    // usual cause.
+    assert!(
+        script.contains("-f /dev/null"),
+        "must not read the user's tmux.conf"
+    );
     assert!(!script.contains(command));
     assert_eq!(script.matches('\'').count() % 2, 0);
     // Under `jobs/`, not the state dir root: the ticket lock keeps

@@ -49,7 +49,7 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
 
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
-         tmux -L {} new-session -d -s coop-{} \
+         tmux -L {} -f /dev/null new-session -d -s coop-{} \
          '{cd} && printf %s {command} | base64 -d | sh > {dir}/log 2>&1; echo $? > {dir}/rc'",
         host.tmux_socket, job.id
     )
