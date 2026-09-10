@@ -1,6 +1,7 @@
 use std::io::Cursor;
 
 use coop::config::{Config, Host};
+use coop::errors::{CoopError, EXIT_DROPPED, EXIT_ORPHAN, EXIT_TIMEOUT, exit_code};
 use coop::tail::{Selection, follow, follow_deferred, once};
 use coop::transport::{Fake, Output};
 
@@ -81,7 +82,11 @@ fn follow_reports_an_orphan_instead_of_inventing_an_exit_code() {
 
     let error = follow(&fake, &host(), &"dead42".parse().unwrap(), 0, &mut out).unwrap_err();
 
-    assert!(error.to_string().contains("no rc will ever arrive"));
+    assert!(matches!(
+        error.downcast_ref::<CoopError>(),
+        Some(CoopError::Orphan { id }) if id == "dead42"
+    ));
+    assert_eq!(exit_code(&error), EXIT_ORPHAN);
     assert_eq!(out.into_inner(), b"last");
 }
 
@@ -95,6 +100,11 @@ fn follow_names_the_resume_command_after_a_connection_error() {
 
     let error = follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap_err();
 
+    assert!(matches!(
+        error.downcast_ref::<CoopError>(),
+        Some(CoopError::Dropped { id }) if id == "abc123"
+    ));
+    assert_eq!(exit_code(&error), EXIT_DROPPED);
     assert!(error.to_string().contains("coop tail abc123"));
 }
 
@@ -167,6 +177,23 @@ fn a_job_that_finishes_within_one_probe_still_prints_its_output() {
         "output arriving with rc must not be lost"
     );
     assert_eq!(fake.scripts().len(), 2, "one extra read on the done path");
+}
+
+#[test]
+fn a_zero_timeout_returns_a_typed_timeout_after_one_state_probe() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(reply("rc=\nalive=1", 0, b""));
+    let id = "abc123".parse().unwrap();
+
+    let error = coop::tail::wait_only(&fake, &host(), &id, Some(0)).unwrap_err();
+
+    assert!(matches!(
+        error.downcast_ref::<CoopError>(),
+        Some(CoopError::Timeout { id }) if id == "abc123"
+    ));
+    assert_eq!(exit_code(&error), EXIT_TIMEOUT);
+    assert_eq!(fake.scripts().len(), 1);
 }
 
 #[test]

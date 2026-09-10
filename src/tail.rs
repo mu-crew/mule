@@ -1,9 +1,10 @@
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::config::Host;
+use crate::errors::CoopError;
 use crate::probe::{From as ProbeFrom, State, next_interval, probe};
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
@@ -121,9 +122,8 @@ fn wait_loop(
     let started = Instant::now();
     let mut interval = Duration::from_secs(1);
     loop {
-        let result = probe(transport, host, id, from).with_context(|| {
-            format!("lost contact while waiting; the job continues\n  resume: coop tail {id}")
-        })?;
+        let result = probe(transport, host, id, from)
+            .map_err(|error| error.context(CoopError::Dropped { id: id.to_string() }))?;
         let new_bytes = !result.bytes.is_empty();
         if let Some(writer) = out.as_deref_mut() {
             writer.write_all(&result.bytes)?;
@@ -155,11 +155,13 @@ fn wait_loop(
                 }
                 return Ok(code);
             }
-            State::Orphan => bail!("job {id} is orphaned; no rc will ever arrive"),
+            State::Orphan => {
+                return Err(CoopError::Orphan { id: id.to_string() }.into());
+            }
             State::Running => {}
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            bail!("timed out waiting for job {id}; it is still running");
+            return Err(CoopError::Timeout { id: id.to_string() }.into());
         }
         let sleep = timeout
             .map(|limit| interval.min(limit.saturating_sub(started.elapsed())))

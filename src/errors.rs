@@ -70,20 +70,10 @@ pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Optio
     })
 }
 
-pub fn waiting(error: AnyhowError, id: &str) -> AnyhowError {
-    if error.downcast_ref::<CoopError>().is_some() {
-        return error;
-    }
-    let message = format!("{error:#}");
-    if message.contains("no rc will ever arrive") {
-        CoopError::Orphan { id: id.to_owned() }.into()
-    } else if message.contains("timed out waiting") {
-        CoopError::Timeout { id: id.to_owned() }.into()
-    } else if message.contains("lost contact while waiting") {
-        CoopError::Dropped { id: id.to_owned() }.into()
-    } else {
-        error
-    }
+// CLI call sites still route wait failures through this adapter. Keep it as a
+// pass-through so only typed errors from the wait loop can select stable codes.
+pub fn waiting(error: AnyhowError, _id: &str) -> AnyhowError {
+    error
 }
 
 pub fn exit_code(error: &AnyhowError) -> i32 {

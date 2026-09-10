@@ -162,6 +162,19 @@ fn typed_failures_have_stable_distinct_exit_codes() {
 }
 
 #[test]
+fn wait_error_prose_cannot_select_a_stable_exit_code() {
+    isolate_state();
+    for message in [
+        "no rc will ever arrive",
+        "timed out waiting",
+        "lost contact while waiting",
+    ] {
+        let error = coop::errors::waiting(anyhow::anyhow!(message), "abc123");
+        assert_eq!(exit_code(&error), 1, "untyped prose must stay generic");
+    }
+}
+
+#[test]
 fn top_level_help_documents_the_operational_contract_and_exit_table() {
     isolate_state();
     let help = Cli::command().render_long_help().to_string();
