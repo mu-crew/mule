@@ -60,13 +60,19 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
     //
     // The marker records that truncation happened, so `tail` can say the log is
     // capped rather than presenting a partial log as complete.
+    //
+    // `if [ -s ... ]; then ...; fi` rather than `[ -s ... ] && ...`: the test is
+    // the last command in the pipeline's right-hand side, so with an empty
+    // overflow file the `&&` form exits 1 -- and that became the exit status of
+    // the whole wrapper. Every successful job reported `rc 1`, including
+    // `coop run true`.
 
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
          tmux -L {} -f /dev/null new-session -d -s coop-{} \
          '{{ {cd} && printf %s {command} | base64 -d | sh; echo $? > {dir}/rc; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
-               [ -s {dir}/.overflow ] && echo 1 > {dir}/truncated; \
+               if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
                rm -f {dir}/.overflow; }}'",
         host.tmux_socket, job.id, host.max_log_bytes
     )

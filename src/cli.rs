@@ -404,16 +404,68 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
         return;
     }
 
-    for row in rows {
-        let (state, rc) = match row.state {
-            State::Running => ("running", "-".to_string()),
-            State::Done(code) => ("done", code.to_string()),
-            State::Orphan => ("orphan", "-".to_string()),
-        };
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            row.id, row.host, state, rc, row.age_secs, row.cmd
-        );
+    if rows.is_empty() {
+        return;
+    }
+
+    // Aligned columns with a header. Tab-separated output with no header left
+    // the reader counting fields to work out which number was the exit code and
+    // which the age -- and `--json` already covers the machine case, so this
+    // one is for a person.
+    let cells: Vec<[String; 6]> = rows
+        .iter()
+        .map(|row| {
+            let (state, rc) = match row.state {
+                State::Running => ("running", "-".to_string()),
+                State::Done(code) => ("done", code.to_string()),
+                State::Orphan => ("orphan", "-".to_string()),
+            };
+            [
+                row.id.clone(),
+                row.host.clone(),
+                state.to_string(),
+                rc,
+                format_age(row.age_secs),
+                row.cmd.clone(),
+            ]
+        })
+        .collect();
+
+    let head = ["ID", "HOST", "STATE", "RC", "AGE", "COMMAND"];
+    // Width the first five columns; the command is last so it can run long
+    // without padding the line.
+    let mut width = head.map(str::len);
+    for row in &cells {
+        for (w, cell) in width.iter_mut().zip(row) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+
+    let render = |cols: &[String; 6]| {
+        let mut line = String::new();
+        for (i, cell) in cols.iter().enumerate().take(5) {
+            line.push_str(&format!("{:<width$}  ", cell, width = width[i]));
+        }
+        line.push_str(&cols[5]);
+        line
+    };
+
+    println!("{}", render(&head.map(String::from)));
+    for row in &cells {
+        println!("{}", render(row));
+    }
+}
+
+/// Compact relative age: `45s`, `12m`, `3h`, `2d`.
+///
+/// Raw seconds made the reader do arithmetic to answer the only question they
+/// were asking -- is this recent? -- and got worse the older the job was.
+fn format_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
     }
 }
 

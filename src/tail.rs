@@ -131,7 +131,25 @@ fn wait_loop(
         }
 
         match result.state {
-            State::Done(code) => return Ok(code),
+            // One more read before returning. `rc` and `log` are written by
+            // different ends of a pipeline, so `rc` can land while the log's
+            // final bytes are still in flight -- measured: rc present with the
+            // log file not yet created. Returning on the first `Done` therefore
+            // dropped the output of any job short enough to finish inside one
+            // probe interval, which is most of them: `coop run --wait ls`
+            // printed the id and nothing else.
+            //
+            // A single extra round trip, only on the terminal path, and only
+            // when someone is actually reading the output.
+            State::Done(code) => {
+                if let Some(writer) = out.as_deref_mut()
+                    && let ProbeFrom::Offset(offset) = from
+                {
+                    let tail = probe(transport, host, id, ProbeFrom::Offset(offset))?;
+                    writer.write_all(&tail.bytes)?;
+                }
+                return Ok(code);
+            }
             State::Orphan => bail!("job {id} is orphaned; no rc will ever arrive"),
             State::Running => {}
         }

@@ -75,3 +75,28 @@ fn a_cwd_with_a_space_is_quoted() {
         "cwd must not be interpolated raw: {script}"
     );
 }
+
+#[test]
+fn the_truncation_check_cannot_become_the_jobs_exit_code() {
+    // `[ -s .overflow ] && echo 1 > truncated` is the last command in the
+    // pipeline's right-hand side, so with an empty overflow file it exits 1 --
+    // and that became the exit status of the whole wrapper. Every successful
+    // job reported `rc 1`, `coop run true` included. An `if` form has no such
+    // result.
+    let script = dispatch_script(
+        &host(),
+        &Job {
+            id: "abc123".parse().unwrap(),
+            cmd: "true".into(),
+            cwd: None,
+        },
+    );
+    assert!(
+        script.contains("if [ -s"),
+        "the truncation check must not be a trailing && test: {script}"
+    );
+    assert!(
+        !script.contains("] && echo 1 >"),
+        "a trailing && test leaks its status into the job's rc: {script}"
+    );
+}

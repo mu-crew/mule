@@ -43,6 +43,8 @@ fn follow_streams_each_byte_once_and_returns_the_job_rc() {
     fake.push(reply("rc=\nalive=1", 1, b"a"));
     fake.push(reply("rc=\nalive=1", 2, b"b"));
     fake.push(reply("rc=3\nalive=0", 2, b""));
+    // The terminal re-read on the done path: nothing further arrived.
+    fake.push(reply("rc=3\nalive=0", 2, b""));
     let mut out = Cursor::new(Vec::new());
 
     let code = follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
@@ -61,6 +63,7 @@ fn follow_does_not_trust_an_overlapping_reported_size_as_the_offset() {
     let fake = Fake::new();
     fake.push(reply("rc=\nalive=1", 20, b"a"));
     fake.push(reply("rc=0\nalive=0", 20, b"b"));
+    fake.push(reply("rc=0\nalive=0", 20, b"")); // terminal re-read
     let mut out = Cursor::new(Vec::new());
 
     follow(&fake, &host(), &"abc123".parse().unwrap(), 7, &mut out).unwrap();
@@ -138,4 +141,44 @@ fn one_shot_tail_limits_the_remote_read_before_taking_stdout() {
         assert_eq!(out.into_inner(), [0, 0xff, b'x']);
         assert!(fake.scripts()[0].contains(command));
     }
+}
+
+#[test]
+fn a_job_that_finishes_within_one_probe_still_prints_its_output() {
+    // `rc` and `log` are written by different ends of a pipeline, so `rc` can
+    // land while the log's last bytes are still in flight -- measured, with the
+    // log file not yet created. Returning on the first `Done` therefore dropped
+    // the output of any job short enough to finish inside one probe interval,
+    // which is most of them: `coop run --wait ls` printed the id and nothing.
+    isolate_state();
+    let fake = Fake::new();
+    // First probe: already done, and no bytes yet.
+    fake.push(Output::ok("rc=0\nalive=0\nsize=6\nbytes:\n"));
+    // The terminal re-read finds them.
+    fake.push(Output::ok("rc=0\nalive=0\nsize=6\nbytes:\nlate\n"));
+
+    let mut out = Vec::new();
+    let code = coop::tail::follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "late\n",
+        "output arriving with rc must not be lost"
+    );
+    assert_eq!(fake.scripts().len(), 2, "one extra read on the done path");
+}
+
+#[test]
+fn a_plain_wait_does_not_pay_for_the_terminal_read() {
+    // `wait` prints nothing, so the extra round trip would be pure cost on the
+    // channel it is meant to protect.
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(Output::ok("rc=2\nalive=0\nsize=0\nbytes:\n"));
+
+    let code = coop::tail::wait_only(&fake, &host(), &"abc123".parse().unwrap(), None).unwrap();
+
+    assert_eq!(code, 2);
+    assert_eq!(fake.scripts().len(), 1, "no terminal read when not tailing");
 }
