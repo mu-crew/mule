@@ -617,7 +617,21 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
         json.contains(
             "\"cmd\":\"python3 -c \\\"print('ok')\\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\\n#\\ttabbed\\\"\""
         ),
-        "JSON must preserve the complete command byte-for-byte: {json}"
+        "json must keep the complete command: {json}"
+    );
+
+    let full = stdout(&sshd.coop(&config, &["ls", "--all", "--full"]));
+    let full_row = full
+        .lines()
+        .find(|line| line.starts_with(&id))
+        .expect("dispatched job must appear in ls --full");
+    assert!(
+        full_row.contains("tabbed"),
+        "--full must keep the whole command: {full_row}"
+    );
+    assert!(
+        !full_row.contains('\u{2026}'),
+        "--full must not truncate: {full_row}"
     );
 
     clean_jobs(&sshd, &[id]);
