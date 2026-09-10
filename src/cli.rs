@@ -8,11 +8,63 @@ use std::io::Write;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use crate::config::{Config, Host};
 use crate::errors::{CoopError, EXIT_NO_MASTER};
 use crate::probe::{State, probe};
 use crate::transport::{Ssh, Transport};
+
+#[derive(Serialize)]
+struct JsonItems<T> {
+    items: T,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct HostListJson<'a> {
+    name: &'a str,
+    target: &'a str,
+    socket: String,
+    master: bool,
+}
+
+#[derive(Serialize)]
+struct HostInfoJson<'a> {
+    name: &'a str,
+    target: &'a str,
+    master: bool,
+    os: &'a str,
+    arch: &'a str,
+    cores: Option<u64>,
+    ram_gb: Option<u64>,
+    gpu: &'a str,
+    socket: String,
+    remedy: &'a str,
+}
+
+#[derive(Serialize)]
+struct JobJson<'a> {
+    id: &'a str,
+    host: &'a str,
+    state: &'static str,
+    rc: Option<i32>,
+    age_secs: u64,
+    cmd: &'a str,
+}
+
+#[derive(Serialize)]
+struct UnreachableJson<'a> {
+    host: &'a str,
+    why: &'a str,
+    remedy: &'a str,
+}
+
+#[derive(Serialize)]
+struct JobsJson<'a> {
+    items: Vec<JobJson<'a>>,
+    unreachable: Vec<UnreachableJson<'a>>,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -254,24 +306,24 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
         cfg.hosts().iter().map(|h| (h, t.master_alive(h))).collect();
 
     if json {
-        // Hand-rolled rather than pulling in serde_json for one object: the
-        // shape is three flat fields and this keeps the dependency list short.
-        let items: Vec<String> = rows
+        // JSON is an agent-facing contract, and this is now one of three
+        // emitters. Typed serialization makes escaping mandatory instead of a
+        // convention each new field can forget.
+        let items = rows
             .iter()
-            .map(|(h, up)| {
-                format!(
-                    r#"{{"name":"{}","target":"{}","socket":"{}","master":{}}}"#,
-                    h.name,
-                    h.target,
-                    h.socket.display(),
-                    up
-                )
+            .map(|(host, master)| HostListJson {
+                name: &host.name,
+                target: &host.target,
+                socket: host.socket.to_string_lossy().into_owned(),
+                master: *master,
             })
-            .collect();
+            .collect::<Vec<_>>();
         println!(
-            "{{\"items\":[{}],\"count\":{}}}",
-            items.join(","),
-            rows.len()
+            "{}",
+            serde_json::to_string(&JsonItems {
+                count: items.len(),
+                items,
+            })?
         );
         return Ok(());
     }
@@ -363,24 +415,26 @@ fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: b
     if json {
         let items = rows
             .iter()
-            .map(|row| {
-                format!(
-                    r#"{{"name":"{}","target":"{}","master":{},"os":"{}","arch":"{}","cores":{},"ram_gb":{},"gpu":"{}","socket":"{}","remedy":"{}"}}"#,
-                    json_escape(&row.host.name),
-                    json_escape(&row.host.target),
-                    row.master,
-                    json_escape(&row.os),
-                    json_escape(&row.arch),
-                    row.cores.map_or_else(|| "null".into(), |n| n.to_string()),
-                    row.ram_gb.map_or_else(|| "null".into(), |n| n.to_string()),
-                    json_escape(&row.gpu),
-                    json_escape(&row.host.socket.to_string_lossy()),
-                    json_escape(row.remedy.as_deref().unwrap_or("")),
-                )
+            .map(|row| HostInfoJson {
+                name: &row.host.name,
+                target: &row.host.target,
+                master: row.master,
+                os: &row.os,
+                arch: &row.arch,
+                cores: row.cores,
+                ram_gb: row.ram_gb,
+                gpu: &row.gpu,
+                socket: row.host.socket.to_string_lossy().into_owned(),
+                remedy: row.remedy.as_deref().unwrap_or(""),
             })
-            .collect::<Vec<_>>()
-            .join(",");
-        println!("{{\"items\":[{items}],\"count\":{}}}", rows.len());
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&JsonItems {
+                count: items.len(),
+                items,
+            })?
+        );
         return Ok(());
     }
 
@@ -738,36 +792,39 @@ fn print_jobs(
             .iter()
             .map(|row| {
                 let (state, rc) = match row.state {
-                    State::Running => ("running", "null".to_string()),
-                    State::Done(code) => ("done", code.to_string()),
-                    State::Orphan => ("orphan", "null".to_string()),
+                    State::Running => ("running", None),
+                    State::Done(code) => ("done", Some(code)),
+                    State::Orphan => ("orphan", None),
                 };
-                format!(
-                    r#"{{"id":"{}","host":"{}","state":"{state}","rc":{rc},"age_secs":{},"cmd":"{}"}}"#,
-                    json_escape(&row.id),
-                    json_escape(&row.host),
-                    row.age_secs,
-                    json_escape(&row.cmd)
-                )
+                JobJson {
+                    id: &row.id,
+                    host: &row.host,
+                    state,
+                    rc,
+                    age_secs: row.age_secs,
+                    cmd: &row.cmd,
+                }
             })
-            .collect::<Vec<_>>()
-            .join(",");
+            .collect();
         let down = unreachable
             .iter()
-            .map(|host| {
+            .map(|host| UnreachableJson {
+                host: &host.host,
+                why: &host.why,
                 // Carry the remedy in JSON too: a script cannot parse the
                 // stderr prose, and "unreachable" without the fix is not
                 // actionable for an agent either.
-                format!(
-                    r#"{{"host":"{}","why":"{}","remedy":"{}"}}"#,
-                    json_escape(&host.host),
-                    json_escape(&host.why),
-                    json_escape(host.remedy.as_deref().unwrap_or(""))
-                )
+                remedy: host.remedy.as_deref().unwrap_or(""),
             })
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(r#"{{"items":[{items}],"unreachable":[{down}]}}"#);
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string(&JobsJson {
+                items,
+                unreachable: down,
+            })
+            .expect("serializing string-backed job rows cannot fail")
+        );
         if rows.is_empty() && hidden == 0 && !quiet {
             eprintln!("no jobs; next: coop run <cmd>");
         }
@@ -907,24 +964,6 @@ fn display_command(command: &str) -> String {
     }
 
     collapsed.chars().take(WIDTH - 1).chain(['…']).collect()
-}
-
-fn json_escape(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\u{08}' => escaped.push_str("\\b"),
-            '\u{0c}' => escaped.push_str("\\f"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            c if c < '\u{20}' => escaped.push_str(&format!("\\u{:04x}", c as u32)),
-            c => escaped.push(c),
-        }
-    }
-    escaped
 }
 
 #[cfg(test)]

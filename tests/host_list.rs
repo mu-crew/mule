@@ -6,6 +6,36 @@ use coop::config::Config;
 use coop::transport::{Fake, Transport};
 
 #[test]
+fn host_list_json_escapes_every_free_text_field() {
+    // Host names now have a filename-component grammar, so the free-text
+    // target and socket fields carry the hostile JSON characters.
+    let dir = std::env::temp_dir().join(format!("coop-host-json-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[hosts.safe-name]\ntarget = \"quote\\\" slash\\\\ newline\\n tab\\t control\\u0001 café\"\nsocket = \"/tmp/quote\\\"-slash\\\\-newline\\n-tab\\t-control\\u0001-café.sock\"\n").unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["host", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("host list must emit valid JSON");
+    let host = &value["items"][0];
+    assert_eq!(host["name"], "safe-name");
+    assert_eq!(
+        host["target"],
+        "quote\" slash\\ newline\n tab\t control\u{1} café"
+    );
+    assert_eq!(
+        host["socket"],
+        "/tmp/quote\"-slash\\-newline\n-tab\t-control\u{1}-café.sock"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn master_detection_is_a_separate_method_from_run() {
     // The exemption of `ssh -O check` from the ticket lock is only structural
     // if it is a different method. If someone ever routes master detection

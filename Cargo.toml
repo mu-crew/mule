@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Config: hand-edited TOML, so serde + toml only. No state database.
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 
 # Errors: anyhow at the boundary, thiserror for the classified ssh failures
