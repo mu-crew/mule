@@ -161,12 +161,16 @@ pub enum Commands {
         lines: Option<u64>,
     },
     /// List jobs
+    ///
+    /// The human table collapses whitespace and truncates commands to keep one
+    /// job on one scannable line. Use --json for each complete command.
     Ls {
         #[command(flatten)]
         host: HostArg,
         /// Include finished jobs
         #[arg(long)]
         all: bool,
+        /// Emit machine-readable rows with complete, unmodified commands
         #[arg(long)]
         json: bool,
     },
@@ -508,7 +512,7 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
                 state.to_string(),
                 rc,
                 format_age(row.age_secs),
-                row.cmd.clone(),
+                display_command(&row.cmd),
             ]
         })
         .collect();
@@ -595,6 +599,17 @@ fn format_age(secs: u64) -> String {
     }
 }
 
+fn display_command(command: &str) -> String {
+    const WIDTH: usize = 80;
+
+    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= WIDTH {
+        return collapsed;
+    }
+
+    collapsed.chars().take(WIDTH - 1).chain(['…']).collect()
+}
+
 fn json_escape(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
     for c in input.chars() {
@@ -611,4 +626,28 @@ fn json_escape(input: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_command;
+
+    #[test]
+    fn display_command_truncates_on_character_boundaries() {
+        const LIMIT: usize = 80;
+        let exact = "é".repeat(LIMIT);
+        let over = "é".repeat(LIMIT + 1);
+
+        assert_eq!(display_command(&exact), exact);
+        assert_eq!(
+            display_command(&over),
+            format!("{}…", "é".repeat(LIMIT - 1))
+        );
+    }
+
+    #[test]
+    fn display_command_collapses_whitespace() {
+        assert_eq!(display_command("one\n\ttwo   three"), "one two three");
+        assert_eq!(display_command(""), "");
+    }
 }

@@ -327,6 +327,50 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
 }
 
 #[test]
+fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "multiline-ls");
+    let config = sshd.write_config(&tmux.name);
+    let command = "python3 -c \"print('ok')\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\n#\ttabbed\"";
+
+    let run = sshd.coop(&config, &["run", command]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let id = stdout(&run);
+
+    let table = stdout(&sshd.coop(&config, &["ls", "--all"]));
+    let row = table
+        .lines()
+        .find(|line| line.starts_with(&id))
+        .expect("dispatched job must appear in ls");
+    assert!(row.contains("python3 -c \"print('ok') # this deliberately"));
+    assert!(
+        row.ends_with('…'),
+        "long command must have a visible marker: {row}"
+    );
+    assert_eq!(
+        table.lines().filter(|line| line.contains("tabbed")).count(),
+        0,
+        "embedded whitespace must not create a continuation row: {table}"
+    );
+
+    let json = stdout(&sshd.coop(&config, &["ls", "--all", "--json"]));
+    assert!(
+        json.contains(
+            "\"cmd\":\"python3 -c \\\"print('ok')\\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\\n#\\ttabbed\\\"\""
+        ),
+        "JSON must preserve the complete command byte-for-byte: {json}"
+    );
+
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
 fn a_job_survives_the_loss_of_its_tmux_server() {
     require_sshd!();
     let sshd = Sshd::start();
