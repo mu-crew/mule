@@ -34,46 +34,51 @@ fn timing_lane() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
-fn four_concurrent_callers_all_wait_bounded() {
+fn concurrent_callers_are_granted_the_lock_in_ticket_order() {
     isolate_state();
-    let _lane = timing_lane();
-    let host = format!("locktest-bounded-{}", std::process::id());
-    let mut hs = vec![];
-    for _ in 0..4 {
-        let h = host.clone();
-        hs.push(std::thread::spawn(move || {
-            let mut worst = Duration::ZERO;
-            for _ in 0..5 {
-                let t = Instant::now();
-                coop::lock::with_lock(&h, || {
-                    std::thread::sleep(Duration::from_millis(50));
-                })
-                .unwrap();
-                worst = worst.max(t.elapsed());
-            }
-            worst
-        }));
-    }
-    let worst = hs.into_iter().map(|h| h.join().unwrap()).max().unwrap();
+    let host = format!("locktest-fifo-{}", std::process::id());
+    let path = coop::lock::lock_path(&host);
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let holder_host = host.clone();
+    let holder = std::thread::spawn(move || {
+        coop::lock::with_lock(&holder_host, || {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
 
-    // Bounded RELATIVE to the work in the queue, not against a wall-clock
-    // constant. Four callers each doing 50ms of work means a fair queue makes
-    // a caller wait for at most the three ahead of it, so ~4x50ms plus
-    // per-handoff overhead. The failure this guards against is unbounded
-    // starvation: the naive spin measured 6x its work, with one 0.25s
-    // operation waiting 4.14s.
-    //
-    // An absolute bound (600ms) measured the MACHINE, not the lock -- it
-    // flaked under a full `cargo test` running thirteen binaries in parallel
-    // while passing alone. Scaling by the work keeps the property under load,
-    // where a starvation bug is most likely to show.
-    let work = Duration::from_millis(50);
-    let fair_ceiling = work * 4;
-    assert!(
-        worst < fair_ceiling * 3,
-        "worst wait {worst:?} against a fair ceiling of {fair_ceiling:?}; \
-         a fair queue tops out near the ceiling, a starving one runs away"
-    );
+    let granted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut callers = Vec::new();
+    for expected_ticket in 1..=4 {
+        let host = host.clone();
+        let granted = Arc::clone(&granted);
+        callers.push(std::thread::spawn(move || {
+            coop::lock::with_lock(&host, || granted.lock().unwrap().push(expected_ticket)).unwrap();
+        }));
+        while fs::read_to_string(path.join("next")).unwrap().trim()
+            != (expected_ticket + 1).to_string()
+        {
+            std::thread::yield_now();
+        }
+    }
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    for caller in callers {
+        caller.join().unwrap();
+    }
+
+    // Fairness is FIFO, an ordering property rather than a duration. The naive
+    // retrying mutex measured waits of 6x the work, including one 0.25s
+    // operation waiting 4.14s. The first replacement asserted an absolute
+    // 600ms and flaked under thirteen parallel test binaries. Scaling that to
+    // 3x four callers' 50ms work still measured scheduler starvation and also
+    // flaked. Recording the requested ticket order and granted order directly
+    // cannot be changed by machine load.
+    assert_eq!(*granted.lock().unwrap(), [1, 2, 3, 4]);
 }
 
 #[test]

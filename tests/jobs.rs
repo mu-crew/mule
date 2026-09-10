@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use coop::config::{Config, Host};
 use coop::jobs::{kill, list, list_with_hidden, prune};
@@ -61,6 +62,82 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     assert_eq!(rows[1].cmd, "false");
     assert_eq!(rows[2].state, State::Orphan);
     assert_eq!(rows[2].cmd, "true");
+}
+
+#[test]
+fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
+    let fake = Fake::new();
+    fake.push(Output::ok(""));
+    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
+    list(&cfg, &fake, None, true).unwrap();
+    let script = fake.scripts().pop().unwrap();
+
+    // The listing runs inside the ticket lock, so its duration is a channel
+    // outage for every other coop call. The original script forked four
+    // processes per job and measured 14.1s at 400 jobs. The current script
+    // measured 0.13s for 300 jobs, a 108x improvement. Execute the real script
+    // over 300 directories with PATH shims that count every external process;
+    // unlike a wall-clock bound, this asserts the shape regardless of load.
+    let dir = std::env::temp_dir().join(format!(
+        "coop-list-processes-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let jobs = dir.join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    for i in 0..300 {
+        let job = jobs.join(format!("{i:06x}"));
+        std::fs::create_dir(&job).unwrap();
+        std::fs::write(job.join("rc"), "0\n").unwrap();
+        std::fs::write(job.join("cmd"), format!("echo job-{i}")).unwrap();
+    }
+    let invocations = dir.join("invocations");
+    for command in [
+        "tmux", "sed", "find", "stat", "date", "awk", "cat", "base64", "tr",
+    ] {
+        let real = std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {command}")])
+            .output()
+            .unwrap();
+        let shim = dir.join(command);
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' {command} >> '{}'; exec '{}' \"$@\"\n",
+                invocations.display(),
+                String::from_utf8(real.stdout).unwrap().trim()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let script = script.replace("$HOME/.local/state/coop/jobs", jobs.to_str().unwrap());
+    let out = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let calls = std::fs::read_to_string(&invocations).unwrap();
+    assert!(
+        calls.lines().count() <= 10,
+        "listing must use a fixed number of processes regardless of job count: {calls}"
+    );
+    assert_eq!(calls.lines().filter(|call| *call == "tmux").count(), 1);
+    assert_eq!(calls.lines().filter(|call| *call == "date").count(), 1);
+    assert_eq!(calls.lines().filter(|call| *call == "awk").count(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

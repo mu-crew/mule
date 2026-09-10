@@ -317,35 +317,56 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
 }
 
 #[test]
-fn dispatch_does_not_wait_for_the_job() {
+fn dispatch_returns_before_the_job_finishes() {
     require_sshd!();
     let sshd = Sshd::start();
     sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "latency");
     let config = sshd.write_config(&tmux.name);
+    let release = sshd.dir.join("release-job");
+    let command = format!("while [ ! -f '{}' ]; do sleep 0.1; done", release.display());
 
-    // Invariant 3: dispatch is detached, so its cost must not scale with the
-    // job. Originally measured as returning in 0s while a full suite ran.
-    let started = Instant::now();
-    let out = sshd.coop(&config, &["run", "sleep 30"]);
-    let elapsed = started.elapsed();
+    // Invariant 3: dispatch is detached, so it must return before the job can
+    // finish. Originally measured as returning in 0s while a full suite ran;
+    // real dispatch measured ~125ms. Those measurements explain the design,
+    // but elapsed time also measures scheduler load. Block the job on a file
+    // instead and assert the ordering directly.
+    let dispatch = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["run", &command])
+        .env("PATH", sshd.path_env())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let release_on_failure = release.clone();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(Duration::from_secs(15)).is_err() {
+            std::fs::write(release_on_failure, "").unwrap();
+        }
+    });
+    let output = dispatch.wait_with_output().unwrap();
     assert!(
-        out.status.success(),
+        output.status.success(),
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
-    let id = stdout(&out);
-
-    // Generous, because this asserts a shape rather than a number: it must be
-    // nowhere near the job's 30s. Real dispatch measured ~125ms.
     assert!(
-        elapsed < Duration::from_secs(5),
-        "dispatch took {elapsed:?}; it must not wait for the job"
+        !release.exists(),
+        "dispatch waited until the watchdog released the job"
     );
-
-    // The job really is still running.
-    let poll = sshd.coop(&config, &["poll", &id]);
-    assert_eq!(stdout(&poll), "running");
+    let id = stdout(&output);
+    assert_eq!(
+        stdout(&sshd.coop(&config, &["poll", &id])),
+        "running",
+        "the detached job must still be blocked on the release file"
+    );
+    std::fs::write(&release, "").unwrap();
+    done_tx.send(()).unwrap();
+    watchdog.join().unwrap();
 
     let _ = sshd.coop(&config, &["kill", &id]);
     clean_jobs(&sshd, &[id]);
