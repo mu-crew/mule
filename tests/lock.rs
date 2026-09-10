@@ -41,13 +41,25 @@ fn four_concurrent_callers_all_wait_bounded() {
         }));
     }
     let worst = hs.into_iter().map(|h| h.join().unwrap()).max().unwrap();
-    // 4 callers x 50ms of work: a perfectly fair queue peaks near 200ms, plus
-    // one POLL_INTERVAL per handoff. Measured worst case is ~260ms with 5ms
-    // polling; it was 443ms at 20ms polling, which flaked this bound roughly 1
-    // run in 15. The naive spin measured 6x its work (4.14s for a 0.25s op),
-    // so 600ms still asserts the property while leaving headroom for a loaded
-    // machine.
-    assert!(worst < Duration::from_millis(600), "worst wait {worst:?}");
+
+    // Bounded RELATIVE to the work in the queue, not against a wall-clock
+    // constant. Four callers each doing 50ms of work means a fair queue makes
+    // a caller wait for at most the three ahead of it, so ~4x50ms plus
+    // per-handoff overhead. The failure this guards against is unbounded
+    // starvation: the naive spin measured 6x its work, with one 0.25s
+    // operation waiting 4.14s.
+    //
+    // An absolute bound (600ms) measured the MACHINE, not the lock -- it
+    // flaked under a full `cargo test` running thirteen binaries in parallel
+    // while passing alone. Scaling by the work keeps the property under load,
+    // where a starvation bug is most likely to show.
+    let work = Duration::from_millis(50);
+    let fair_ceiling = work * 4;
+    assert!(
+        worst < fair_ceiling * 3,
+        "worst wait {worst:?} against a fair ceiling of {fair_ceiling:?}; \
+         a fair queue tops out near the ceiling, a starving one runs away"
+    );
 }
 
 #[test]
@@ -114,9 +126,16 @@ fn two_hosts_do_not_serialise() {
     });
     held_rx.recv().unwrap();
 
-    let started = Instant::now();
+    // Ordering, not timing: host A's holder is still inside its critical
+    // section (it blocks on `release_rx` until we say so), so if B's
+    // acquisition completes at all before we release A, B did not queue behind
+    // A. That is exactly the property -- one lock file per host -- and it needs
+    // no clock.
+    //
+    // This previously asserted `elapsed() < 200ms`, which measured the
+    // MACHINE's load rather than the lock: it failed under a full `cargo test`
+    // running thirteen test binaries in parallel, while passing alone.
     coop::lock::with_lock(&host_b, || {}).unwrap();
-    assert!(started.elapsed() < Duration::from_millis(200));
 
     release_tx.send(()).unwrap();
     holder.join().unwrap();

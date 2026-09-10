@@ -69,21 +69,68 @@ pub trait Transport {
     fn master_alive(&self, host: &Host) -> bool;
 }
 
+/// Every ssh coop runs, configured so it can never prompt.
+///
+/// `BatchMode=yes` alone is not enough. It gags *ssh's* own prompts, but a
+/// `ProxyCommand` is a separate program with its own terminal: a site wrapper
+/// doing 2FA (`ProxyCommand 2fa-proxy ...`) prompts regardless, so every coop call
+/// on a host with a dead master spawned a Duo passcode prompt into the user's
+/// terminal -- repeatedly, since coop is expected to be called often, and with
+/// no indication of which invocation was asking.
+///
+/// Three settings close it:
+///   BatchMode=yes           - ssh itself never asks
+///   ControlMaster=no        - never create a master as a side effect; coop
+///                             requires one to exist and refuses otherwise
+///   ProxyCommand=none       - do not run a site wrapper that can prompt
+///
+/// `ProxyCommand=none` is safe precisely because coop only ever multiplexes
+/// over an EXISTING master: the socket is already connected, so no proxy is
+/// needed to reach the host. The master the user opens by hand keeps its own
+/// ProxyCommand, which is where 2FA belongs -- once per ControlPersist window,
+/// deliberately, with the user watching.
+fn base_args(host: &Host) -> Vec<String> {
+    vec![
+        "-S".into(),
+        host.socket.display().to_string(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "ProxyCommand=none".into(),
+        host.target.clone(),
+    ]
+}
+
+/// Arguments for the lock-exempt master probe. Exposed for tests, which assert
+/// that no coop invocation can prompt.
+pub fn probe_args(host: &Host) -> Vec<String> {
+    let mut args = base_args(host);
+    args.extend(["-O".into(), "check".into()]);
+    args
+}
+
+/// Arguments for running a script over the master.
+pub fn run_args(host: &Host, script: &str) -> Vec<String> {
+    let mut args = base_args(host);
+    args.push(script.to_string());
+    args
+}
+
+fn base_command(host: &Host) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(base_args(host));
+    cmd
+}
+
 /// The real thing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Ssh;
 
 impl Transport for Ssh {
     fn run(&self, host: &Host, script: &str) -> Result<Output> {
-        // `BatchMode=yes` so a missing master fails fast instead of prompting
-        // into a background call that has no TTY to prompt on. coop checks
-        // `master_alive` first and reports the `ssh -MNf` command; this is the
-        // belt-and-braces half.
-        let out = Command::new("ssh")
-            .arg("-S")
-            .arg(&host.socket)
-            .args(["-o", "BatchMode=yes"])
-            .arg(&host.target)
+        let out = base_command(host)
             .arg(script)
             .output()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
@@ -99,11 +146,8 @@ impl Transport for Ssh {
     }
 
     fn master_alive(&self, host: &Host) -> bool {
-        Command::new("ssh")
-            .arg("-S")
-            .arg(&host.socket)
+        base_command(host)
             .args(["-O", "check"])
-            .arg(&host.target)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)

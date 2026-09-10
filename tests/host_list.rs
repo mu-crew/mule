@@ -94,3 +94,36 @@ fn stdout_survives_invalid_utf8() {
     assert!(String::from_utf8(raw.clone()).is_err());
     assert_ne!(String::from_utf8_lossy(&raw).as_bytes(), raw.as_slice());
 }
+
+#[test]
+fn every_ssh_invocation_is_incapable_of_prompting() {
+    // `BatchMode=yes` gags ssh's OWN prompts but not a `ProxyCommand`, which is
+    // a separate program with its own terminal. A site wrapper that performs
+    // 2FA (`ProxyCommand 2fa-proxy ...`, as a corporate devserver typically sets)
+    // will prompt regardless -- so a coop call against a host whose master died
+    // could spawn a passcode prompt into the caller's terminal, with nothing
+    // naming which invocation was asking.
+    //
+    // Asserted on the argv rather than by running ssh, because the failure is
+    // the presence of a capability, and a passing run proves only that this
+    // particular host had no proxy configured.
+    let cfg = Config::parse("[hosts.dev]\ntarget = \"h\"\nsocket = \"/tmp/x.sock\"\n").unwrap();
+    let host = cfg.host(None).unwrap();
+
+    for args in [
+        coop::transport::probe_args(host),
+        coop::transport::run_args(host, "echo hi"),
+    ] {
+        let flat = args.join(" ");
+        assert!(flat.contains("BatchMode=yes"), "{flat}");
+        // Never create a master as a side effect: coop requires one to exist
+        // and refuses otherwise, so creating one here would be both a surprise
+        // and the thing that needs 2FA.
+        assert!(flat.contains("ControlMaster=no"), "{flat}");
+        // Safe because coop only multiplexes over an EXISTING master: the
+        // socket is already connected, so no proxy is needed to reach the host.
+        // The user's hand-opened master keeps its own ProxyCommand, which is
+        // where 2FA belongs -- once per ControlPersist window, deliberately.
+        assert!(flat.contains("ProxyCommand=none"), "{flat}");
+    }
+}
