@@ -226,11 +226,11 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
         );
         for (h, up) in &rows {
             if !up {
-                eprintln!(
-                    "  ssh -MNf -S {} -o ControlPersist=8h {}",
-                    h.socket.display(),
-                    h.target
-                );
+                // Rendered by the same code every other verb uses, so the
+                // socket directory is prepared here too: ssh cannot create it
+                // and the printed command fails without it, after the 2FA
+                // prompt.
+                eprintln!("  {}", crate::errors::master_command(h));
             }
         }
     }
@@ -361,6 +361,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
 fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable], json: bool) {
     for host in unreachable {
         eprintln!("{}: unreachable ({})", host.host, host.why);
+        if let Some(remedy) = &host.remedy {
+            eprintln!("  {remedy}");
+            eprintln!("  a human may need to tap a hardware key; ask rather than retrying");
+        }
     }
     if json {
         let items = rows
@@ -384,10 +388,14 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
         let down = unreachable
             .iter()
             .map(|host| {
+                // Carry the remedy in JSON too: a script cannot parse the
+                // stderr prose, and "unreachable" without the fix is not
+                // actionable for an agent either.
                 format!(
-                    r#"{{"host":"{}","why":"{}"}}"#,
+                    r#"{{"host":"{}","why":"{}","remedy":"{}"}}"#,
                     json_escape(&host.host),
-                    json_escape(&host.why)
+                    json_escape(&host.why),
+                    json_escape(host.remedy.as_deref().unwrap_or(""))
                 )
             })
             .collect::<Vec<_>>()

@@ -167,3 +167,67 @@ fn every_job_verb_demands_a_master_with_exit_three() {
         "a verb must not touch the channel when the master is down"
     );
 }
+
+#[test]
+fn reporting_a_missing_master_prepares_the_socket_directory() {
+    // ssh will NOT create the directory holding a control socket: it binds a
+    // temporary name inside it and fails with "unix_listener: cannot bind to
+    // path ...: No such file or directory". coop defaults the socket to
+    // ~/.ssh/coop/<host>.sock and never created that directory, so the command
+    // coop printed could not work -- and it failed AFTER the 2FA prompt, so the
+    // user paid a hardware-token tap to discover coop's own advice was wrong.
+    isolate_state();
+    let base = std::env::temp_dir().join(format!("coop-sockdir-{}", std::process::id()));
+    std::fs::remove_dir_all(&base).ok();
+    let sock = base.join("nested").join("dev.sock");
+
+    let cfg = coop::config::Config::parse(&format!(
+        "[hosts.dev]\ntarget = \"h\"\nsocket = \"{}\"\n",
+        sock.display()
+    ))
+    .unwrap();
+    let host = cfg.host(None).unwrap();
+
+    assert!(!sock.parent().unwrap().exists(), "precondition");
+
+    let err = coop::errors::require_master(&coop::transport::Fake::no_master(), host).unwrap_err();
+    assert_eq!(coop::errors::exit_code(&err), 3);
+
+    let parent = sock.parent().unwrap();
+    assert!(
+        parent.is_dir(),
+        "the socket directory must exist afterwards"
+    );
+
+    // 0700: ssh refuses a control socket in a directory others can write, so a
+    // 0755 mkdir would trade one error for a subtler one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "socket directory must be private");
+    }
+
+    // Idempotent: a second report must not fail on the existing directory.
+    let again =
+        coop::errors::require_master(&coop::transport::Fake::no_master(), host).unwrap_err();
+    assert_eq!(coop::errors::exit_code(&again), 3);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn the_master_command_is_rendered_in_one_place() {
+    // `host list` and `ls` both print this advice; three copies would drift.
+    isolate_state();
+    let cfg = coop::config::Config::parse(
+        "[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/coop-render/dev.sock\"\n",
+    )
+    .unwrap();
+    let rendered = coop::errors::master_command(cfg.host(None).unwrap());
+    assert!(rendered.contains("ssh -MNf"), "{rendered}");
+    assert!(rendered.contains("/tmp/coop-render/dev.sock"), "{rendered}");
+    assert!(rendered.contains("build.example"), "{rendered}");
+    assert!(rendered.contains("ControlPersist=8h"), "{rendered}");
+    std::fs::remove_dir_all("/tmp/coop-render").ok();
+}

@@ -28,6 +28,12 @@ pub struct Row {
 pub struct Unreachable {
     pub host: String,
     pub why: String,
+    /// The command that would fix it, when there is one.
+    ///
+    /// `ls` treats a down master as information rather than an error, so it
+    /// never built the typed `NoMaster` that carries this -- leaving the user a
+    /// diagnosis with no remedy, unlike every other verb.
+    pub remedy: Option<String>,
 }
 
 pub fn list(
@@ -50,6 +56,7 @@ pub fn list(
             unreachable.push(Unreachable {
                 host: host.name.clone(),
                 why: "no control master".into(),
+                remedy: Some(crate::errors::master_command(host)),
             });
             continue;
         }

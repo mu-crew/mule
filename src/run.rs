@@ -3,7 +3,6 @@ use std::io::Write;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
-use crate::errors::CoopError;
 use crate::lock::with_lock;
 use crate::transport::Transport;
 use crate::wrapper::{Job, JobId, dispatch_script, new_id};
@@ -28,12 +27,7 @@ pub fn dispatch_with_warnings(
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
     // one transport call deliberately outside the lock.
     if !transport.master_alive(host) {
-        return Err(CoopError::NoMaster {
-            host: host.name.clone(),
-            socket: host.socket.display().to_string(),
-            target: host.target.clone(),
-        }
-        .into());
+        return Err(crate::errors::no_master(host));
     }
 
     let job = Job {
