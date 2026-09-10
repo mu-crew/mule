@@ -305,7 +305,11 @@ fn kill_never_overwrites_a_real_exit_code() {
     assert_eq!(f.artifact(&id, "rc").trim(), "5");
 
     let out = f.coop(&["kill", &id]);
-    assert!(out.status.success() || !out.status.success()); // either is fine
+    assert!(
+        out.status.success(),
+        "kill of a finished job must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         f.artifact(&id, "rc").trim(),
         "5",

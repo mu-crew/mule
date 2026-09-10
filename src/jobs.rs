@@ -203,9 +203,16 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
 pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<i32> {
     crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
+    // Destroy is best-effort: a finished job, a second kill, or a watchdog that
+    // already tore the session down must still return rc. `&& cat` made
+    // kill-session's failure hide that no-op. Cancel watch-{id} too, or a
+    // capped job's sleeper lives until max_secs and can overwrite rc with 124.
     let script = format!(
-        "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; tmux -L {} kill-session -t coop-{id} && cat $d/rc",
-        host.tmux_socket
+        "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; \
+         tmux -L {socket} kill-session -t coop-{id} 2>/dev/null; \
+         tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
+         cat $d/rc",
+        socket = host.tmux_socket
     );
     let output = transport.run(host, &script)?;
     if output.code != 0 {

@@ -306,6 +306,17 @@ fn kill_records_rc_before_destroying_the_session() {
     let rc = script.find("[ -f $d/rc ] || echo 137 > $d/rc").unwrap();
     let kill = script.find("kill-session").unwrap();
     assert!(rc < kill);
+    // A finished job, a second kill, or a watchdog that already destroyed the
+    // session must still return rc. `&& cat` made kill-session's failure hide
+    // a successful no-op.
+    assert!(
+        !script.contains("&& cat $d/rc"),
+        "destroy must not gate reading rc: {script}"
+    );
+    assert!(
+        script.contains("kill-session -t watch-abc123"),
+        "a capped job's watchdog must not outlive kill: {script}"
+    );
 }
 
 #[test]
