@@ -54,6 +54,13 @@ struct JobJson<'a> {
 }
 
 #[derive(Serialize)]
+struct PollJson {
+    state: &'static str,
+    rc: Option<i32>,
+    log_size: u64,
+}
+
+#[derive(Serialize)]
 struct UnreachableJson<'a> {
     host: &'a str,
     why: &'a str,
@@ -595,15 +602,7 @@ fn poll_with_hint(
     crate::errors::require_master(t, host)?;
     let result = probe(t, host, id, crate::probe::From::StateOnly)?;
     if json {
-        let (state, rc) = match result.state {
-            State::Running => ("running", "null".to_string()),
-            State::Done(code) => ("done", code.to_string()),
-            State::Orphan => ("orphan", "null".to_string()),
-        };
-        println!(
-            "{{\"state\":\"{state}\",\"rc\":{rc},\"log_size\":{}}}",
-            result.log_size
-        );
+        println!("{}", poll_json(&result.state, result.log_size));
     } else {
         match result.state {
             State::Running => println!("running"),
@@ -625,6 +624,20 @@ fn poll_with_hint(
         }
     }
     Ok(0)
+}
+
+fn poll_json(state: &State, log_size: u64) -> String {
+    let (state, rc) = match state {
+        State::Running => ("running", None),
+        State::Done(code) => ("done", Some(*code)),
+        State::Orphan => ("orphan", None),
+    };
+    serde_json::to_string(&PollJson {
+        state,
+        rc,
+        log_size,
+    })
+    .expect("poll json is numbers and static strings")
 }
 
 pub fn wait(
@@ -1272,9 +1285,10 @@ fn collapse_whitespace(command: &str) -> String {
 mod tests {
     use super::{
         DispatchWarning, collapse_whitespace, command_from_args, dispatch_warnings,
-        display_command, host_info,
+        display_command, host_info, poll_json,
     };
     use crate::config::Config;
+    use crate::probe::State;
     use crate::transport::{Fake, Output};
 
     #[test]
@@ -1287,6 +1301,25 @@ mod tests {
         host_info(&cfg, &fake, None, true).unwrap();
 
         assert_eq!(fake.scripts().len(), 2);
+    }
+
+    #[test]
+    fn poll_json_is_typed_like_the_other_surfaces() {
+        // Hand-rolled concatenation would stay valid for these fields and then
+        // regress the moment a string needed escaping. serde is the contract
+        // the other emitters already use.
+        assert_eq!(
+            poll_json(&State::Running, 12),
+            r#"{"state":"running","rc":null,"log_size":12}"#
+        );
+        assert_eq!(
+            poll_json(&State::Done(5), 0),
+            r#"{"state":"done","rc":5,"log_size":0}"#
+        );
+        assert_eq!(
+            poll_json(&State::Orphan, 99),
+            r#"{"state":"orphan","rc":null,"log_size":99}"#
+        );
     }
 
     #[test]
