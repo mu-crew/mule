@@ -41,12 +41,23 @@ pub fn list(
     host_filter: Option<&str>,
     all: bool,
 ) -> Result<(Vec<Row>, Vec<Unreachable>)> {
+    let (rows, unreachable, _) = list_with_hidden(cfg, transport, host_filter, all)?;
+    Ok((rows, unreachable))
+}
+
+pub fn list_with_hidden(
+    cfg: &Config,
+    transport: &dyn Transport,
+    host_filter: Option<&str>,
+    all: bool,
+) -> Result<(Vec<Row>, Vec<Unreachable>, usize)> {
     let hosts: Vec<&Host> = match host_filter {
         Some(name) => vec![cfg.host(Some(name))?],
         None => cfg.hosts().iter().collect(),
     };
     let mut rows = Vec::new();
     let mut unreachable = Vec::new();
+    let mut hidden = 0;
 
     // Each host takes the same ticket lock, so parallel calls would only queue
     // at the lock while making error reporting and ordering less predictable.
@@ -67,9 +78,9 @@ pub fn list(
                 output.stderr.trim()
             );
         }
-        parse_rows(host, &output.text(), all, &mut rows)?;
+        hidden += parse_rows(host, &output.text(), all, &mut rows)?;
     }
-    Ok((rows, unreachable))
+    Ok((rows, unreachable, hidden))
 }
 
 /// One round trip, and a bounded number of processes regardless of job count.
@@ -129,7 +140,8 @@ fn list_script(host: &Host) -> String {
     )
 }
 
-fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Result<()> {
+fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Result<usize> {
+    let mut hidden = 0;
     for line in reply.lines() {
         let mut fields = line.splitn(5, '\t');
         let id = fields.next().context("invalid ls reply: missing id")?;
@@ -170,19 +182,29 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
                 age_secs,
                 cmd,
             });
+        } else {
+            hidden += 1;
         }
     }
-    Ok(())
+    Ok(hidden)
 }
 
-pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<()> {
+pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<i32> {
     crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
     let script = format!(
-        "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; tmux -L {} kill-session -t coop-{id}",
+        "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; tmux -L {} kill-session -t coop-{id} && cat $d/rc",
         host.tmux_socket
     );
-    run_mutation(transport, host, &script, "kill")
+    let output = transport.run(host, &script)?;
+    if output.code != 0 {
+        bail!("kill failed: {}", output.stderr.trim());
+    }
+    output
+        .text()
+        .trim()
+        .parse()
+        .context("kill returned an invalid exit code")
 }
 
 /// What `rm` was asked to remove.
@@ -240,19 +262,6 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-fn run_mutation(
-    transport: &dyn Transport,
-    host: &Host,
-    script: &str,
-    operation: &str,
-) -> Result<()> {
-    let output = transport.run(host, script)?;
-    if output.code != 0 {
-        bail!("{operation} failed: {}", output.stderr.trim());
-    }
-    Ok(())
 }
 
 /// How much longer an `orphan` is kept than a finished job.

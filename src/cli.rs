@@ -61,6 +61,10 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
 
+    /// Suppress successful next-step hints on stderr
+    #[arg(long, global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -293,6 +297,16 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
 }
 
 pub fn poll(t: &dyn Transport, host: &Host, id: &crate::wrapper::JobId, json: bool) -> Result<i32> {
+    poll_with_hint(t, host, id, json, true)
+}
+
+fn poll_with_hint(
+    t: &dyn Transport,
+    host: &Host,
+    id: &crate::wrapper::JobId,
+    json: bool,
+    quiet: bool,
+) -> Result<i32> {
     // State only: `poll` discards log bytes, so asking for them would transfer
     // the whole log -- potentially hundreds of MB -- while holding the single
     // session channel and the ticket lock. That is invariant 3 violated by the
@@ -316,6 +330,19 @@ pub fn poll(t: &dyn Transport, host: &Host, id: &crate::wrapper::JobId, json: bo
             State::Orphan => println!("orphan"),
         }
     }
+    if !quiet {
+        match result.state {
+            State::Running => {
+                eprintln!("next: coop wait {id} to block; coop tail {id} -f to follow")
+            }
+            State::Done(_) => {
+                eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state")
+            }
+            State::Orphan => eprintln!(
+                "orphan: no exit code will arrive\nnext: coop tail {id} for output; coop rm {id} to drop its state"
+            ),
+        }
+    }
     Ok(0)
 }
 
@@ -331,6 +358,7 @@ pub fn wait(
 
 pub fn dispatch(cli: Cli) -> Result<i32> {
     let cfg = load_config(cli.config.as_deref())?;
+    let quiet = cli.quiet;
     match cli.command {
         Commands::Run {
             host,
@@ -352,6 +380,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     println!("{id}");
                     std::io::stdout().flush()?;
                     if !wait {
+                        if !quiet {
+                            eprintln!("next: coop wait {id} for the exit code");
+                            eprintln!("      coop tail {id} for output");
+                        }
                         return Ok(0);
                     }
                     let mut stdout = std::io::stdout().lock();
@@ -359,8 +391,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         crate::tail::follow_deferred(&Ssh, host, &id, &mut stdout)
                     } else {
                         crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
-                    };
-                    result.map_err(|error| crate::errors::waiting(error, id.as_str()))
+                    }
+                    .map_err(|error| crate::errors::waiting(error, id.as_str()));
+                    if result.is_ok() && !quiet {
+                        eprintln!("next: coop rm {id} to drop its state");
+                    }
+                    result
                 }
                 Err(error)
                     if matches!(
@@ -378,10 +414,16 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             host_list(&cfg, &Ssh, json)?;
             Ok(0)
         }
-        Commands::Poll { id, host, json } => poll(&Ssh, cfg.host(host.host.as_deref())?, &id, json),
+        Commands::Poll { id, host, json } => {
+            poll_with_hint(&Ssh, cfg.host(host.host.as_deref())?, &id, json, quiet)
+        }
         Commands::Wait { id, host, timeout } => {
-            wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
-                .map_err(|error| crate::errors::waiting(error, id.as_str()))
+            let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
+                .map_err(|error| crate::errors::waiting(error, id.as_str()));
+            if result.is_ok() && !quiet {
+                eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state");
+            }
+            result
         }
         Commands::Tail {
             id,
@@ -405,12 +447,17 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
         }
         Commands::Ls { host, all, json } => {
-            let (rows, unreachable) = crate::jobs::list(&cfg, &Ssh, host.host.as_deref(), all)?;
-            print_jobs(&rows, &unreachable, json);
+            let (rows, unreachable, hidden) =
+                crate::jobs::list_with_hidden(&cfg, &Ssh, host.host.as_deref(), all)?;
+            print_jobs(&rows, &unreachable, hidden, json, quiet);
             Ok(0)
         }
         Commands::Kill { id, host } => {
-            crate::jobs::kill(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
+            let rc = crate::jobs::kill(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
+            if !quiet {
+                eprintln!("killed {id}; now done {rc}");
+                eprintln!("next: coop rm {id} to drop its state");
+            }
             Ok(0)
         }
         Commands::Rm { id, all, host } => {
@@ -444,7 +491,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     }
 }
 
-fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable], json: bool) {
+fn print_jobs(
+    rows: &[crate::jobs::Row],
+    unreachable: &[crate::jobs::Unreachable],
+    hidden: usize,
+    json: bool,
+    quiet: bool,
+) {
     for host in unreachable {
         eprintln!("{}: unreachable ({})", host.host, host.why);
         if let Some(remedy) = &host.remedy {
@@ -487,10 +540,20 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
             .collect::<Vec<_>>()
             .join(",");
         println!(r#"{{"items":[{items}],"unreachable":[{down}]}}"#);
+        if rows.is_empty() && hidden == 0 && !quiet {
+            eprintln!("no jobs; next: coop run <cmd>");
+        }
         return;
     }
 
     if rows.is_empty() {
+        if !quiet {
+            if hidden == 0 {
+                eprintln!("no jobs; next: coop run <cmd>");
+            } else {
+                eprintln!("{hidden} older finished jobs hidden; next: coop ls --all");
+            }
+        }
         return;
     }
 
@@ -540,6 +603,13 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
     for row in &cells {
         println!("{}", render(row));
     }
+    if !quiet {
+        let id = &rows[0].id;
+        eprintln!("next: coop poll {id}; coop tail {id}");
+        if hidden > 0 {
+            eprintln!("{hidden} older finished jobs hidden; next: coop ls --all");
+        }
+    }
 }
 
 /// Warn when the command contains something that looks like a coop flag.
@@ -554,10 +624,11 @@ fn print_jobs(rows: &[crate::jobs::Row], unreachable: &[crate::jobs::Unreachable
 /// So this warns rather than erroring: the command really might want the flag,
 /// and refusing would break `coop run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
-    const COOP_FLAGS: [&str; 7] = [
+    const COOP_FLAGS: [&str; 8] = [
         "--wait",
         "--no-tail",
         "--max-secs",
+        "--quiet",
         "--cwd",
         "--host",
         "--json",

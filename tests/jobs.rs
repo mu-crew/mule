@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use coop::config::{Config, Host};
-use coop::jobs::{kill, list, prune};
+use coop::jobs::{kill, list, list_with_hidden, prune};
 use coop::probe::State;
 use coop::transport::{Fake, Output, Transport};
 
@@ -78,13 +78,14 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     let fake = Fake::new();
     fake.push(Output::ok(reply.clone()));
-    let (rows, _) = list(&cfg, &fake, None, false).unwrap();
+    let (rows, _, hidden) = list_with_hidden(&cfg, &fake, None, false).unwrap();
     let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
         ids,
         ["aaaaaa", "cccccc"],
         "an old `done` job needs --all; running and orphan are never hidden"
     );
+    assert_eq!(hidden, 1, "the renderer must know how many rows --all adds");
 
     let all = Fake::new();
     all.push(Output::ok(reply));
@@ -140,7 +141,11 @@ fn list_reports_unreachable_hosts_and_visits_live_hosts_sequentially() {
 #[test]
 fn kill_records_rc_before_destroying_the_session() {
     let fake = Fake::new();
-    kill(&fake, &host(), &"abc123".parse().unwrap()).unwrap();
+    fake.push(Output::ok("137\n"));
+    assert_eq!(
+        kill(&fake, &host(), &"abc123".parse().unwrap()).unwrap(),
+        137
+    );
 
     let script = &fake.scripts()[0];
     let rc = script.find("[ -f $d/rc ] || echo 137 > $d/rc").unwrap();

@@ -207,6 +207,46 @@ fn concurrent_dispatches_all_succeed_through_the_gate() {
 }
 
 #[test]
+fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "run-hint");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.coop(&config, &["run", "sleep 30"]);
+    assert!(out.status.success());
+    let output_text = String::from_utf8_lossy(&out.stdout);
+    let id = output_text.trim();
+    assert_eq!(
+        output_text.len(),
+        7,
+        "stdout must be six hex characters and a newline: {output_text:?}"
+    );
+    assert!(
+        id.len() == 6
+            && id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&format!("coop wait {id}")), "{stderr}");
+    assert!(stderr.contains(&format!("coop tail {id}")), "{stderr}");
+
+    let quiet = sshd.coop(&config, &["--quiet", "run", "true"]);
+    assert!(quiet.status.success());
+    assert!(
+        quiet.stderr.is_empty(),
+        "--quiet must suppress hints: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    let quiet_id = stdout(&quiet);
+
+    let _ = sshd.coop(&config, &["--quiet", "kill", id]);
+    clean_jobs(&sshd, &[id.to_string(), quiet_id]);
+}
+
+#[test]
 fn dispatch_does_not_wait_for_the_job() {
     require_sshd!();
     let sshd = Sshd::start();
@@ -394,6 +434,10 @@ fn a_job_survives_the_loss_of_its_tmux_server() {
     assert_eq!(stdout(&sshd.coop(&config, &["tail", &id])), "durable");
     let wait = sshd.coop(&config, &["wait", &id]);
     assert_eq!(wait.status.code(), Some(9), "wait returns the job's code");
+    assert!(wait.stdout.is_empty(), "wait must keep stdout clean");
+    let hint = String::from_utf8_lossy(&wait.stderr);
+    assert!(hint.contains(&format!("coop tail {id}")), "{hint}");
+    assert!(hint.contains(&format!("coop rm {id}")), "{hint}");
 
     clean_jobs(&sshd, &[id]);
 }

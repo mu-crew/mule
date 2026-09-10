@@ -159,12 +159,23 @@ fn probe_reports_every_state_from_real_artifacts() {
     // Running: no rc, session alive.
     let running = f.run("sleep 30");
     std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(f.out(&["poll", &running]), "running");
+    let running_poll = f.coop(&["poll", &running]);
+    assert_eq!(
+        String::from_utf8_lossy(&running_poll.stdout).trim(),
+        "running"
+    );
+    let hint = String::from_utf8_lossy(&running_poll.stderr);
+    assert!(hint.contains(&format!("coop wait {running}")), "{hint}");
+    assert!(hint.contains(&format!("coop tail {running} -f")), "{hint}");
 
     // Done: rc present, and the code is the job's.
     let done = f.run("echo hi; exit 6");
     f.await_done(&done);
-    assert_eq!(f.out(&["poll", &done]), "6");
+    let done_poll = f.coop(&["poll", &done]);
+    assert_eq!(String::from_utf8_lossy(&done_poll.stdout).trim(), "6");
+    let hint = String::from_utf8_lossy(&done_poll.stderr);
+    assert!(hint.contains(&format!("coop tail {done}")), "{hint}");
+    assert!(hint.contains(&format!("coop rm {done}")), "{hint}");
 
     // Orphan: no rc, session gone. Kill the tmux session directly, bypassing
     // `coop kill` so no rc is written.
@@ -173,7 +184,15 @@ fn probe_reports_every_state_from_real_artifacts() {
     let _ = f
         .sshd
         .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
-    assert_eq!(f.out(&["poll", &orphan]), "orphan");
+    let orphan_poll = f.coop(&["poll", &orphan]);
+    assert_eq!(
+        String::from_utf8_lossy(&orphan_poll.stdout).trim(),
+        "orphan"
+    );
+    let hint = String::from_utf8_lossy(&orphan_poll.stderr);
+    assert!(hint.contains("no exit code will arrive"), "{hint}");
+    assert!(hint.contains(&format!("coop tail {orphan}")), "{hint}");
+    assert!(hint.contains(&format!("coop rm {orphan}")), "{hint}");
 
     // rc wins over a live session: a job that finished between the two reads is
     // Done, not Running. Write an rc under a still-alive session to force it.
@@ -240,6 +259,13 @@ fn kill_writes_rc_137_and_destroys_the_session() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(out.stdout.is_empty(), "kill status belongs on stderr");
+    let hint = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        hint.contains(&format!("killed {id}; now done 137")),
+        "{hint}"
+    );
+    assert!(hint.contains(&format!("coop rm {id}")), "{hint}");
 
     // 137 rather than an absent rc is what earns `orphan` its meaning: an
     // orphan means "not coop's doing".
@@ -678,6 +704,41 @@ fn rm_with_no_target_says_what_to_do() {
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("coop rm <id>"), "{text}");
     assert!(text.contains("coop rm --all"), "{text}");
+}
+
+#[test]
+fn ls_explains_empty_and_hidden_results() {
+    require_sshd!();
+    let _lane = exclusive();
+    let mut f = Fixture::new("lshints");
+    assert!(
+        f.sshd
+            .ssh(&["rm -rf $HOME/.local/state/coop/jobs"])
+            .status
+            .success()
+    );
+
+    let empty = f.coop(&["ls"]);
+    assert!(empty.stdout.is_empty());
+    let hint = String::from_utf8_lossy(&empty.stderr);
+    assert!(hint.contains("no jobs"), "{hint}");
+    assert!(hint.contains("coop run <cmd>"), "{hint}");
+
+    let old = f.run("true");
+    f.await_done(&old);
+    let stamp = own_stamp(7);
+    assert!(
+        f.sshd
+            .ssh(&[&format!("touch -t {stamp} {}", f.job_dir(&old))])
+            .status
+            .success()
+    );
+
+    let hidden = f.coop(&["ls"]);
+    assert!(hidden.stdout.is_empty());
+    let hint = String::from_utf8_lossy(&hidden.stderr);
+    assert!(hint.contains("1 older finished jobs hidden"), "{hint}");
+    assert!(hint.contains("coop ls --all"), "{hint}");
 }
 
 #[test]
