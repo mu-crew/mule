@@ -23,6 +23,18 @@ pub enum CoopError {
         "the master is down or its one slot is held\n  run ssh -O check with coop's configured ControlPath to tell which"
     )]
     SessionChannelBusy,
+    #[error(
+        "the local ssh agent is unreachable; ssh-add -l cannot use SSH_AUTH_SOCK\n  re-establish or re-attach the agent; an authentication prompt may be waiting where you cannot see it"
+    )]
+    SshAgentUnreachable,
+    #[error(
+        "the local ssh agent has no keys loaded\n  add the required key with ssh-add; an authentication prompt may be waiting where you cannot see it"
+    )]
+    SshAgentHasNoKeys,
+    #[error(
+        "keyboard-interactive authentication failed; this is either a local ssh-agent problem or a busy control-master channel\n  run ssh-add -l, then ssh -O check with coop's configured ControlPath"
+    )]
+    KeyboardInteractiveAmbiguous,
     #[error("timed out waiting for job {id}; it is still running")]
     Timeout { id: String },
     #[error("job {id} is orphaned; no rc will ever arrive")]
@@ -31,16 +43,31 @@ pub enum CoopError {
     Dropped { id: String },
 }
 
-pub fn classify(stderr: &str) -> Option<CoopError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentState {
+    Keys,
+    NoKeys,
+    Unreachable,
+    Unknown,
+}
+
+pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<CoopError> {
     let stderr = stderr.to_ascii_lowercase();
-    [
-        "session request failed",
-        "session open refused",
-        "permission denied (keyboard-interactive)",
-    ]
-    .iter()
-    .any(|pattern| stderr.contains(pattern))
-    .then_some(CoopError::SessionChannelBusy)
+    if ["session request failed", "session open refused"]
+        .iter()
+        .any(|pattern| stderr.contains(pattern))
+    {
+        return Some(CoopError::SessionChannelBusy);
+    }
+    if !stderr.contains("permission denied (keyboard-interactive)") {
+        return None;
+    }
+    Some(match agent_state() {
+        AgentState::Keys => CoopError::SessionChannelBusy,
+        AgentState::NoKeys => CoopError::SshAgentHasNoKeys,
+        AgentState::Unreachable => CoopError::SshAgentUnreachable,
+        AgentState::Unknown => CoopError::KeyboardInteractiveAmbiguous,
+    })
 }
 
 pub fn waiting(error: AnyhowError, id: &str) -> AnyhowError {
@@ -65,7 +92,13 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
         Some(CoopError::Timeout { .. }) => EXIT_TIMEOUT,
         Some(CoopError::Orphan { .. }) => EXIT_ORPHAN,
         Some(CoopError::Dropped { .. }) => EXIT_DROPPED,
-        Some(CoopError::SessionChannelBusy) | None => 1,
+        Some(
+            CoopError::SessionChannelBusy
+            | CoopError::SshAgentUnreachable
+            | CoopError::SshAgentHasNoKeys
+            | CoopError::KeyboardInteractiveAmbiguous,
+        )
+        | None => 1,
     }
 }
 

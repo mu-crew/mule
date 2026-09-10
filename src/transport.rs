@@ -146,6 +146,15 @@ fn base_command(host: &Host) -> Command {
     cmd
 }
 
+fn ssh_agent_state() -> crate::errors::AgentState {
+    match Command::new("ssh-add").arg("-l").output() {
+        Ok(output) if output.status.success() => crate::errors::AgentState::Keys,
+        Ok(output) if output.status.code() == Some(1) => crate::errors::AgentState::NoKeys,
+        Ok(output) if output.status.code() == Some(2) => crate::errors::AgentState::Unreachable,
+        Ok(_) | Err(_) => crate::errors::AgentState::Unknown,
+    }
+}
+
 /// The real thing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Ssh;
@@ -157,7 +166,7 @@ impl Transport for Ssh {
             .output()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if let Some(error) = crate::errors::classify(&stderr) {
+        if let Some(error) = crate::errors::classify(&stderr, ssh_agent_state) {
             return Err(error.into());
         }
         Ok(Output {

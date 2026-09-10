@@ -2,7 +2,8 @@ use clap::CommandFactory;
 
 use coop::cli::Cli;
 use coop::errors::{
-    CoopError, EXIT_DROPPED, EXIT_NO_MASTER, EXIT_ORPHAN, EXIT_TIMEOUT, classify, exit_code,
+    AgentState, CoopError, EXIT_DROPPED, EXIT_NO_MASTER, EXIT_ORPHAN, EXIT_TIMEOUT, classify,
+    exit_code,
 };
 
 /// Point the lock directory at a temp dir for the whole test binary.
@@ -22,19 +23,78 @@ fn isolate_state() {
 #[test]
 fn refused_session_diagnostics_are_classified_case_insensitively() {
     isolate_state();
-    for stderr in [
-        "session request failed",
-        "SESSION OPEN REFUSED",
-        "Permission denied (keyboard-interactive)",
-    ] {
-        assert_eq!(classify(stderr), Some(CoopError::SessionChannelBusy));
+    for stderr in ["session request failed", "SESSION OPEN REFUSED"] {
+        assert_eq!(
+            classify(stderr, || panic!(
+                "unambiguous errors must not probe the agent"
+            )),
+            Some(CoopError::SessionChannelBusy)
+        );
     }
+}
+
+#[test]
+fn keyboard_interactive_with_an_unreachable_agent_names_the_credential_problem() {
+    isolate_state();
+    let error = classify("Permission denied (keyboard-interactive)", || {
+        AgentState::Unreachable
+    })
+    .unwrap();
+
+    assert_eq!(error, CoopError::SshAgentUnreachable);
+    let text = error.to_string();
+    assert!(text.contains("ssh-add -l"), "{text}");
+    assert!(text.contains("SSH_AUTH_SOCK"), "{text}");
+    assert!(text.contains("prompt"), "{text}");
+    assert!(text.contains("cannot see"), "{text}");
+}
+
+#[test]
+fn keyboard_interactive_with_keys_is_likely_a_busy_channel() {
+    isolate_state();
+    assert_eq!(
+        classify("Permission denied (keyboard-interactive)", || {
+            AgentState::Keys
+        }),
+        Some(CoopError::SessionChannelBusy)
+    );
+}
+
+#[test]
+fn keyboard_interactive_with_no_keys_names_the_credential_problem() {
+    isolate_state();
+    let error = classify("Permission denied (keyboard-interactive)", || {
+        AgentState::NoKeys
+    })
+    .unwrap();
+
+    assert_eq!(error, CoopError::SshAgentHasNoKeys);
+    assert!(error.to_string().contains("ssh-add"));
+}
+
+#[test]
+fn keyboard_interactive_with_unknown_agent_state_reports_both_possibilities() {
+    isolate_state();
+    let text = classify("Permission denied (keyboard-interactive)", || {
+        AgentState::Unknown
+    })
+    .unwrap()
+    .to_string();
+
+    assert!(text.contains("ssh-add -l"), "{text}");
+    assert!(text.contains("ssh -O check"), "{text}");
+    assert!(text.contains("either"), "{text}");
 }
 
 #[test]
 fn genuine_auth_failure_is_not_classified_as_a_busy_channel() {
     isolate_state();
-    assert_eq!(classify("Permission denied (publickey)"), None);
+    assert_eq!(
+        classify("Permission denied (publickey)", || {
+            panic!("publickey failures must not probe the agent")
+        }),
+        None
+    );
 }
 
 #[test]
