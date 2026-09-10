@@ -179,3 +179,73 @@ fn ordinary_tmux_socket_names_are_accepted() {
         );
     }
 }
+
+#[test]
+fn seeding_writes_a_template_and_never_clobbers() {
+    let dir = tmp("seed");
+    let p = dir.join("config.toml");
+    std::fs::remove_file(&p).ok();
+
+    assert!(
+        coop::config::seed(&p).unwrap(),
+        "should create on first call"
+    );
+    assert!(
+        !coop::config::seed(&p).unwrap(),
+        "must not report a second create"
+    );
+
+    // Idempotent and non-destructive: a real config must survive a stray seed.
+    std::fs::write(&p, "[hosts.mine]\n").unwrap();
+    assert!(!coop::config::seed(&p).unwrap());
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "[hosts.mine]\n");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn seeding_creates_missing_parent_directories() {
+    let dir = tmp("seed-deep");
+    let p = dir.join("nested").join("deeper").join("config.toml");
+    assert!(coop::config::seed(&p).unwrap());
+    assert!(p.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_template_is_a_valid_but_empty_config() {
+    // As written it configures nothing, so coop still says "no hosts" rather
+    // than inventing a host that does not exist.
+    let err = chain(Config::parse(coop::config::TEMPLATE).unwrap_err());
+    assert!(err.contains("no hosts"), "{err}");
+}
+
+#[test]
+fn the_template_parses_once_uncommented() {
+    // A template that produces a broken config is worse than no template. An
+    // earlier draft had two `[hosts.build]` blocks, so following the
+    // instructions literally gave `duplicate key` -- caught only by doing it.
+    let uncommented: String = coop::config::TEMPLATE
+        .lines()
+        .filter_map(|line| line.strip_prefix("# "))
+        // Keep only the config lines, dropping prose and the shell example
+        // (which contains `=` inside `ControlPersist=8h`).
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with('[')
+                || line
+                    .split_once('=')
+                    .is_some_and(|(key, _)| !key.trim().contains(' '))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let cfg = Config::parse(&uncommented)
+        .unwrap_or_else(|e| panic!("uncommented template must parse: {e:#}\n{uncommented}"));
+    let host = cfg.host(Some("build")).unwrap();
+    assert_eq!(host.target, "build");
+    assert_eq!(host.tmux_socket, "coop");
+    assert_eq!(host.max_running, 4);
+    assert_eq!(host.keep_days, 14);
+    assert_eq!(host.default_cwd.as_deref(), Some("~/work"));
+}

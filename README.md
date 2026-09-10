@@ -32,7 +32,8 @@ Build and install with Cargo:
 cargo install --path .
 ```
 
-Create `~/.config/coop/config.toml`. The minimum is two lines:
+The first run without a config writes a commented template to
+`~/.config/coop/config.toml` and tells you to edit it. The minimum is two lines:
 
 ```toml
 [hosts.build]

@@ -95,6 +95,17 @@ Jobs use a non-login, non-interactive shell. Remote profile files do not run, so
 
 ## Configuration
 
+The first run without a config file writes a commented template to the default
+path and exits non-zero, naming the file and the next step. A bare
+`No such file or directory` names a path but not what belongs in it, which
+leaves a first-time caller nowhere; a file that already exists is something to
+edit.
+
+Every host in the template is commented out, so it configures nothing: coop
+cannot know a host name, and inventing one produces confusing failures against a
+target that does not exist. An explicit `--config` is never seeded, since a
+missing path there is the caller's typo to see.
+
 The default file is `~/.config/coop/config.toml`. Host entries are user intent, so a text file is easier to edit and diff than a state database.
 
 ```toml

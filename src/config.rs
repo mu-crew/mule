@@ -93,6 +93,56 @@ fn expand_tilde(raw: &str) -> Result<PathBuf> {
 }
 
 /// Where the config lives: `~/.config/coop/config.toml`.
+/// Written to the config path the first time coop runs without one.
+///
+/// Every host is commented out, so the file is a prompt rather than a guess:
+/// coop cannot know a host name, and inventing one would produce confusing
+/// failures against a target that does not exist.
+pub const TEMPLATE: &str = "\
+# coop hosts. Uncomment and edit -- the section name is what you pass to --host.
+#
+# One block per host. `target` is the only key worth setting by hand; every
+# other line below shows its default and can stay commented out.
+#
+# [hosts.build]
+# target      = \"build\"                    # ssh target (default: section name)
+# socket      = \"~/.ssh/coop/build.sock\"   # coop's own ControlPath
+# tmux_socket = \"coop\"                     # private tmux server
+# max_running = 4                          # warn past this; not a queue
+# default_cwd = \"~/work\"                   # where `run` starts, unless --cwd
+# keep_days   = 14                         # prune finished jobs older than this
+#
+# Then open the control master, once per ControlPersist window. This may ask
+# you to touch a hardware key; coop cannot do it for you:
+#
+#   ssh -MNf -S ~/.ssh/coop/build.sock -o ControlPersist=8h build
+";
+
+/// Write [`TEMPLATE`] to `path` unless something is already there.
+///
+/// Returns whether it created the file. Uses `create_new`, so a race with
+/// another coop process cannot clobber a real config.
+pub fn seed(path: &Path) -> Result<bool> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(TEMPLATE.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
 pub fn default_path() -> Result<PathBuf> {
     let dirs =
         directories::BaseDirs::new().ok_or_else(|| anyhow!("cannot locate a home directory"))?;
@@ -115,7 +165,13 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let raw: RawConfig = toml::from_str(text)?;
         if raw.hosts.is_empty() {
-            bail!("no hosts configured; add a section like:\n\n  [hosts.dev]\n  target = \"dev\"");
+            // Reached via the template, whose hosts are all commented out, so
+            // point at the two lines that actually turn it into a config.
+            bail!(
+                "no hosts configured\n  \
+                 uncomment a block, or add:\n\n    \
+                 [hosts.dev]\n    target = \"dev\""
+            );
         }
         let hosts = raw
             .hosts

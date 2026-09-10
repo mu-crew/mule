@@ -153,10 +153,26 @@ pub enum HostCmd {
 }
 
 pub fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
-    match path {
-        Some(p) => Config::load(p),
-        None => Config::load(&crate::config::default_path()?),
+    // An explicit --config is the user asserting the file exists; a missing one
+    // is their typo to see, not ours to paper over with a template.
+    if let Some(p) = path {
+        return Config::load(p);
     }
+
+    let default = crate::config::default_path()?;
+    if !default.exists() {
+        // First run. A bare "No such file or directory" is a dead end: it names
+        // a path but not what belongs in it. Seed a commented template so the
+        // next step is to edit a file that already exists.
+        crate::config::seed(&default)?;
+        anyhow::bail!(
+            "no hosts configured yet\n  \
+             wrote a template to {}\n  \
+             edit it to name a host, then run `coop host list`",
+            default.display()
+        );
+    }
+    Config::load(&default)
 }
 
 /// `coop host list`.
