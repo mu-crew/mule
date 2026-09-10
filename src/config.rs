@@ -92,6 +92,22 @@ pub struct Config {
     hosts: Vec<Host>,
 }
 
+/// Is `value` safe to use as one component of a filesystem path?
+///
+/// Conservative on purpose. Both a host name and a `tmux_socket` end up in a
+/// path *and* unquoted in a remote shell script, so the grammar has to exclude
+/// path separators, shell metacharacters and whitespace at once. `.` and `..`
+/// are excluded separately: they satisfy the character rule while still
+/// meaning "this directory" and "the parent".
+fn is_filename_component(value: &str) -> bool {
+    if value.is_empty() || value == "." || value == ".." {
+        return false;
+    }
+    value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
 /// Expand a leading `~/` against the real home directory.
 ///
 /// Only a leading `~/` (or a bare `~`): `~user` is deliberately unsupported,
@@ -198,6 +214,25 @@ impl Config {
             .hosts
             .into_iter()
             .map(|(name, h)| {
+                // The section name is not just a label: it is appended to
+                // `{host}.lock` under the state dir and to the default
+                // `~/.ssh/coop/{host}.sock`. TOML allows a quoted key, so
+                // without this a name is arbitrary text reaching two paths.
+                // Measured: `[hosts."../../../../tmp/coop-escape"]` parsed and
+                // produced a socket outside the directory coop owns, and a `/`
+                // nests the lock somewhere `create_dir_all` may not reach --
+                // which lets two hosts share one lock and silently breaks the
+                // per-host serialisation the fairness gate depends on.
+                //
+                // Same grammar as `tmux_socket` below, for the same reason: a
+                // host name is a filename component, so this loses nothing
+                // real.
+                if !is_filename_component(&name) {
+                    bail!(
+                        "invalid host name {name:?}; use letters, digits, dot, \
+                         dash or underscore, and not `.` or `..`"
+                    );
+                }
                 let tmux_socket = h
                     .tmux_socket
                     .unwrap_or_else(|| DEFAULT_TMUX_SOCKET.to_string());
@@ -205,11 +240,7 @@ impl Config {
                 // name containing shell syntax would be command injection from
                 // a config file. tmux socket names are a filename component,
                 // so this grammar loses nothing real.
-                if tmux_socket.is_empty()
-                    || !tmux_socket
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-                {
+                if !is_filename_component(&tmux_socket) {
                     bail!(
                         "host {name:?}: invalid tmux_socket {tmux_socket:?}; \
                          use letters, digits, dot, dash or underscore"

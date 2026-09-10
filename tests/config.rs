@@ -252,3 +252,46 @@ fn the_template_parses_once_uncommented() {
     assert_eq!(host.keep_days, 14);
     assert_eq!(host.default_cwd.as_deref(), Some("~/work"));
 }
+
+#[test]
+fn a_host_name_cannot_escape_the_state_tree() {
+    // TOML allows a quoted key, so a host section name is arbitrary text --
+    // and that name is appended to two paths: `{host}.lock` under the state
+    // dir (src/lock.rs) and the default `~/.ssh/coop/{host}.sock`. Measured
+    // before this validation existed: `[hosts."../../../../tmp/coop-escape"]`
+    // parsed happily and `host list` printed
+    // `/Users/me/.ssh/coop/../../../../tmp/coop-escape.sock`, i.e. a socket and
+    // a lock outside the directory coop owns. A `/` in the name nests instead,
+    // so the lock lands somewhere `create_dir_all` may not reach and two hosts
+    // can collide on one lock -- which silently breaks the per-host
+    // serialisation the whole fairness gate rests on.
+    for bad in [
+        "../escape",
+        "..",
+        ".",
+        "a/b",
+        "/abs",
+        "with space",
+        "tab\there",
+        "new\nline",
+        "",
+        "dollar$sign",
+        "semi;colon",
+    ] {
+        let text = format!("[hosts.\"{bad}\"]\ntarget = \"h\"\n");
+        let result = Config::parse(&text);
+        assert!(
+            result.is_err(),
+            "host name {bad:?} must be refused, it reaches a filesystem path"
+        );
+    }
+
+    // The grammar still has to admit the names people actually write.
+    for good in ["dev", "build-01", "my_host", "a.b.c", "HOST9"] {
+        let text = format!("[hosts.\"{good}\"]\ntarget = \"h\"\n");
+        assert!(
+            Config::parse(&text).is_ok(),
+            "host name {good:?} is ordinary and must be accepted"
+        );
+    }
+}
