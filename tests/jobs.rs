@@ -149,7 +149,7 @@ fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
 
     // The listing runs inside the ticket lock, so its duration is a channel
     // outage for every other coop call. The original script forked four
-    // processes per job and measured 14.1s at 400 jobs. The current script
+    // processes per job and measured 14.1s at 300 jobs. The current script
     // measured 0.13s for 300 jobs, a 108x improvement. Execute the real script
     // over 300 directories with PATH shims that count every external process;
     // unlike a wall-clock bound, this asserts the shape regardless of load.

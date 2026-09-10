@@ -87,7 +87,7 @@ pub fn list_with_hidden(
 ///
 /// The previous version was a shell loop forking four processes PER JOB -- a
 /// `cat` for `rc`, a `tmux has-session`, a `stat`, and a `base64` for `cmd`.
-/// Measured at 400 jobs: **14.1s**, all of it inside the ticket lock, so
+/// Measured at 300 jobs: **14.1s**, all of it inside the ticket lock, so
 /// nothing else coop-related could run. That breaks coop's own rule against
 /// holding a capped channel for more than about a second, and since `keep_days`
 /// defaults to 14, a few hundred jobs is ordinary rather than pathological.
