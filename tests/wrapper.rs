@@ -101,7 +101,11 @@ fn a_cwd_with_a_space_is_quoted() {
     };
     let script = dispatch_script(&host(), &job);
     assert!(
-        !script.contains("cd /tmp/my dir &&"),
+        script.contains("cd \"$(printf %s") && script.contains(" | base64 -d)\""),
+        "cwd must be base64-wrapped: {script}"
+    );
+    assert!(
+        !script.contains("/tmp/my dir"),
         "cwd must not be interpolated raw: {script}"
     );
 }
