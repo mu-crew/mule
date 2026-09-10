@@ -243,6 +243,13 @@ pub enum Commands {
         id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
+        /// Drop the job's state directory too, in the same round trip
+        ///
+        /// `kill` then `rm` is the common pair -- ending a job you did not
+        /// mean to start usually means discarding its output as well. Doing
+        /// both here costs one ssh call instead of two on a capped channel.
+        #[arg(long)]
+        rm: bool,
     },
     /// Drop a job's state directory
     Rm {
@@ -650,14 +657,21 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 warn_about_swallowed_flags(&cmd);
             }
             let command = command_from_args(&cmd);
-            if !quiet {
-                let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
-                warn_about_dispatch_patterns(&command, has_runtime_cap);
-            }
+            let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
             match crate::run::dispatch(&Ssh, host, &command, cwd.as_deref(), max_secs) {
                 Ok(id) => {
                     println!("{id}");
                     std::io::stdout().flush()?;
+                    // Warn AFTER dispatch, so the advice can name the job it
+                    // is about. Warning first meant printing a literal
+                    // `coop tail <id>` at the one moment a real id did not
+                    // exist yet -- and the job starts regardless, so a reader
+                    // was told something was wrong with no way to act on it.
+                    // coop never blocks on a heuristic: the command belongs to
+                    // the caller (AGENTS.md), and a pipeline may be deliberate.
+                    if !quiet {
+                        warn_about_dispatch_patterns(&command, has_runtime_cap, &id);
+                    }
                     if !wait {
                         if !quiet {
                             eprintln!("next: coop wait {id} for the exit code");
@@ -758,11 +772,27 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             print_jobs(&rows, &unreachable, hidden, json, full, quiet);
             Ok(0)
         }
-        Commands::Kill { id, host } => {
-            let rc = crate::jobs::kill(&Ssh, cfg.host(host.host.as_deref())?, &id)?;
+        Commands::Kill { id, host, rm } => {
+            let host = cfg.host(host.host.as_deref())?;
+            let rc = crate::jobs::kill(&Ssh, host, &id)?;
+            if rm {
+                // The kill already wrote `rc`, so the job is finished and
+                // `remove` will take it. One more round trip is unavoidable --
+                // the kill must land before the state can go -- but the caller
+                // does not have to make the decision twice.
+                let removed =
+                    crate::jobs::remove(&Ssh, host, &crate::jobs::Target::One(id.clone()))?;
+                if !quiet {
+                    match removed.first() {
+                        Some(id) => eprintln!("killed and removed {id} (was done {rc})"),
+                        None => eprintln!("killed {id}, but its state was already gone"),
+                    }
+                }
+                return Ok(0);
+            }
             if !quiet {
                 eprintln!("killed {id}; now done {rc}");
-                eprintln!("next: coop rm {id} to drop its state");
+                eprintln!("next: coop rm {id} to drop its state, or kill --rm next time");
             }
             Ok(0)
         }
@@ -1176,14 +1206,30 @@ fn shell_tokens(command: &str) -> Vec<ShellToken> {
     tokens
 }
 
-fn warn_about_dispatch_patterns(command: &str, has_max_secs: bool) {
+/// Report dispatch-pattern warnings for a job that is already running.
+///
+/// Every warning names the job and how to end it. The job exists by the time
+/// this runs -- coop warns rather than blocking, because the command belongs
+/// to the caller and a final pipeline may be exactly what they meant -- so
+/// "here is what looks wrong" without "here is how to stop it" leaves the
+/// reader holding a running job and no next step. That is worse for the
+/// unbounded-loop case than saying nothing, since an unbounded loop is
+/// precisely the job that will not end on its own.
+fn warn_about_dispatch_patterns(command: &str, has_max_secs: bool, id: &crate::wrapper::JobId) {
     for warning in dispatch_warnings(command, has_max_secs) {
         match warning {
             DispatchWarning::PipelineStatus => eprintln!(
-                "coop: warning: a final head/tail pipeline may hide the job's failure\n  let coop shape the output instead: coop tail <id> -n 3\n  if intentional, set -o pipefail before the pipeline"
+                "coop: warning: a final head/tail pipeline may hide the job's failure\n  \
+                 rc will be the pipe's, so a failed command can report success\n  \
+                 let coop shape the output instead: coop tail {id} -n 3\n  \
+                 if intentional, set -o pipefail before the pipeline\n  \
+                 to start over:  coop kill --rm {id}"
             ),
             DispatchWarning::UnboundedLoop => eprintln!(
-                "coop: warning: this looks like an unbounded loop\n  bound the remote job: coop run --max-secs <seconds> '<cmd>'"
+                "coop: warning: this looks like an unbounded loop, and nothing will stop it\n  \
+                 it holds a tmux session and a growing log until the host reboots\n  \
+                 stop it now:   coop kill --rm {id}\n  \
+                 then bound it: coop run --max-secs <seconds> '<cmd>'"
             ),
         }
     }

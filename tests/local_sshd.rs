@@ -271,7 +271,22 @@ fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("final head/tail pipeline"), "{stderr}");
-    assert!(stderr.contains("coop tail <id> -n 3"), "{stderr}");
+    // The advice must name THIS job, not a `<id>` placeholder. The warning
+    // used to print before dispatch, at the one moment no real id existed --
+    // so it reported a problem the reader could not act on, while the job ran
+    // anyway. Every suggested command has to be pasteable.
+    assert!(
+        stderr.contains(&format!("coop tail {id} -n 3")),
+        "the hint must name the real id: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("coop kill --rm {id}")),
+        "a warning about a running job must say how to end it: {stderr}"
+    );
+    assert!(
+        !stderr.contains("<id>"),
+        "no placeholder ids in a message about a job that exists: {stderr}"
+    );
 
     let quiet = sshd.coop(&config, &["--quiet", "run", "printf ok | tail -1"]);
     assert!(quiet.status.success());
@@ -811,5 +826,60 @@ fn host_info_probes_real_capabilities_and_reports_a_down_master() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("ssh -MNf"),
         "down host must include its remedy"
+    );
+}
+
+#[test]
+fn kill_rm_ends_the_job_and_drops_its_state() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "kill-rm");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.coop(&config, &["run", "sleep 60"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "running");
+
+    // One verb, one decision. `kill` then `rm` was two round trips on the
+    // capped channel for what is nearly always a single intent: ending a job
+    // you did not mean to start also means discarding its output.
+    let killed = sshd.coop(&config, &["kill", "--rm", &id]);
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&killed.stderr).contains("killed and removed"),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+
+    // The state directory is gone, so the job is absent from `ls --all`
+    // entirely rather than listed as done.
+    let listed = stdout(&sshd.coop(&config, &["ls", "--all", "--quiet"]));
+    assert!(
+        !listed.contains(&id),
+        "kill --rm must leave no job state: {listed}"
+    );
+
+    // And the session is gone, so nothing is still running.
+    let sessions = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        "kill --rm must end the job, not just forget it"
     );
 }
