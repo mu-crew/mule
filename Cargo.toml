@@ -1,9 +1,39 @@
 [package]
-name = "coop"
+# The bare `coop` name has been a placeholder on crates.io since 2022 ("Reserved.
+# Cooperation for safe applications & libraries", one version, never updated), so
+# the crate takes the conventional `-cli` suffix. The BINARY is still `coop` --
+# see [[bin]] below -- so `cargo install coop-cli` puts `coop` on PATH and
+# nothing a user types changes.
+name = "coop-cli"
 version = "0.1.0"
 edition = "2024"
 description = "Fire remote jobs down a private ssh channel nothing else can contend with."
 license = "MIT"
+repository = "https://github.com/martintrojer/coop"
+homepage = "https://github.com/martintrojer/coop"
+documentation = "https://github.com/martintrojer/coop"
+readme = "README.md"
+keywords = ["ssh", "remote", "jobs", "tmux", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# Edition 2024 needs 1.85, and the code uses let-chains and
+# `u64::is_multiple_of`. Stated so a build failure names the cause.
+rust-version = "1.85"
+# Ship only what builds and explains the tool. `tests/` is excluded because
+# layers 2 and 3 need tmux and a local sshd, so they cannot run from a
+# published tarball -- the repository is where they belong.
+include = ["src/**/*.rs", "README.md", "SPEC.md", "LICENSE", "CHANGELOG.md"]
+
+# The library keeps the short name too, so `coop::cli` and the 91 `coop::`
+# paths across src/ and tests/ are unaffected by the crate rename. Without
+# this, renaming the package renames the lib target and nothing compiles.
+[lib]
+name = "coop"
+path = "src/lib.rs"
+
+# The binary keeps the short name: `coop run`, `coop poll`, `coop tail`.
+[[bin]]
+name = "coop"
+path = "src/main.rs"
 
 [dependencies]
 # CLI parsing

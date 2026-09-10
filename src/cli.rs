@@ -77,6 +77,10 @@ struct JobsJson<'a> {
 #[derive(Parser, Debug)]
 #[command(
     name = "coop",
+    // From Cargo.toml, so `coop --version` cannot drift from the published
+    // crate. A released binary that cannot say which version it is makes a bug
+    // report unactionable.
+    version,
     about = "Fire remote jobs down a private ssh channel nothing else can take.",
     long_about = "\
 Hand coop a command, get an id back, then poll, wait or tail against that id.

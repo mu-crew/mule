@@ -2,6 +2,25 @@
 
 Long remote commands occupy an SSH session; on a `MaxSessions 1` connection, concurrent calls fail with misleading authentication errors. `coop` detaches each job under a private tmux server, returns an ID, and reserves a separate gated SSH connection for short dispatches and artifact reads.
 
+## Install
+
+```sh
+cargo install coop-cli
+```
+
+The crate is `coop-cli` because the bare `coop` name has been an unused
+placeholder on crates.io since 2022. **The binary is `coop`** — every command
+below is what you type.
+
+From source:
+
+```sh
+git clone https://github.com/martintrojer/coop && cd coop && cargo install --path .
+```
+
+Needs Rust 1.85 or newer, and `tmux` on the remote host. First run writes a
+commented config template to `~/.config/coop/config.toml`.
+
 ## 30-second demo
 
 ```console
