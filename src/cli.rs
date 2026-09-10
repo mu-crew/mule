@@ -210,6 +210,15 @@ pub enum HostCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Probe host OS, architecture, cores, memory, and GPU
+    Info {
+        /// Probe only this configured host
+        #[arg(long, value_name = "H")]
+        host: Option<String>,
+        /// Emit every capability as machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
@@ -295,6 +304,158 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct HostInfo<'a> {
+    host: &'a Host,
+    master: bool,
+    os: String,
+    arch: String,
+    cores: Option<u64>,
+    ram_gb: Option<u64>,
+    gpu: String,
+    remedy: Option<String>,
+}
+
+/// Probe only on explicit `host info`: `host list` is a lock-exempt
+/// `ssh -O check`, so adding a session there would make the reachability check
+/// contend with jobs. The full probe measured 0.27s and stays one round trip.
+fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: bool) -> Result<()> {
+    let hosts: Vec<&Host> = match host_filter {
+        Some(name) => vec![cfg.host(Some(name))?],
+        None => cfg.hosts().iter().collect(),
+    };
+    let mut rows = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        if !t.master_alive(host) {
+            rows.push(HostInfo {
+                host,
+                master: false,
+                os: "unknown".into(),
+                arch: "unknown".into(),
+                cores: None,
+                ram_gb: None,
+                gpu: "unknown".into(),
+                remedy: Some(crate::errors::master_command(host)),
+            });
+            continue;
+        }
+        let output = t.run(host, host_info_script())?;
+        if output.code != 0 {
+            anyhow::bail!(
+                "probing host {} failed: {}",
+                host.name,
+                output.stderr.trim()
+            );
+        }
+        rows.push(parse_host_info(host, &output.text()));
+    }
+
+    for row in rows.iter().filter(|row| !row.master) {
+        eprintln!("{}: unreachable (no control master)", row.host.name);
+        if let Some(remedy) = &row.remedy {
+            eprintln!("  {remedy}");
+            eprintln!("  a human may need to tap a hardware key; ask rather than retrying");
+        }
+    }
+
+    if json {
+        let items = rows
+            .iter()
+            .map(|row| {
+                format!(
+                    r#"{{"name":"{}","target":"{}","master":{},"os":"{}","arch":"{}","cores":{},"ram_gb":{},"gpu":"{}","socket":"{}","remedy":"{}"}}"#,
+                    json_escape(&row.host.name),
+                    json_escape(&row.host.target),
+                    row.master,
+                    json_escape(&row.os),
+                    json_escape(&row.arch),
+                    row.cores.map_or_else(|| "null".into(), |n| n.to_string()),
+                    row.ram_gb.map_or_else(|| "null".into(), |n| n.to_string()),
+                    json_escape(&row.gpu),
+                    json_escape(&row.host.socket.to_string_lossy()),
+                    json_escape(row.remedy.as_deref().unwrap_or("")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("{{\"items\":[{items}],\"count\":{}}}", rows.len());
+        return Ok(());
+    }
+
+    println!("NAME  MASTER  OS  ARCH  CORES  RAM  GPU  TARGET");
+    for row in &rows {
+        println!(
+            "{}  {}  {}  {}  {}  {}  {}  {}",
+            row.host.name,
+            if row.master { "up" } else { "down" },
+            row.os,
+            row.arch,
+            row.cores
+                .map_or_else(|| "unknown".into(), |n| n.to_string()),
+            row.ram_gb
+                .map_or_else(|| "unknown".into(), |n| format!("{n}GB")),
+            row.gpu,
+            row.host.target,
+        );
+    }
+    Ok(())
+}
+
+/// One portable best-effort script. Every platform-specific command falls
+/// back, and `command -v` guards nvidia-smi because `missing | awk` succeeds.
+fn host_info_script() -> &'static str {
+    "os=$(uname -s 2>/dev/null || echo unknown); \
+     arch=$(uname -m 2>/dev/null || echo unknown); \
+     cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo unknown); \
+     if [ -r /proc/meminfo ]; then \
+       ram=$(awk '/MemTotal/{printf \"%.0f\", $2/1048576}' /proc/meminfo 2>/dev/null); \
+     elif command -v sysctl >/dev/null 2>&1; then \
+       bytes=$(sysctl -n hw.memsize 2>/dev/null); \
+       case $bytes in *[!0-9]*|'') ram=unknown;; *) ram=$((bytes / 1073741824));; esac; \
+     else ram=unknown; fi; \
+     [ -n \"$ram\" ] || ram=unknown; \
+     if command -v nvidia-smi >/dev/null 2>&1; then \
+       gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | \
+             awk 'NR <= 2 { if (NR > 1) printf \"; \"; printf \"%s\", $0 }'); \
+     elif command -v system_profiler >/dev/null 2>&1; then \
+       gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | \
+             awk -F: '/Chipset Model/{sub(/^[[:space:]]*/, \"\", $2); print $2; exit}'); \
+     else gpu=none; fi; \
+     [ -n \"$gpu\" ] || gpu=none; \
+     printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$os\" \"$arch\" \"$cores\" \"$ram\" \"$gpu\""
+}
+
+fn parse_host_info<'a>(host: &'a Host, text: &str) -> HostInfo<'a> {
+    let mut fields = text.trim_end().splitn(5, '\t');
+    let os = fields
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let arch = fields
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let cores = fields.next().and_then(|s| s.parse().ok());
+    let ram_gb = fields.next().and_then(|s| s.parse().ok());
+    let gpu = fields
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    HostInfo {
+        host,
+        master: true,
+        os,
+        arch,
+        cores,
+        ram_gb,
+        gpu,
+        remedy: None,
+    }
 }
 
 pub fn poll(t: &dyn Transport, host: &Host, id: &crate::wrapper::JobId, json: bool) -> Result<i32> {
@@ -421,6 +582,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         }
         Commands::Host(HostCmd::List { json }) => {
             host_list(&cfg, &Ssh, json)?;
+            if !quiet {
+                eprintln!("next: coop host info --json for OS, cores, RAM, and GPU");
+            }
+            Ok(0)
+        }
+        Commands::Host(HostCmd::Info { host, json }) => {
+            host_info(&cfg, &Ssh, host.as_deref(), json)?;
             Ok(0)
         }
         Commands::Poll { id, host, json } => {
@@ -761,7 +929,21 @@ fn json_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::display_command;
+    use super::{display_command, host_info};
+    use crate::config::Config;
+    use crate::transport::{Fake, Output};
+
+    #[test]
+    fn host_info_uses_one_round_trip_per_reachable_host() {
+        let cfg = Config::parse("[hosts.one]\n[hosts.two]\n").unwrap();
+        let fake = Fake::new();
+        fake.push(Output::ok("Linux\tx86_64\t8\t16\tnone\n"))
+            .push(Output::ok("Darwin\tarm64\t10\t32\tApple GPU\n"));
+
+        host_info(&cfg, &fake, None, true).unwrap();
+
+        assert_eq!(fake.scripts().len(), 2);
+    }
 
     #[test]
     fn display_command_truncates_on_character_boundaries() {

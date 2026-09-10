@@ -623,3 +623,86 @@ fn a_missing_master_exits_three_with_the_recovery_command() {
         );
     }
 }
+
+#[test]
+fn host_info_probes_real_capabilities_and_reports_a_down_master() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    sshd.open_master(&sshd.socket);
+    let config = sshd.dir.join("host-info.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[hosts.live]\ntarget = \"127.0.0.1\"\nsocket = \"{}\"\n\
+             [hosts.down]\ntarget = \"127.0.0.1\"\nsocket = \"{}\"\n",
+            sshd.socket.display(),
+            sshd.dir.join("down.sock").display()
+        ),
+    )
+    .unwrap();
+
+    let list = sshd.coop(&config, &["host", "list"]);
+    assert!(list.status.success());
+    assert!(
+        String::from_utf8_lossy(&list.stderr).contains("coop host info --json"),
+        "host list must point agents at the opt-in probe"
+    );
+
+    let expected_os = stdout(&sshd.ssh(&["uname", "-s"]));
+    let expected_arch = stdout(&sshd.ssh(&["uname", "-m"]));
+    let expected_cores = stdout(&sshd.ssh(&["nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null"]));
+    let expected_ram = stdout(&sshd.ssh(&[
+        "if [ -r /proc/meminfo ]; then awk '/MemTotal/{printf \"%.0f\", $2/1048576}' /proc/meminfo; else echo $(( $(sysctl -n hw.memsize) / 1073741824 )); fi",
+    ]));
+    let out = sshd.coop(&config, &["host", "info", "--json"]);
+    assert!(
+        out.status.success(),
+        "host info failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = String::from_utf8_lossy(&out.stdout);
+    for field in [
+        "\"name\"",
+        "\"target\"",
+        "\"master\"",
+        "\"os\"",
+        "\"arch\"",
+        "\"cores\"",
+        "\"ram_gb\"",
+        "\"gpu\"",
+        "\"remedy\"",
+    ] {
+        assert!(json.contains(field), "missing {field}: {json}");
+    }
+    assert!(
+        json.contains(&format!(
+            "\"name\":\"live\",\"target\":\"127.0.0.1\",\"master\":true,\"os\":\"{expected_os}\",\"arch\":\"{expected_arch}\""
+        )),
+        "live host capabilities did not come from the loopback host: {json}"
+    );
+    assert!(
+        json.contains(&format!("\"cores\":{expected_cores}")),
+        "{json}"
+    );
+    assert!(
+        json.contains(&format!("\"ram_gb\":{expected_ram}")),
+        "{json}"
+    );
+    let live = json.split("\"name\":\"live\"").nth(1).unwrap_or_default();
+    assert!(
+        !live.contains("\"gpu\":\"\""),
+        "GPU must be explicit: {json}"
+    );
+    assert!(
+        !live.contains("\"gpu\":\"unknown\""),
+        "a reachable host without a detected GPU must report none: {json}"
+    );
+    assert!(
+        json.contains("\"name\":\"down\",\"target\":\"127.0.0.1\",\"master\":false,\"os\":\"unknown\",\"arch\":\"unknown\",\"cores\":null,\"ram_gb\":null,\"gpu\":\"unknown\""),
+        "a down master must remain visible without a probe: {json}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ssh -MNf"),
+        "down host must include its remedy"
+    );
+}
