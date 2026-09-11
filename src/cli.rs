@@ -126,7 +126,12 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
 
-    /// Suppress successful next-step hints on stderr
+    /// Suppress next-step hints on stderr. Warnings are still printed.
+    ///
+    /// A hint is convenience; a warning is correctness. They do not share a
+    /// switch, because the caller most likely to pass `--quiet` is the one
+    /// wanting a clean id -- and silencing their safety net at the same time
+    /// is the opposite of what they asked for.
     #[arg(long, global = true)]
     pub quiet: bool,
 
@@ -689,9 +694,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     // was told something was wrong with no way to act on it.
                     // coop never blocks on a heuristic: the command belongs to
                     // the caller (AGENTS.md), and a pipeline may be deliberate.
-                    if !quiet {
-                        warn_about_dispatch_patterns(&command, has_runtime_cap, &id);
-                    }
+                    // Not gated on `quiet`: see the flag's own docs. A
+                    // caller piping coop through `tail -1` to get a bare id
+                    // was already losing this warning to their own pipeline,
+                    // so making `--quiet` the recommended alternative had to
+                    // stop hiding it too.
+                    warn_about_dispatch_patterns(&command, has_runtime_cap, &id);
                     if !wait {
                         if !quiet {
                             eprintln!("next: coop wait {id} for the exit code");

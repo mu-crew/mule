@@ -325,9 +325,21 @@ fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
         "no placeholder ids in a message about a job that exists: {stderr}"
     );
 
+    // `--quiet` drops the HINTS and keeps the WARNING -- see
+    // quiet_drops_hints_but_keeps_warnings for the full contract. This test
+    // previously required stderr to be empty, which made the documented way
+    // to get a clean id also disable the safety net.
     let quiet = sshd.coop(&config, &["--quiet", "run", "printf ok | tail -1"]);
     assert!(quiet.status.success());
-    assert!(quiet.stderr.is_empty(), "--quiet must suppress the warning");
+    let quiet_err = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_err.contains("next: coop"),
+        "--quiet must suppress the hints: {quiet_err}"
+    );
+    assert!(
+        quiet_err.contains("may hide the job's failure"),
+        "--quiet must keep the warning: {quiet_err}"
+    );
     let quiet_id = stdout(&quiet);
 
     clean_jobs(&sshd, &[id, quiet_id]);
@@ -933,4 +945,52 @@ fn kill_rm_ends_the_job_and_drops_its_state() {
         !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
         "kill --rm must end the job, not just forget it"
     );
+}
+
+#[test]
+fn quiet_drops_hints_but_keeps_warnings() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "quiet-warn");
+    let config = sshd.write_config(&tmux.name);
+
+    // A real shape an agent writes when exploring a host, pasted from a
+    // session: the pipeline's `head` becomes the job's rc.
+    let command = "grep -rn proxy /etc/hosts 2>/dev/null | head -12";
+
+    let loud = sshd.coop(&config, &["run", command]);
+    assert!(loud.status.success());
+    let loud_err = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_err.contains("may hide the job's failure"),
+        "{loud_err}"
+    );
+    assert!(loud_err.contains("next: coop wait"), "{loud_err}");
+
+    // `--quiet` means "stop holding my hand", not "disable the safety net".
+    // Those are different classes: a hint is convenience, a warning is
+    // correctness. Sharing one flag meant the documented way to get a clean
+    // id -- which is what a caller piping coop through `tail -1` is after --
+    // also silenced the warning about their own command.
+    let quiet = sshd.coop(&config, &["--quiet", "run", command]);
+    assert!(quiet.status.success());
+    let quiet_err = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        quiet_err.contains("may hide the job's failure"),
+        "--quiet must keep the warning: {quiet_err:?}"
+    );
+    assert!(
+        !quiet_err.contains("next: coop wait"),
+        "--quiet must drop the hints: {quiet_err:?}"
+    );
+
+    // stdout stays exactly the id on both paths, so `id=$(coop run ...)` is
+    // the clean way to get a handle and needs no piping at all.
+    for out in [&loud, &quiet] {
+        let id = stdout(out);
+        assert_eq!(id.len(), 6, "stdout must be only the id: {id:?}");
+    }
+
+    clean_jobs(&sshd, &[stdout(&loud), stdout(&quiet)]);
 }
