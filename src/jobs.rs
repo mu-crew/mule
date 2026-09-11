@@ -20,6 +20,7 @@ pub struct Row {
     pub host: String,
     pub state: State,
     pub age_secs: u64,
+    pub runtime_secs: Option<u64>,
     pub cmd: String,
 }
 
@@ -107,13 +108,14 @@ pub fn list_with_hidden(
 /// `cmd` is base64-encoded inside awk. A command may contain a tab or newline,
 /// either of which would corrupt the row format. Keeping the encoder in the
 /// existing awk process avoids restoring the per-job `base64` forks that made
-/// listing take 14.1s.
+/// listing take 14.1s. The same batched stat includes `cmd` and `rc`: spawning
+/// one stat per artifact would undo that improvement.
 fn list_script(host: &Host) -> String {
     format!(
         "root={JOBS_ROOT}; [ -d \"$root\" ] || exit 0; \
          live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | sed 's/^coop-//'); \
-         {{ find \"$root\" -mindepth 1 -maxdepth 1 -type d -exec stat -c '%Y %n' {{}} + 2>/dev/null \
-            || find \"$root\" -mindepth 1 -maxdepth 1 -type d -exec stat -f '%m %N' {{}} + ; }} \
+         {{ find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -c '%Y %n' {{}} + 2>/dev/null \
+            || find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -f '%m %N' {{}} + ; }} \
          | awk -v now=\"$(date +%s)\" -v live=\"$live\" '\
              BEGIN {{ \
                n = split(live, L, \"\\n\"); \
@@ -135,15 +137,33 @@ fn list_script(host: &Host) -> String {
                return out; \
              }} \
              {{ \
-               mtime = $1; dir = substr($0, length($1) + 2); \
+               mtime = $1; path = substr($0, length($1) + 2); \
+               dir = path; kind = \"dir\"; \
+               if (sub(/\\/cmd$/, \"\", dir)) kind = \"cmd\"; \
+               else if (sub(/\\/rc$/, \"\", dir)) kind = \"rc\"; \
                id = dir; sub(/.*\\//, \"\", id); \
-               rc = \"\"; if ((getline l < (dir \"/rc\")) > 0) rc = l; \
-               close(dir \"/rc\"); \
-               cmd = \"\"; \
-               while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
-               close(dir \"/cmd\"); \
-               printf \"%s\\t%s\\t%s\\t%s\\t%s\\n\", \
-                 id, now - mtime, rc, (id in alive) ? 1 : 0, b64(cmd); \
+               dirs[id] = dir; \
+               if (kind == \"dir\") dir_mtime[id] = mtime; \
+               else if (kind == \"cmd\") cmd_mtime[id] = mtime; \
+               else rc_mtime[id] = mtime; \
+             }} \
+             END {{ \
+               for (id in dirs) {{ \
+                 dir = dirs[id]; \
+                 rc = \"\"; if ((getline l < (dir \"/rc\")) > 0) rc = l; \
+                 close(dir \"/rc\"); \
+                 cmd = \"\"; \
+                 while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
+                 close(dir \"/cmd\"); \
+                 runtime = \"\"; \
+                 if (rc != \"\" && (id in cmd_mtime) && (id in rc_mtime)) \
+                   runtime = rc_mtime[id] - cmd_mtime[id]; \
+                 else if (rc == \"\" && (id in alive) && (id in cmd_mtime)) \
+                   runtime = now - cmd_mtime[id]; \
+                 if (runtime != \"\" && runtime < 0) runtime = 0; \
+                 printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", \
+                   id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd); \
+               }} \
              }}'",
         host.tmux_socket
     )
@@ -152,13 +172,23 @@ fn list_script(host: &Host) -> String {
 fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Result<usize> {
     let mut hidden = 0;
     for line in reply.lines() {
-        let mut fields = line.splitn(5, '\t');
+        let mut fields = line.splitn(6, '\t');
         let id = fields.next().context("invalid ls reply: missing id")?;
         let age_secs = fields
             .next()
             .context("invalid ls reply: missing age")?
             .parse()
             .context("invalid age in ls reply")?;
+        let runtime_text = fields.next().context("invalid ls reply: missing runtime")?;
+        let runtime_secs = if runtime_text.is_empty() {
+            None
+        } else {
+            Some(
+                runtime_text
+                    .parse()
+                    .context("invalid runtime in ls reply")?,
+            )
+        };
         let rc_text = fields.next().context("invalid ls reply: missing rc")?;
         let alive = fields.next().context("invalid ls reply: missing alive")? == "1";
         let cmd = String::from_utf8_lossy(&decode_command(
@@ -175,6 +205,12 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             None if alive => State::Running,
             None => State::Orphan,
         };
+        // An orphan has no completion timestamp, so elapsed time since dispatch
+        // is not its runtime. Keep the value absent rather than repeat AGE's
+        // old mistake of giving one number two meanings.
+        let runtime_secs = (!matches!(state, State::Orphan))
+            .then_some(runtime_secs)
+            .flatten();
         // Time-based, not state-based. Filtering on `done` treated finished
         // work as noise the caller had already seen -- true for a job watched
         // with `--wait`, false for every job dispatched and walked away from,
@@ -191,6 +227,7 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
                 host: host.name.clone(),
                 state,
                 age_secs,
+                runtime_secs,
                 cmd,
             });
         } else {

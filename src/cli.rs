@@ -51,6 +51,7 @@ struct JobJson<'a> {
     state: &'static str,
     rc: Option<i32>,
     age_secs: u64,
+    runtime_secs: Option<u64>,
     cmd: &'a str,
 }
 
@@ -58,6 +59,7 @@ struct JobJson<'a> {
 struct PollJson {
     state: &'static str,
     rc: Option<i32>,
+    runtime_secs: Option<u64>,
     log_size: u64,
 }
 
@@ -614,7 +616,10 @@ fn poll_with_hint(
     crate::errors::require_master(t, host)?;
     let result = probe(t, host, id, crate::probe::From::StateOnly)?;
     if json {
-        println!("{}", poll_json(&result.state, result.log_size));
+        println!(
+            "{}",
+            poll_json(&result.state, result.runtime_secs, result.log_size)
+        );
     } else {
         match result.state {
             State::Running => println!("running"),
@@ -625,7 +630,14 @@ fn poll_with_hint(
     if !quiet {
         match result.state {
             State::Running => {
-                eprintln!("next: coop wait {id} to block; coop tail {id} -f to follow")
+                if let Some(runtime) = result.runtime_secs {
+                    eprintln!(
+                        "running for {}; next: coop wait {id} to block; coop tail {id} -f to follow",
+                        format_age(runtime)
+                    );
+                } else {
+                    eprintln!("next: coop wait {id} to block; coop tail {id} -f to follow");
+                }
             }
             State::Done(_) => {
                 eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state")
@@ -638,7 +650,7 @@ fn poll_with_hint(
     Ok(0)
 }
 
-fn poll_json(state: &State, log_size: u64) -> String {
+fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String {
     let (state, rc) = match state {
         State::Running => ("running", None),
         State::Done(code) => ("done", Some(*code)),
@@ -647,6 +659,7 @@ fn poll_json(state: &State, log_size: u64) -> String {
     serde_json::to_string(&PollJson {
         state,
         rc,
+        runtime_secs,
         log_size,
     })
     .expect("poll json is numbers and static strings")
@@ -936,6 +949,7 @@ fn print_jobs(
                     state,
                     rc,
                     age_secs: row.age_secs,
+                    runtime_secs: row.runtime_secs,
                     cmd: &row.cmd,
                 }
             })
@@ -983,7 +997,7 @@ fn print_jobs(
     // COMMAND is last so it can run long without padding every line -- which
     // is why `print_table` never pads its final column.
     print_table(
-        &["ID", "HOST", "STATE", "RC", "AGE", "COMMAND"],
+        &["ID", "HOST", "STATE", "RC", "RUNTIME", "COMMAND"],
         &rows
             .iter()
             .map(|row| {
@@ -997,7 +1011,9 @@ fn print_jobs(
                     row.host.clone(),
                     state.to_string(),
                     rc,
-                    format_age(row.age_secs),
+                    row.runtime_secs
+                        .map(format_age)
+                        .unwrap_or_else(|| "-".into()),
                     if full {
                         collapse_whitespace(&row.cmd)
                     } else {
@@ -1163,16 +1179,16 @@ mod tests {
         // regress the moment a string needed escaping. serde is the contract
         // the other emitters already use.
         assert_eq!(
-            poll_json(&State::Running, 12),
-            r#"{"state":"running","rc":null,"log_size":12}"#
+            poll_json(&State::Running, Some(7), 12),
+            r#"{"state":"running","rc":null,"runtime_secs":7,"log_size":12}"#
         );
         assert_eq!(
-            poll_json(&State::Done(5), 0),
-            r#"{"state":"done","rc":5,"log_size":0}"#
+            poll_json(&State::Done(5), Some(3), 0),
+            r#"{"state":"done","rc":5,"runtime_secs":3,"log_size":0}"#
         );
         assert_eq!(
-            poll_json(&State::Orphan, 99),
-            r#"{"state":"orphan","rc":null,"log_size":99}"#
+            poll_json(&State::Orphan, None, 99),
+            r#"{"state":"orphan","rc":null,"runtime_secs":null,"log_size":99}"#
         );
     }
 

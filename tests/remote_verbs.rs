@@ -352,6 +352,77 @@ fn ls_enumerates_real_jobs_with_their_commands() {
 }
 
 #[test]
+fn ls_and_poll_report_runtime_from_real_artifact_mtimes() {
+    require_sshd!();
+    let _lane = shared();
+    let mut f = Fixture::new("runtime");
+
+    let done = f.run("sleep 2");
+    f.await_done(&done);
+    let running = f.run("sleep 60");
+    std::thread::sleep(Duration::from_secs(2));
+    let orphan = f.run("sleep 60");
+    std::thread::sleep(Duration::from_millis(600));
+    let _ = f
+        .sshd
+        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
+
+    let listing = f.out(&["ls", "--all"]);
+    let header = listing.lines().next().unwrap_or_default();
+    assert!(header.contains("RUNTIME"), "{header}");
+    assert!(!header.contains("AGE"), "{header}");
+    let done_row = listing
+        .lines()
+        .find(|line| line.starts_with(&done))
+        .unwrap();
+    let displayed_runtime = done_row
+        .split_whitespace()
+        .nth(4)
+        .and_then(|cell| cell.strip_suffix('s'))
+        .and_then(|secs| secs.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("missing seconds runtime: {done_row}"));
+    assert!(displayed_runtime >= 2, "{done_row}");
+    let orphan_row = listing
+        .lines()
+        .find(|line| line.starts_with(&orphan))
+        .unwrap();
+    assert_eq!(
+        orphan_row.split_whitespace().nth(4),
+        Some("-"),
+        "an orphan's runtime is unknowable: {orphan_row}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&f.out(&["ls", "--all", "--json"])).unwrap();
+    let jobs = json["items"].as_array().unwrap();
+    let runtime =
+        |id: &str| jobs.iter().find(|job| job["id"] == id).unwrap()["runtime_secs"].clone();
+    assert!(runtime(&done).as_u64().unwrap() >= 2);
+    assert!(runtime(&running).as_u64().unwrap() >= 2);
+    assert!(runtime(&orphan).is_null(), "{json}");
+
+    for (id, expected) in [(&running, Some(2)), (&done, Some(2)), (&orphan, None)] {
+        let poll: serde_json::Value =
+            serde_json::from_str(&f.out(&["poll", id, "--json"])).unwrap();
+        match expected {
+            Some(minimum) => assert!(poll["runtime_secs"].as_u64().unwrap() >= minimum),
+            None => assert!(poll["runtime_secs"].is_null(), "{poll}"),
+        }
+    }
+    let running_poll = f.coop(&["poll", &running]);
+    assert_eq!(
+        String::from_utf8_lossy(&running_poll.stdout).trim(),
+        "running"
+    );
+    assert!(
+        String::from_utf8_lossy(&running_poll.stderr).contains("running for"),
+        "{}",
+        String::from_utf8_lossy(&running_poll.stderr)
+    );
+
+    let _ = f.coop(&["kill", &running]);
+}
+
+#[test]
 fn tail_reads_offsets_and_caps_against_a_real_log() {
     require_sshd!();
     let _lane = shared();
@@ -548,7 +619,7 @@ fn run_wait_prints_the_output_of_an_instant_command() {
     // out which number is the exit code and which the age.
     let listing = f.out(&["ls"]);
     let header = listing.lines().next().unwrap_or_default();
-    for column in ["ID", "HOST", "STATE", "RC", "AGE", "COMMAND"] {
+    for column in ["ID", "HOST", "STATE", "RC", "RUNTIME", "COMMAND"] {
         assert!(
             header.contains(column),
             "missing {column} in header: {header:?}"

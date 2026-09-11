@@ -55,7 +55,7 @@ fn ls_json_is_stable_for_every_job_state() {
     let ssh = dir.join("ssh");
     std::fs::write(
         &ssh,
-        "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) exit 0;; esac\nprintf 'abc123\\t12\\t\\t1\\tZWNobyBoaQ==\\ndef456\\t34\\t9\\t0\\tZmFsc2U=\\nfed987\\t56\\t\\t0\\tdHJ1ZQ==\\n'\n",
+        "#!/bin/sh\ncase \" $* \" in *\" -O check \"*) exit 0;; esac\nprintf 'abc123\\t12\\t12\\t\\t1\\tZWNobyBoaQ==\\ndef456\\t34\\t9\\t9\\t0\\tZmFsc2U=\\nfed987\\t56\\t\\t\\t0\\tdHJ1ZQ==\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -76,7 +76,7 @@ fn ls_json_is_stable_for_every_job_state() {
     );
     assert_eq!(
         output.stdout,
-        b"{\"items\":[{\"id\":\"abc123\",\"host\":\"dev\",\"state\":\"running\",\"rc\":null,\"age_secs\":12,\"cmd\":\"echo hi\"},{\"id\":\"def456\",\"host\":\"dev\",\"state\":\"done\",\"rc\":9,\"age_secs\":34,\"cmd\":\"false\"},{\"id\":\"fed987\",\"host\":\"dev\",\"state\":\"orphan\",\"rc\":null,\"age_secs\":56,\"cmd\":\"true\"}],\"unreachable\":[]}\n"
+        b"{\"items\":[{\"id\":\"abc123\",\"host\":\"dev\",\"state\":\"running\",\"rc\":null,\"age_secs\":12,\"runtime_secs\":12,\"cmd\":\"echo hi\"},{\"id\":\"def456\",\"host\":\"dev\",\"state\":\"done\",\"rc\":9,\"age_secs\":34,\"runtime_secs\":9,\"cmd\":\"false\"},{\"id\":\"fed987\",\"host\":\"dev\",\"state\":\"orphan\",\"rc\":null,\"age_secs\":56,\"runtime_secs\":null,\"cmd\":\"true\"}],\"unreachable\":[]}\n"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -87,9 +87,9 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     // ages in seconds: running/12s, done/34s, orphan/56s. Commands use the
     // same base64 protocol as dispatch.
     fake.push(Output::ok(
-        "abc123\t12\t\t1\tZWNobyBoaQ==\n\
-         def456\t34\t9\t0\tZmFsc2U=\n\
-         fed987\t56\t\t0\tdHJ1ZQ==\n",
+        "abc123\t12\t12\t\t1\tZWNobyBoaQ==\n\
+         def456\t34\t9\t9\t0\tZmFsc2U=\n\
+         fed987\t56\t\t\t0\tdHJ1ZQ==\n",
     ));
     let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
 
@@ -104,6 +104,7 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     assert_eq!(rows[0].host, "dev");
     assert_eq!(rows[0].state, State::Running);
     assert_eq!(rows[0].age_secs, 12);
+    assert_eq!(rows[0].runtime_secs, Some(12));
     assert_eq!(rows[0].cmd, "echo hi");
     assert_eq!(rows[1].state, State::Done(9));
     assert_eq!(rows[1].cmd, "false");
@@ -226,9 +227,9 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     // A week-old job in each state.
     let reply = format!(
-        "aaaaaa\t{week}\t\t1\tZWNobyBoaQ==\n\
-         bbbbbb\t{week}\t0\t0\tZmFsc2U=\n\
-         cccccc\t{week}\t\t0\tdHJ1ZQ==\n"
+        "aaaaaa\t{week}\t{week}\t\t1\tZWNobyBoaQ==\n\
+         bbbbbb\t{week}\t2\t0\t0\tZmFsc2U=\n\
+         cccccc\t{week}\t\t\t0\tdHJ1ZQ==\n"
     );
 
     let fake = Fake::new();
@@ -260,7 +261,7 @@ impl Transport for HostsFake {
             .unwrap()
             .push((host.name.clone(), script.to_owned()));
         Ok(Output::ok(format!(
-            "{}01\t1\t\t1\tdHJ1ZQ==\n",
+            "{}01\t1\t1\t\t1\tdHJ1ZQ==\n",
             &host.name[..3]
         )))
     }

@@ -16,6 +16,7 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     pub state: State,
+    pub runtime_secs: Option<u64>,
     pub log_size: u64,
     pub bytes: Vec<u8>,
 }
@@ -50,8 +51,15 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let dir = state_dir(id);
     let from = from.into();
     let script = format!(
-        "d={dir}; printf 'rc=%s\\n' \"$(cat $d/rc 2>/dev/null)\"; \
-         printf 'alive=%s\\n' \"$(tmux -L {} has-session -t coop-{id} 2>/dev/null && echo 1 || echo 0)\"; \
+        "d={dir}; rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
+         alive=$(tmux -L {} has-session -t coop-{id} 2>/dev/null && echo 1 || echo 0); \
+         printf 'alive=%s\\n' \"$alive\"; \
+         cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
+         if [ -n \"$rc\" ]; then end_mtime=$(stat -c %Y $d/rc 2>/dev/null || stat -f %m $d/rc 2>/dev/null); \
+         elif [ \"$alive\" = 1 ]; then end_mtime=$(date +%s); else end_mtime=; fi; \
+         if [ -n \"$cmd_mtime\" ] && [ -n \"$end_mtime\" ]; then runtime=$((end_mtime - cmd_mtime)); \
+           [ \"$runtime\" -lt 0 ] && runtime=0; else runtime=; fi; \
+         printf 'runtime=%s\\n' \"$runtime\"; \
          printf 'size=%s\\n' \"$(wc -c < $d/log 2>/dev/null || echo 0)\"; \
          printf 'bytes:\\n'; {}",
         host.tmux_socket,
@@ -76,6 +84,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
 
     let mut rc = None;
     let mut alive = None;
+    let mut runtime_secs = None;
     let mut log_size = None;
     for line in output.text().lines() {
         if let Some(value) = line.strip_prefix("rc=") {
@@ -84,6 +93,10 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
             }
         } else if let Some(value) = line.strip_prefix("alive=") {
             alive = Some(value == "1");
+        } else if let Some(value) = line.strip_prefix("runtime=") {
+            if !value.is_empty() {
+                runtime_secs = Some(value.parse().context("invalid runtime in probe reply")?);
+            }
         } else if let Some(value) = line.strip_prefix("size=") {
             log_size = Some(
                 value
@@ -101,6 +114,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     };
     Ok(Probe {
         state,
+        runtime_secs,
         log_size: log_size.context("invalid probe reply: missing size")?,
         bytes,
     })

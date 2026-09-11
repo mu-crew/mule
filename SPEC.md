@@ -191,7 +191,7 @@ coop host list [--json]
 coop host info [--host H] [--json]
 ```
 
-`poll` prints `running`, `orphan`, or the exit code. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
+`poll` prints `running`, `orphan`, or the exit code; for a running job its stderr hint includes elapsed runtime. `poll --json` includes `runtime_secs`. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
 
 `run --max-secs S` overrides the host's `max_job_secs` for that job; zero means unbounded. A portable watchdog runs in a separate private tmux session, so it needs no `timeout(1)` (absent on stock macOS), does not hold SSH, and cannot leave its `sleep` keeping a fast job alive. At the cap it writes **124**, GNU `timeout`'s established code, then destroys the job session and its process tree. Normal completion destroys the watchdog and preserves the command's own rc. This remote runtime bound is deliberately distinct from `wait --timeout`, which only stops the local caller waiting and leaves the job running.
 
@@ -214,7 +214,7 @@ A refused session channel is classified instead of exposing the misleading authe
 
 ## Listing, load, and cleanup
 
-`ls` does a bounded amount of work per host -- one `tmux list-sessions`, one batched `stat`, one `awk` -- rather than work proportional to the job count. The listing runs inside the ticket lock, so its duration is a channel outage for everything else: a per-job version measured 14.1s at 300 jobs, fourteen times the one-second ceiling stated above, at a job count `keep_days` makes ordinary.
+`ls` does a bounded amount of work per host -- one `tmux list-sessions`, one batched `stat`, one `awk` -- rather than work proportional to the job count. The same stat batch reads the directory, `cmd`, and `rc` mtimes. Runtime is `now - cmd_mtime` while running and `rc_mtime - cmd_mtime` when finished; an orphan shows `-` because its end time is unknowable. The human table shows `RUNTIME` instead of the state-dependent `AGE`; JSON retains `age_secs` and adds `runtime_secs`. The listing runs inside the ticket lock, so its duration is a channel outage for everything else: a per-job version measured 14.1s at 300 jobs, fourteen times the one-second ceiling stated above, at a job count `keep_days` makes ordinary.
 
 `ls` checks configured hosts sequentially because every host call takes its own lock. It reports unreachable hosts instead of silently omitting them.
 

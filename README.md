@@ -184,7 +184,7 @@ flags there. Use `--` when the command takes a flag coop also has:
 coop run -- ls --all
 ```
 
-`coop ls` shows the last 24 hours plus anything running or orphaned; `--all` reaches further back. Its table collapses whitespace and marks commands longer than 80 characters with `…`, keeping each job on one line. Use `coop ls --full` to read a long command in the table, and `coop ls --json` as the machine surface. Logs are capped at 100MB per job (`max_log_bytes`), and a truncated log says so.
+`coop ls` shows the last 24 hours plus anything running or orphaned; `--all` reaches further back. Its `RUNTIME` column is elapsed time for running jobs, total time for finished jobs, and `-` for orphans, whose runtime is unknowable. The table collapses whitespace and marks commands longer than 80 characters with `…`, keeping each job on one line. Use `coop ls --full` to read a long command in the table, and `coop ls --json` as the machine surface; JSON keeps `age_secs` and adds `runtime_secs`. Logs are capped at 100MB per job (`max_log_bytes`), and a truncated log says so.
 
 Jobs are unbounded by default. Set `max_job_secs` on a host, or pass
 `coop run --max-secs S`, to cap remote runtime. A timed-out job records rc
