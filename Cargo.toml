@@ -3,7 +3,7 @@
 # suffix. Both targets below are still named `coop`, so nothing a user types
 # changes.
 name = "coop-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Fire remote jobs down a private ssh channel nothing else can contend with."
 license = "MIT"

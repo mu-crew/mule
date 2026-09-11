@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 — 2026-09-11
+
+**`ls` reports how long a job RAN, replacing the AGE column.** Age answered
+neither question anyone asks: for a finished job it meant "time since it
+finished", for a running one "time since dispatch". Runtime comes from the
+`cmd` and `rc` artifact mtimes, so nothing new is written — elapsed for a
+running job, total for a finished one, `-` for an orphan whose total is
+unknowable. `--json` keeps `age_secs` and adds `runtime_secs`.
+
+**`--quiet` no longer hides warnings.** It was documented as suppressing
+next-step hints and also silenced the dispatch warnings, so the clean way to
+get a bare job id disabled the safety net at the same time. Hints are
+convenience; warnings are correctness. They no longer share a switch.
+
+Note `coop run` puts the id alone on stdout, so `id=$(coop --quiet run '<cmd>')`
+captures a clean handle while any warning still reaches your terminal. Piping
+coop through `tail -1` to get the id captures a hint instead.
+
 ## 0.1.0 — 2026-09-10
 
 First release. `coop` fires jobs at a remote host over its own ssh control
