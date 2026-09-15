@@ -994,3 +994,58 @@ fn quiet_drops_hints_but_keeps_warnings() {
 
     clean_jobs(&sshd, &[stdout(&loud), stdout(&quiet)]);
 }
+
+#[test]
+fn ls_running_excludes_finished_and_orphaned_jobs() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "ls-running");
+    let config = sshd.write_config(&tmux.name);
+
+    let running = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
+    let done = stdout(&sshd.coop(&config, &["run", "exit 0"]));
+    let orphan = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
+
+    // Wait for the short job to finish; ordering, not a guessed sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while stdout(&sshd.coop(&config, &["poll", &done])) == "running" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "short job never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Destroy one session without writing rc: that is an orphan, and
+    // "running" must mean a live process rather than merely "not done".
+    let killed = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "kill-session",
+        "-t",
+        &format!("coop-{orphan}"),
+    ]);
+    assert!(killed.status.success());
+
+    let table = stdout(&sshd.coop(&config, &["ls", "--running", "--quiet"]));
+    assert!(table.contains(&running), "running job missing: {table}");
+    assert!(
+        !table.contains(&done),
+        "finished job leaked into --running: {table}"
+    );
+    assert!(
+        !table.contains(&orphan),
+        "orphan leaked into --running: {table}"
+    );
+
+    let json = stdout(&sshd.coop(&config, &["ls", "--running", "--json", "--quiet"]));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["items"].as_array().unwrap().len(), 1);
+    assert_eq!(value["items"][0]["id"], running);
+    assert_eq!(value["items"][0]["state"], "running");
+
+    let _ = sshd.coop(&config, &["kill", "--rm", &running]);
+    clean_jobs(&sshd, &[done, orphan]);
+}

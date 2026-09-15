@@ -1,4 +1,4 @@
-use clap::CommandFactory;
+use clap::{CommandFactory, Parser};
 
 use coop::cli::Cli;
 use coop::errors::{
@@ -159,6 +159,16 @@ fn typed_failures_have_stable_distinct_exit_codes() {
         [3, 4, 5, 6]
     );
     assert_eq!(exit_code(&anyhow::anyhow!("unclassified")), 1);
+}
+
+#[test]
+fn ls_all_and_running_are_mutually_exclusive() {
+    let error = Cli::try_parse_from(["coop", "ls", "--all", "--running"])
+        .expect_err("--all and --running answer opposite questions");
+    let text = error.to_string();
+    assert!(text.contains("cannot be used with"), "{text}");
+    assert!(text.contains("--all"), "{text}");
+    assert!(text.contains("--running"), "{text}");
 }
 
 #[test]

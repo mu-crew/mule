@@ -245,8 +245,15 @@ pub enum Commands {
         #[command(flatten)]
         host: HostArg,
         /// Include finished jobs older than the default 24-hour window
-        #[arg(long)]
+        #[arg(long, conflicts_with = "running")]
         all: bool,
+        /// Show only jobs whose remote tmux session is still alive
+        ///
+        /// Orphans are excluded: they have no rc, but their process is gone and
+        /// no result will ever arrive. `--running` means work is running, not
+        /// merely "not finished".
+        #[arg(long, conflicts_with = "all")]
+        running: bool,
         /// Emit machine-readable rows with complete, unmodified commands
         #[arg(long)]
         json: bool,
@@ -805,12 +812,24 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Ls {
             host,
             all,
+            running,
             json,
             full,
         } => {
-            let (rows, unreachable, hidden) =
+            let (mut rows, unreachable, hidden) =
                 crate::jobs::list_with_hidden(&cfg, &Ssh, host.host.as_deref(), all)?;
-            print_jobs(&rows, &unreachable, hidden, json, full, quiet);
+            if running {
+                rows.retain(|row| matches!(row.state, State::Running));
+            }
+            print_jobs(
+                &rows,
+                &unreachable,
+                if running { 0 } else { hidden },
+                json,
+                full,
+                quiet,
+                running,
+            );
             Ok(0)
         }
         Commands::Kill { id, host, rm } => {
@@ -926,6 +945,7 @@ fn print_jobs(
     json: bool,
     full: bool,
     quiet: bool,
+    running_only: bool,
 ) {
     for host in unreachable {
         eprintln!("{}: unreachable ({})", host.host, host.why);
@@ -981,7 +1001,9 @@ fn print_jobs(
 
     if rows.is_empty() {
         if !quiet {
-            if hidden == 0 {
+            if running_only {
+                eprintln!("no running jobs; next: coop run <cmd>");
+            } else if hidden == 0 {
                 eprintln!("no jobs; next: coop run <cmd>");
             } else {
                 eprintln!("{hidden} older finished jobs hidden; next: coop ls --all");
