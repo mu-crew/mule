@@ -108,7 +108,7 @@ existing master.
 | Anything that must survive a dropped connection | Yes. That is the only way to get an exit code back later. |
 | Several long commands at once | Yes. Ungated, 1 of 5 concurrent calls succeeded. |
 | A transfer between the host and a *third* machine | Yes. Both endpoints are remote. |
-| `git rev-parse`, a status poll, a state collector | No. Already sub-second, so 125ms buys nothing. |
+| `git rev-parse`, a status poll, a state collector | Usually direct. Use coop if refusal can look like success: 8 concurrent bare `rev-parse` polls returned 1 sha and 7 empty results; coop dispatched all 8. |
 | A transfer to or from *this* machine | No. A job cannot reach its dispatcher. |
 | A command needing a live terminal | No. Jobs are detached and read no input. |
 
@@ -117,8 +117,12 @@ it is paid by every other tool that needs the channel while you hold it. So the
 question is not "is 125ms of dispatch worth it to me" but "how long am I willing
 to break `git fetch` for". One second is already a long outage.
 
-Below that, a direct call is cheaper, and a refused channel on a short
-idempotent command is better retried than routed around.
+Below that, a direct call is cheaper when failure is loud. Route through coop
+when refusal can be mistaken for a valid empty result.
+
+Measured on the capped host: while a multi-minute job ran through coop, a
+concurrent plain `ssh dev` still succeeded. That coexistence is the promise:
+long work uses coop's private connection while ordinary tools keep theirs.
 
 ## Install and configure
 
