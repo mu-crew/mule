@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
 use crate::transport::Transport;
-use crate::wrapper::{Job, JobId, dispatch_script, new_id};
+use crate::wrapper::{Job, JobId, JobMetadata, dispatch_script, new_id};
 
 pub fn dispatch(
     transport: &dyn Transport,
@@ -12,8 +12,17 @@ pub fn dispatch(
     cmd: &str,
     cwd: Option<&str>,
     max_secs: Option<u64>,
+    metadata: JobMetadata,
 ) -> Result<JobId> {
-    dispatch_with_warnings(transport, host, cmd, cwd, max_secs, &mut std::io::stderr())
+    dispatch_with_warnings(
+        transport,
+        host,
+        cmd,
+        cwd,
+        max_secs,
+        metadata,
+        &mut std::io::stderr(),
+    )
 }
 
 #[doc(hidden)]
@@ -23,6 +32,7 @@ pub fn dispatch_with_warnings(
     cmd: &str,
     cwd: Option<&str>,
     max_secs: Option<u64>,
+    metadata: JobMetadata,
     warnings: &mut dyn Write,
 ) -> Result<JobId> {
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
@@ -38,6 +48,7 @@ pub fn dispatch_with_warnings(
         cmd: cmd.to_owned(),
         cwd: cwd.map(str::to_owned),
         max_secs: max_secs.unwrap_or(host.max_job_secs),
+        metadata,
     };
     let script = format!(
         "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",

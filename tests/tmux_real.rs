@@ -97,6 +97,7 @@ impl TmuxServer {
             cmd: command.into(),
             cwd: cwd.map(str::to_owned),
             max_secs: 0,
+            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
         };
         let script = dispatch_script(&host, &job).replace(
             &format!("{}/{id}", coop::wrapper::JOBS_ROOT),

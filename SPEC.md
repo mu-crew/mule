@@ -94,6 +94,12 @@ With `--max-secs` or `max_job_secs`, a second `watch-<id>` session writes **124*
 
 Both the command and a user-supplied working directory are base64-encoded. They cross the local argument parser, the remote shell, tmux argument parsing, and `sh`; layered quoting reopens injection and expansion bugs at each boundary. The `cmd` file is a display copy, not executable input.
 
+By default, only the final command shell receives `MU_MANAGED_AGENT=1` and
+`MU_AGENT_NAME=coop-<id>`. A non-empty local `MU_WORKSTREAM` is base64-encoded,
+decoded into that shell's environment, and otherwise omitted. `run --human`
+omits all three variables. The SSH dispatch shell and watchdog never receive
+this metadata.
+
 ## Shell and working directory
 
 Jobs use a non-login, non-interactive shell, so login profiles do not run. A command therefore does not inherit whatever an interactive session would have set up, which is what stops a job depending on a host's dotfiles: an irreproducible job fails as "works when I ssh in, fails under coop", and the person debugging it is rarely the person who edited the dotfile.
@@ -180,7 +186,7 @@ One tap unblocks every job for the life of the `ControlPersist` window, so the e
 ## Commands and output
 
 ```text
-coop run [--host H] [--cwd D] [--max-secs S] [--wait] [--no-tail] <cmd>
+coop run [--host H] [--cwd D] [--max-secs S] [--human] [--wait] [--no-tail] <cmd>
 coop poll <id> [--host H] [--json]
 coop wait <id> [--host H] [--timeout S]
 coop tail <id> [--host H] [-f] [--all | -n LINES]

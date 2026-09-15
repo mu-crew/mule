@@ -464,6 +464,97 @@ fn dispatch_preserves_command_argument_boundaries() {
 }
 
 #[test]
+fn run_applies_crew_metadata_only_to_managed_job_shells() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "crew-metadata");
+    let config = sshd.write_config(&tmux.name);
+    let sentinel = sshd.dir.join("workstream-was-executed");
+    let hostile = format!("crew ' \"$(touch {})\"\nnext", sentinel.display());
+    let command =
+        "printf '%s|%s|<%s>' \"$MU_MANAGED_AGENT\" \"$MU_AGENT_NAME\" \"${MU_WORKSTREAM-}\"";
+
+    let managed = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["run", "--wait", command])
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env("MU_WORKSTREAM", &hostile)
+        .output()
+        .unwrap();
+    assert!(
+        managed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&managed.stderr)
+    );
+    let managed_stdout = String::from_utf8_lossy(&managed.stdout);
+    let (managed_id, managed_log) = managed_stdout.split_once('\n').unwrap();
+    assert_eq!(managed_log, format!("1|coop-{managed_id}|<{hostile}>"));
+    assert!(
+        !sentinel.exists(),
+        "workstream text executed as shell syntax"
+    );
+
+    let absent = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "run",
+            "--wait",
+            "printf '%s|%s|%s' \"$MU_MANAGED_AGENT\" \"$MU_AGENT_NAME\" \"${MU_WORKSTREAM+x}\"",
+        ])
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env_remove("MU_WORKSTREAM")
+        .output()
+        .unwrap();
+    assert!(
+        absent.status.success(),
+        "{}",
+        String::from_utf8_lossy(&absent.stderr)
+    );
+    let absent_stdout = String::from_utf8_lossy(&absent.stdout);
+    let (absent_id, absent_log) = absent_stdout.split_once('\n').unwrap();
+    assert_eq!(absent_log, format!("1|coop-{absent_id}|"));
+
+    let human = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "run",
+            "--human",
+            "--wait",
+            "printf '%s|%s|%s' \"${MU_MANAGED_AGENT+x}\" \"${MU_AGENT_NAME+x}\" \"${MU_WORKSTREAM+x}\"",
+        ])
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env("MU_MANAGED_AGENT", "local")
+        .env("MU_AGENT_NAME", "local")
+        .env("MU_WORKSTREAM", &hostile)
+        .output()
+        .unwrap();
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let (human_id, human_log) = human_stdout.split_once('\n').unwrap();
+    assert_eq!(human_log, "||");
+
+    clean_jobs(
+        &sshd,
+        &[
+            managed_id.to_string(),
+            absent_id.to_string(),
+            human_id.to_string(),
+        ],
+    );
+}
+
+#[test]
 fn dispatch_returns_before_the_job_finishes() {
     require_sshd!();
     let sshd = Sshd::start();

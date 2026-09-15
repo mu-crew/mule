@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 — 2026-09-15
+
+Jobs now identify as managed agents by default. The final command shell receives
+`MU_MANAGED_AGENT=1`, `MU_AGENT_NAME=coop-<job-id>`, and the caller's non-empty
+`MU_WORKSTREAM`. Forwarded workstream values are encoded before they enter the
+remote wrapper. `coop run --human` omits all three variables.
+
 ## 0.1.1 — 2026-09-11
 
 **`ls` reports how long a job RAN, replacing the AGE column.** Age answered

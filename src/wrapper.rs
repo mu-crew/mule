@@ -12,6 +12,13 @@ pub struct Job {
     pub cmd: String,
     pub cwd: Option<String>,
     pub max_secs: u64,
+    pub metadata: JobMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobMetadata {
+    Managed { workstream: Option<String> },
+    Human,
 }
 
 /// Remote per-job state, as a shell string (never a local `PathBuf`).
@@ -69,8 +76,24 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         ),
     };
 
+    let shell = match &job.metadata {
+        JobMetadata::Managed { workstream } => {
+            let agent = format!("coop-{}", job.id);
+            match workstream {
+                Some(workstream) => format!(
+                    "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh",
+                    encode_command(workstream.as_bytes())
+                ),
+                None => format!("env -u MU_WORKSTREAM MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} sh"),
+            }
+        }
+        JobMetadata::Human => {
+            "env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh".to_string()
+        }
+    };
+
     let run = if job.max_secs == 0 {
-        format!("{cd} && printf %s {command} | base64 -d | sh; echo $? > {dir}/rc")
+        format!("{cd} && printf %s {command} | base64 -d | {shell}; echo $? > {dir}/rc")
     } else {
         // POSIX sh has no portable process-group primitive, so the inner tmux
         // session supplies one: `kill-session` terminates the command and all
@@ -91,7 +114,7 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
         format!(
             "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
              \"printf %s {watchdog} | base64 -d | sh\"; \
-             {cd} && printf %s {command} | base64 -d | sh; rc=$?; \
+             {cd} && printf %s {command} | base64 -d | {shell}; rc=$?; \
              tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
              if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
             socket = host.tmux_socket,

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use coop::config::Host;
-use coop::wrapper::{Job, dispatch_script, new_id, state_dir};
+use coop::wrapper::{Job, JobMetadata, dispatch_script, new_id, state_dir};
 
 fn host() -> Host {
     Host {
@@ -50,6 +50,7 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
         cmd: command.into(),
         cwd: None,
         max_secs: 0,
+        metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
     };
 
     let script = dispatch_script(&host(), &job);
@@ -72,6 +73,57 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
         state_dir(&job.id),
         "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs/a1b2c3"
     );
+}
+
+#[test]
+fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
+    let hostile = "crew ' \"$(touch /tmp/coop-workstream-injection)\"\nnext";
+    let managed = dispatch_script(
+        &host(),
+        &Job {
+            id: "a1b2c3".parse().unwrap(),
+            cmd: "env".into(),
+            cwd: None,
+            max_secs: 0,
+            metadata: JobMetadata::Managed {
+                workstream: Some(hostile.into()),
+            },
+        },
+    );
+
+    assert!(
+        !managed.contains(hostile),
+        "workstream must not be interpolated"
+    );
+    assert!(
+        managed.contains(&coop::wrapper::encode_command(hostile.as_bytes())),
+        "workstream must enter the wrapper encoded"
+    );
+    assert!(managed.contains("env MU_MANAGED_AGENT=1 MU_AGENT_NAME=coop-a1b2c3"));
+
+    let absent = dispatch_script(
+        &host(),
+        &Job {
+            id: "a1b2c3".parse().unwrap(),
+            cmd: "env".into(),
+            cwd: None,
+            max_secs: 0,
+            metadata: JobMetadata::Managed { workstream: None },
+        },
+    );
+    assert!(absent.contains("env -u MU_WORKSTREAM"));
+
+    let human = dispatch_script(
+        &host(),
+        &Job {
+            id: "a1b2c3".parse().unwrap(),
+            cmd: "env".into(),
+            cwd: None,
+            max_secs: 0,
+            metadata: JobMetadata::Human,
+        },
+    );
+    assert!(human.contains("env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh"));
 }
 
 #[test]
@@ -98,6 +150,7 @@ fn a_cwd_with_a_space_is_quoted() {
         cmd: "echo hi".into(),
         cwd: Some("/tmp/my dir".into()),
         max_secs: 0,
+        metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
     };
     let script = dispatch_script(&host(), &job);
     assert!(
@@ -124,6 +177,7 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
             cmd: "true".into(),
             cwd: None,
             max_secs: 0,
+            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
         },
     );
     assert!(
@@ -149,6 +203,7 @@ fn watchdog_writes_124_only_when_rc_is_absent() {
             cmd: "true".into(),
             cwd: None,
             max_secs: 30,
+            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
         },
     );
     let watch = script
@@ -164,6 +219,10 @@ fn watchdog_writes_124_only_when_rc_is_absent() {
     assert!(
         payload.contains("if [ ! -f") && payload.contains("echo 124"),
         "124 must be gated on a missing rc: {payload}"
+    );
+    assert!(
+        !payload.contains("MU_"),
+        "crew metadata belongs only to the command shell: {payload}"
     );
 }
 
@@ -226,6 +285,7 @@ fn script_for(cwd: &str) -> String {
             cmd: "true".into(),
             cwd: Some(cwd.into()),
             max_secs: 0,
+            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
         },
     )
 }

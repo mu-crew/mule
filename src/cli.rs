@@ -160,6 +160,9 @@ pub enum Commands {
         /// Kill the remote job after S seconds (0 means unbounded)
         #[arg(long, value_name = "S")]
         max_secs: Option<u64>,
+        /// Do not mark the job as a managed agent or forward MU_WORKSTREAM
+        #[arg(long)]
+        human: bool,
         /// Block locally until the job finishes; unlike --max-secs, this does not kill it
         #[arg(long)]
         wait: bool,
@@ -690,6 +693,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             host,
             cwd,
             max_secs,
+            human,
             wait,
             no_tail,
             cmd,
@@ -703,7 +707,16 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             let command = command_from_args(&cmd);
             let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
-            match crate::run::dispatch(&Ssh, host, &command, cwd.as_deref(), max_secs) {
+            let metadata = if human {
+                crate::wrapper::JobMetadata::Human
+            } else {
+                crate::wrapper::JobMetadata::Managed {
+                    workstream: std::env::var("MU_WORKSTREAM")
+                        .ok()
+                        .filter(|value| !value.is_empty()),
+                }
+            };
+            match crate::run::dispatch(&Ssh, host, &command, cwd.as_deref(), max_secs, metadata) {
                 Ok(id) => {
                     println!("{id}");
                     std::io::stdout().flush()?;
@@ -1081,10 +1094,11 @@ fn command_from_args(args: &[String]) -> String {
 /// So this warns rather than erroring: the command really might want the flag,
 /// and refusing would break `coop run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
-    const COOP_FLAGS: [&str; 8] = [
+    const COOP_FLAGS: [&str; 9] = [
         "--wait",
         "--no-tail",
         "--max-secs",
+        "--human",
         "--quiet",
         "--cwd",
         "--host",

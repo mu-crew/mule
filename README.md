@@ -35,6 +35,11 @@ done
 
 `run --wait` combines dispatch, live output, and the job's exit status.
 
+By default, the job command receives `MU_MANAGED_AGENT=1` and
+`MU_AGENT_NAME=coop-<job-id>`. If the caller has a non-empty `MU_WORKSTREAM`,
+coop forwards it unchanged. Use `coop run --human <cmd>` to omit all three
+variables for an ad-hoc agent.
+
 ## Why a plain SSH command fails
 
 One connection to the host carries one session channel. A long command holds it
