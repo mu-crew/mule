@@ -163,7 +163,13 @@ pub enum Commands {
         /// Do not mark the job as a managed agent or forward MU_WORKSTREAM
         #[arg(long)]
         human: bool,
-        /// Keep stdin, stdout, and stderr attached to the remote tmux pane PTY
+        /// Run an interactive/full-screen program on the remote tmux pane PTY
+        ///
+        /// Use this for `pi-meta`, editors, REPLs, and other programs you plan
+        /// to view or control through murmur/mu. Without --tui, coop pipes the
+        /// command's output into its log artifact, so attaching reaches the
+        /// right pane but there is no live TUI to render. After dispatch, coop
+        /// prints pasteable screen, murmur jump, mu attach, and cleanup commands.
         #[arg(long, conflicts_with_all = ["wait", "no_tail"])]
         tui: bool,
         /// Block locally until the job finishes; unlike --max-secs, this does not kill it

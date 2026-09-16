@@ -229,7 +229,8 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
          printf %s {consumer} | base64 -d > {dir}/pipe && echo tui > {dir}/mode && \
          tmux -L {socket} -f /dev/null new-session -d -s coop-{id} -c {dir} \
            \"sh ./wrapper\" && \
-         {{ tmux -L {socket} set-option -g extended-keys on 2>/dev/null || \
+         {{ tmux -L {socket} set-option -g extended-keys on 2>/dev/null && \
+            tmux -L {socket} set-option -g extended-keys-format csi-u 2>/dev/null || \
             {{ tmux -L {socket} kill-session -t coop-{id} 2>/dev/null; \
                echo 'coop: tmux 3.2 or newer is required for --tui' >&2; false; }}; }} && \
          tmux -L {socket} pipe-pane -O -t coop-{id} \"cd {dir} && sh ./pipe\" && \

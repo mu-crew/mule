@@ -218,6 +218,23 @@ fn only_tui_dispatch_enables_extended_keys_on_the_private_server() {
         .unwrap();
     assert!(tui_option.status.success());
     assert_eq!(tui_option.stdout, b"on\n");
+
+    // Pi uses CSI-u for modified keys. `extended-keys on` alone leaves tmux's
+    // format at xterm, which a real pi-meta TUI reported verbatim as a warning
+    // on its first screen. The private `-f /dev/null` server can never inherit
+    // the user's setting, so TUI dispatch owns both halves of the protocol.
+    let tui_format = Command::new("tmux")
+        .args([
+            "-L",
+            &tui.socket,
+            "show-options",
+            "-gv",
+            "extended-keys-format",
+        ])
+        .output()
+        .unwrap();
+    assert!(tui_format.status.success());
+    assert_eq!(tui_format.stdout, b"csi-u\n");
 }
 
 #[test]
