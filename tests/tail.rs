@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use coop::config::{Config, Host};
 use coop::errors::{CoopError, EXIT_DROPPED, EXIT_ORPHAN, EXIT_TIMEOUT, exit_code};
-use coop::tail::{Selection, follow, follow_deferred, once};
+use coop::tail::{Selection, follow, follow_deferred, once, once_mode_aware};
 use coop::transport::{Fake, Output};
 
 /// Point the lock directory at a temp dir for the whole test binary.
@@ -151,6 +151,67 @@ fn one_shot_tail_limits_the_remote_read_before_taking_stdout() {
         assert_eq!(out.into_inner(), [0, 0xff, b'x']);
         assert!(fake.scripts()[0].contains(command));
     }
+}
+
+#[test]
+fn tui_tail_selects_running_screen_saved_screen_and_explicit_transcript() {
+    isolate_state();
+    let id = "abc123".parse().unwrap();
+    let cases = [
+        (
+            Output::ok(b"\x1elive pane"),
+            false,
+            Selection::LastBytes,
+            b"live pane".as_slice(),
+            "capture-pane -p -J",
+        ),
+        (
+            Output::ok(b"\x1esaved screen"),
+            false,
+            Selection::All,
+            b"saved screen".as_slice(),
+            "cat ${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs/abc123/screen",
+        ),
+        (
+            Output::ok(b"raw\x1f"),
+            true,
+            Selection::LastBytes,
+            b"raw".as_slice(),
+            "tail -c 65536",
+        ),
+    ];
+
+    for (output, transcript, selection, expected, command) in cases {
+        let fake = Fake::new();
+        fake.push(output);
+        let mut out = Vec::new();
+
+        if transcript {
+            once(&fake, &host(), &id, selection, &mut out).unwrap();
+        } else {
+            once_mode_aware(&fake, &host(), &id, selection, &mut out).unwrap();
+        }
+
+        assert_eq!(out, expected);
+        assert!(fake.scripts().last().unwrap().contains(command));
+    }
+}
+
+#[test]
+fn tui_tail_never_falls_back_to_the_transcript_when_the_pane_is_missing() {
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(Output::ok(b"\x1e"));
+    let mut out = Vec::new();
+
+    let id = "abc123".parse().unwrap();
+    once_mode_aware(&fake, &host(), &id, Selection::LastBytes, &mut out).unwrap();
+
+    assert!(out.is_empty());
+    assert_eq!(fake.scripts().len(), 1);
+    let script = &fake.scripts()[0];
+    let tui_branch = script.split("else printf").next().unwrap();
+    assert!(!tui_branch.contains("/log"));
 }
 
 #[test]

@@ -220,21 +220,22 @@ pub enum Commands {
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
     },
-    /// Print a job's merged stdout and stderr as raw bytes
+    /// Print ordinary output, or a TUI job's current/final readable screen
     ///
+    /// Use --transcript to read a TUI's raw terminal bytes. For ordinary jobs,
     /// stdout and stderr are merged into one log, in the order the job wrote
-    /// them; redirect inside your command to separate them. There is one
-    /// artifact per job on purpose: splitting it would mean two files, two
-    /// probe offsets, and a lost interleaving, to serve a case a redirect in
-    /// your own command already covers.
+    /// them; redirect inside your command to separate them.
     Tail {
         /// The job whose log to print.
         id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
-        /// Follow until the job finishes
-        #[arg(short, long)]
+        /// Follow until the job finishes (TUI jobs must be viewed or attached instead)
+        #[arg(short, long, conflicts_with = "transcript")]
         follow: bool,
+        /// For a TUI job, print its raw terminal transcript instead of its screen
+        #[arg(long, conflicts_with = "follow")]
+        transcript: bool,
         /// Print the whole log instead of the last 64KB
         #[arg(long, conflicts_with_all = ["lines", "follow"])]
         all: bool,
@@ -711,13 +712,15 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             let command = command_from_args(&cmd);
             let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
+            let workstream = (!human)
+                .then(|| std::env::var("MU_WORKSTREAM").ok())
+                .flatten()
+                .filter(|value| !value.is_empty());
             let metadata = if human {
                 crate::wrapper::JobMetadata::Human
             } else {
                 crate::wrapper::JobMetadata::Managed {
-                    workstream: std::env::var("MU_WORKSTREAM")
-                        .ok()
-                        .filter(|value| !value.is_empty()),
+                    workstream: workstream.clone(),
                 }
             };
             let mode = if tui {
@@ -752,8 +755,12 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     warn_about_dispatch_patterns(&command, has_runtime_cap, &id);
                     if !wait {
                         if !quiet {
-                            eprintln!("next: coop wait {id} for the exit code");
-                            eprintln!("      coop tail {id} for output");
+                            if tui {
+                                eprint!("{}", tui_hints(&id, &host.target, workstream.as_deref()));
+                            } else {
+                                eprintln!("next: coop wait {id} for the exit code");
+                                eprintln!("      coop tail {id} for output");
+                            }
                         }
                         return Ok(0);
                     }
@@ -822,12 +829,23 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             id,
             host,
             follow,
+            transcript,
             all,
             lines,
         } => {
             let host = cfg.host(host.host.as_deref())?;
             let mut stdout = std::io::stdout().lock();
             if follow {
+                if crate::tail::is_tui(&Ssh, host, &id)? {
+                    let mut message =
+                        "cannot follow a TUI job; streaming redraw bytes is not useful".to_string();
+                    if !quiet {
+                        message.push_str(&format!(
+                            "\n  view current screen: coop tail {id}\n  jump/interact:       murmur pick --all    # select coop-{id}"
+                        ));
+                    }
+                    anyhow::bail!(message);
+                }
                 crate::tail::follow(&Ssh, host, &id, 0, &mut stdout)
             } else {
                 let selection = match lines {
@@ -835,7 +853,11 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     None if all => crate::tail::Selection::All,
                     None => crate::tail::Selection::LastBytes,
                 };
-                crate::tail::once(&Ssh, host, &id, selection, &mut stdout)?;
+                if transcript {
+                    crate::tail::once(&Ssh, host, &id, selection, &mut stdout)?;
+                } else {
+                    crate::tail::once_mode_aware(&Ssh, host, &id, selection, &mut stdout)?;
+                }
                 Ok(0)
             }
         }
@@ -915,6 +937,26 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn tui_hints(id: &crate::wrapper::JobId, target: &str, workstream: Option<&str>) -> String {
+    let agent = format!("coop-{id}");
+    let target = shell_quote(target);
+    let workstream = workstream
+        .map(|value| format!(" -w {}", shell_quote(value)))
+        .unwrap_or_default();
+    format!(
+        "TUI job {id} is interactive\n\
+           view current screen: coop tail {id}\n\
+           jump/interact:       murmur pick --all    # select {agent}\n\
+           control through mu:  mu agent spawn {agent}{workstream} --command \\\n\
+             \"$(murmur jump-command --host {target} --agent {agent})\"\n\
+           stop and remove:     coop kill --rm {id}\n"
+    )
 }
 
 const HINT_SCAN_BYTES: usize = 64 * 1024;
@@ -1211,6 +1253,7 @@ fn collapse_whitespace(command: &str) -> String {
 mod tests {
     use super::{
         Cli, collapse_whitespace, command_from_args, display_command, host_info, poll_json,
+        tui_hints,
     };
     use crate::config::Config;
     use crate::probe::State;
@@ -1226,6 +1269,46 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["coop", "run", "--tui", "--wait", "true"]).is_err());
         assert!(Cli::try_parse_from(["coop", "run", "--tui", "--no-tail", "true"]).is_err());
+    }
+
+    #[test]
+    fn tui_transcript_is_explicit_and_cannot_be_followed() {
+        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript"]).is_ok());
+        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript", "-n", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript", "-f"]).is_err());
+    }
+
+    #[test]
+    fn tui_hints_shell_quote_the_target_and_forwarded_workstream() {
+        let id = "abc123".parse().unwrap();
+        let hints = tui_hints(
+            &id,
+            "dev '$(touch /tmp/target)'",
+            Some("crew '$(touch /tmp/workstream)'"),
+        );
+
+        assert!(hints.contains("coop tail abc123"), "{hints}");
+        assert!(hints.contains("murmur pick --all"), "{hints}");
+        assert!(
+            hints.contains("--host 'dev '\\''$(touch /tmp/target)'\\'''"),
+            "{hints}"
+        );
+        assert!(
+            hints.contains("-w 'crew '\\''$(touch /tmp/workstream)'\\'''"),
+            "{hints}"
+        );
+        assert!(
+            hints.contains("--command \\\n\"$(murmur jump-command"),
+            "{hints}"
+        );
+        assert!(hints.contains("coop kill --rm abc123"), "{hints}");
+    }
+
+    #[test]
+    fn tui_hints_omit_workstream_when_none_was_forwarded() {
+        let id = "abc123".parse().unwrap();
+        let hints = tui_hints(&id, "dev", None);
+        assert!(!hints.contains(" -w "), "{hints}");
     }
 
     #[test]

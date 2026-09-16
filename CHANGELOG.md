@@ -5,7 +5,11 @@
 `coop run --tui` keeps the command attached to its private tmux pane PTY while
 `pipe-pane` writes a capped durable transcript. A start barrier prevents early
 output loss; TUI jobs record their mode and final visible screen, and retain the
-existing timeout, kill, runtime, and cleanup lifecycle.
+existing timeout, kill, runtime, and cleanup lifecycle. Plain `tail` now reads
+the live or saved TUI screen; `tail --transcript` explicitly reads raw terminal
+bytes, and `tail -f` points at the screen and murmur picker instead of streaming
+redraws. TUI dispatch prints pasteable screen, picker, mu-control, and cleanup
+commands with shell-quoted target and forwarded workstream values.
 
 ## 0.1.2 — 2026-09-15
 

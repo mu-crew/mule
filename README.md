@@ -40,6 +40,18 @@ By default, the job command receives `MU_MANAGED_AGENT=1` and
 coop forwards it unchanged. Use `coop run --human <cmd>` to omit all three
 variables for an ad-hoc agent.
 
+Commands that need a terminal use explicit TUI mode:
+
+```sh
+id=$(coop run --tui 'pi-meta --pi-meta-no-solo --approve')
+coop tail "$id"                 # current screen, or final saved screen
+coop tail --transcript "$id"    # raw terminal transcript, explicitly
+```
+
+TUI dispatch prints pasteable `murmur pick`, `mu agent spawn`, and
+`coop kill --rm` commands on stderr. `tail -f` refuses TUI jobs because a redraw
+stream is not a useful log; use the screen or attach through murmur instead.
+
 ## Why a plain SSH command fails
 
 One connection to the host carries one session channel. A long command holds it
@@ -110,7 +122,7 @@ existing master.
 | A transfer between the host and a *third* machine | Yes. Both endpoints are remote. |
 | `git rev-parse`, a status poll, a state collector | Usually direct. Use coop if refusal can look like success: 8 concurrent bare `rev-parse` polls returned 1 sha and 7 empty results; coop dispatched all 8. |
 | A transfer to or from *this* machine | No. A job cannot reach its dispatcher. |
-| A command needing a live terminal | No. Jobs are detached and read no input. |
+| A TUI command that can live in remote tmux | Yes, explicitly with `run --tui`; interact through murmur or mu. |
 
 **Threshold: roughly one second.** The cost of a long call is not paid by you --
 it is paid by every other tool that needs the channel while you hold it. So the

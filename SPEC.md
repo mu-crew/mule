@@ -67,9 +67,11 @@ The lock poll interval is **5ms**. With four callers, five rounds each, and **50
 Each job lives under `~/.local/state/coop/jobs/<id>/`:
 
 ```text
-cmd    command as entered, for ls
-log    merged stdout and stderr
-rc     exit code, written only after completion
+cmd     command as entered, for ls
+log     merged stdout and stderr, or a raw TUI transcript
+rc      exit code, written only after completion
+mode    `tui` for explicit terminal jobs; absent for ordinary jobs
+screen  final visible screen for a completed TUI job
 ```
 
 The remote artifact is the only source of truth. There is no local job index. The `rc` file is durable across dropped connections and distinguishes these states:
@@ -186,10 +188,10 @@ One tap unblocks every job for the life of the `ControlPersist` window, so the e
 ## Commands and output
 
 ```text
-coop run [--host H] [--cwd D] [--max-secs S] [--human] [--wait] [--no-tail] <cmd>
+coop run [--host H] [--cwd D] [--max-secs S] [--human] [--tui | --wait [--no-tail]] <cmd>
 coop poll <id> [--host H] [--json]
 coop wait <id> [--host H] [--timeout S]
-coop tail <id> [--host H] [-f] [--all | -n LINES]
+coop tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
 coop ls [--host H] [--all] [--json] [--full]
 coop kill <id> [--host H] [--rm]
 coop rm [<id> | --all] [--host H]
@@ -201,9 +203,15 @@ coop host info [--host H] [--json]
 
 `run --max-secs S` overrides the host's `max_job_secs` for that job; zero means unbounded. A portable watchdog runs in a separate private tmux session, so it needs no `timeout(1)` (absent on stock macOS), does not hold SSH, and cannot leave its `sleep` keeping a fast job alive. At the cap it writes **124**, GNU `timeout`'s established code, then destroys the job session and its process tree. Normal completion destroys the watchdog and preserves the command's own rc. This remote runtime bound is deliberately distinct from `wait --timeout`, which only stops the local caller waiting and leaves the job running.
 
-`tail` writes raw bytes because lossy UTF-8 conversion would corrupt the artifact. Standard output and standard error stay merged to preserve their order. A caller that needs separate streams can redirect them inside the submitted command.
+For an ordinary job, `tail` writes raw bytes because lossy UTF-8 conversion would corrupt the artifact. Standard output and standard error stay merged to preserve their order. A caller that needs separate streams can redirect them inside the submitted command.
 
-A one-shot `tail` reads only the last **64KB** by default. `--all` reads the full log, and `-n` reads the requested number of lines. A **200MB** read would hold the only channel slot and defeat the design. Follow mode reads only bytes added since its previous offset.
+For a TUI job, plain `tail` captures the running pane or reads the saved final
+screen. `tail --transcript` explicitly reads the raw terminal transcript using
+the same selection behavior as an ordinary log. `tail -f` refuses with screen
+and murmur picker hints: streaming redraw bytes is not useful, and a missing
+pane never silently falls back to those bytes.
+
+A one-shot transcript or ordinary `tail` reads only the last **64KB** by default. `--all` reads the full log, and `-n` reads the requested number of lines. A **200MB** read would hold the only channel slot and defeat the design. Follow mode reads only bytes added since its previous offset.
 
 `poll`, `wait`, and follow mode use one probe shape that returns `rc`, session presence, log size, and requested bytes. Follow starts at a **1s** interval, doubles to at most **5s** while quiet, and resets to **1s** when output arrives. `--wait --no-tail` polls state, then reads the full log once.
 

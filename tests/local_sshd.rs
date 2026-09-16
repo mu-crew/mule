@@ -284,6 +284,69 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
 }
 
 #[test]
+fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "tui-hint-quote");
+    let config = sshd.write_config(&tmux.name);
+    let sentinel = sshd.dir.join("hint-expanded-workstream");
+    let workstream = format!("crew '$(touch {})'", sentinel.display());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["run", "--tui", "sleep 30"])
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env("MU_WORKSTREAM", &workstream)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+    let hints = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        hints.contains(&format!("TUI job {id} is interactive")),
+        "{hints}"
+    );
+    assert!(hints.contains(&format!("coop tail {id}")), "{hints}");
+    assert!(hints.contains(&format!("# select coop-{id}")), "{hints}");
+    assert!(hints.contains("--host '127.0.0.1'"), "{hints}");
+    assert!(
+        hints.contains(&format!(
+            "-w 'crew '\\''$(touch {})'\\'''",
+            sentinel.display()
+        )),
+        "{hints}"
+    );
+    assert!(hints.contains(&format!("--agent coop-{id})\"")), "{hints}");
+    assert!(hints.contains(&format!("coop kill --rm {id}")), "{hints}");
+    assert!(
+        !sentinel.exists(),
+        "rendering the hint executed workstream text"
+    );
+
+    let quiet = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        .arg("--config")
+        .arg(&config)
+        .args(["--quiet", "run", "--tui", "true"])
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env("MU_WORKSTREAM", &workstream)
+        .output()
+        .unwrap();
+    assert!(quiet.status.success());
+    assert!(quiet.stderr.is_empty(), "--quiet must suppress TUI hints");
+
+    let _ = sshd.coop(&config, &["--quiet", "kill", "--rm", &id]);
+    clean_jobs(&sshd, &[stdout(&quiet)]);
+}
+
+#[test]
 fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
     require_sshd!();
     let sshd = Sshd::start();
@@ -613,6 +676,93 @@ fn tui_job_uses_the_remote_pane_pty_and_accepts_input() {
     assert!(text.contains("answer:remote-input"), "{text:?}");
 
     clean_jobs(&sshd, &[id]);
+}
+
+#[test]
+fn tui_tail_reads_screen_by_default_and_raw_transcript_only_when_requested() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "tui-tail");
+    let config = sshd.write_config(&tmux.name);
+    let command = "printf 'first\\n'; printf '\\033[2Jvisible\\n'; IFS= read -r answer; printf 'final:%s\\n' \"$answer\"";
+
+    let id = stdout(&sshd.coop(&config, &["--quiet", "run", "--tui", command]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let screen = sshd.coop(&config, &["tail", &id]);
+        if String::from_utf8_lossy(&screen.stdout).contains("visible") {
+            assert!(screen.status.success());
+            assert!(
+                !screen.stdout.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+                "default TUI tail must be a readable screen snapshot: {:?}",
+                screen.stdout
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "running screen never became visible"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let sent = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "send-keys",
+        "-t",
+        &format!("coop-{id}"),
+        "done",
+        "Enter",
+    ]);
+    assert!(sent.status.success());
+    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+        assert!(Instant::now() < deadline, "TUI job never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let completed = sshd.coop(&config, &["tail", &id]);
+    assert!(completed.status.success());
+    assert!(
+        String::from_utf8_lossy(&completed.stdout).contains("final:done"),
+        "completed tail must read the saved screen: {:?}",
+        completed.stdout
+    );
+
+    let transcript = sshd.coop(&config, &["tail", "--transcript", "--all", &id]);
+    assert!(transcript.status.success());
+    assert!(
+        transcript
+            .stdout
+            .windows(4)
+            .any(|bytes| bytes == b"\x1b[2J"),
+        "explicit transcript must preserve terminal bytes: {:?}",
+        transcript.stdout
+    );
+
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
+fn tui_follow_refuses_with_screen_and_picker_hints() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "tui-follow");
+    let config = sshd.write_config(&tmux.name);
+    let id = stdout(&sshd.coop(&config, &["--quiet", "run", "--tui", "sleep 30"]));
+
+    let out = sshd.coop(&config, &["tail", "-f", &id]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains(&format!("coop tail {id}")), "{error}");
+    assert!(error.contains("murmur pick --all"), "{error}");
+    assert!(!error.contains("--transcript"), "{error}");
+
+    let _ = sshd.coop(&config, &["--quiet", "kill", "--rm", &id]);
 }
 
 #[test]

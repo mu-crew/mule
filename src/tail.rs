@@ -16,6 +16,73 @@ pub enum Selection {
     Lines(u64),
 }
 
+pub fn is_tui(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<bool> {
+    crate::errors::require_master(transport, host)?;
+    let output = transport.run(host, &format!("cat {}/mode 2>/dev/null", state_dir(id)))?;
+    Ok(output.code == 0 && output.stdout == b"tui\n")
+}
+
+/// Read a TUI's live pane or saved screen, and an ordinary job's log.
+///
+/// The TUI branch never names the transcript. If a pane vanishes before its
+/// final capture, raw terminal redraw bytes are not a readable substitute.
+pub fn once_mode_aware(
+    transport: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    selection: Selection,
+    out: &mut dyn Write,
+) -> Result<()> {
+    crate::errors::require_master(transport, host)?;
+    let dir = state_dir(id);
+    let read = selection_command(selection, &dir);
+    let script = format!(
+        "if [ \"$(cat {dir}/mode 2>/dev/null)\" = tui ]; then \
+           printf '\\036'; \
+           if tmux -L {socket} capture-pane -p -J -t coop-{id} 2>/dev/null; then :; \
+           elif [ -f {dir}/screen ]; then cat {dir}/screen; \
+           else echo 'coop: TUI pane is gone and no saved screen is available' >&2; fi; \
+         else printf '\\037'; {read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\"; fi",
+        socket = host.tmux_socket,
+    );
+    let output = transport.run(host, &script)?;
+    if output.code != 0 {
+        bail!("tail failed: {}", output.stderr.trim());
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    match output.stdout.first() {
+        Some(0x1e) => out.write_all(&output.stdout[1..])?,
+        Some(0x1f) => write_transcript(host, &output.stdout[1..], out)?,
+        _ => bail!("tail returned an invalid mode marker"),
+    }
+    Ok(())
+}
+
+fn selection_command(selection: Selection, dir: &str) -> String {
+    match selection {
+        Selection::LastBytes => format!("tail -c 65536 {dir}/log"),
+        Selection::All => format!("cat {dir}/log"),
+        Selection::Lines(lines) => format!("tail -n {lines} {dir}/log"),
+    }
+}
+
+fn write_transcript(host: &Host, bytes: &[u8], out: &mut dyn Write) -> Result<()> {
+    let (body, truncated) = match bytes.iter().rposition(|&b| b == 0x1f) {
+        Some(i) => (&bytes[..i], bytes[i + 1..] == *b"1"),
+        None => (bytes, false),
+    };
+    out.write_all(body)?;
+    if truncated {
+        eprintln!(
+            "coop: log was capped at {} bytes; the job ran to completion but later output was discarded\n  the log holds stdout and stderr merged, in the order the job wrote them; redirect inside your command to separate them",
+            host.max_log_bytes
+        );
+    }
+    Ok(())
+}
+
 pub fn once(
     transport: &dyn Transport,
     host: &Host,
@@ -40,29 +107,7 @@ pub fn once(
         bail!("tail failed: {}", output.stderr.trim());
     }
 
-    // Split on the unit separator: log bytes are arbitrary, so the marker must
-    // be a byte the log cannot contain ambiguously at the very end.
-    let (body, truncated) = match output.stdout.iter().rposition(|&b| b == 0x1f) {
-        Some(i) => (&output.stdout[..i], output.stdout[i + 1..] == *b"1"),
-        None => (&output.stdout[..], false),
-    };
-    out.write_all(body)?;
-
-    if truncated {
-        // stderr, so it cannot corrupt `out=$(coop tail id)`.
-        // Name the merging here too. This is the ONE runtime message about the
-        // log, so it reaches a reader who never opened `--help`, and someone
-        // parsing a truncated log is exactly the reader most likely to be
-        // surprised by stderr interleaved into it.
-        eprintln!(
-            "coop: log was capped at {} bytes; the job ran to completion but \
-             later output was discarded\n  \
-             the log holds stdout and stderr merged, in the order the job \
-             wrote them; redirect inside your command to separate them",
-            host.max_log_bytes
-        );
-    }
-    Ok(())
+    write_transcript(host, &output.stdout, out)
 }
 
 pub fn follow(
