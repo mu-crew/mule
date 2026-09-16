@@ -190,6 +190,37 @@ fn read(path: impl AsRef<Path>) -> String {
 }
 
 #[test]
+fn only_tui_dispatch_enables_extended_keys_on_the_private_server() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+
+    let ordinary = TmuxServer::start();
+    ordinary.run("000097", "true", None);
+    let ordinary_option = Command::new("tmux")
+        .args([
+            "-L",
+            &ordinary.socket,
+            "show-options",
+            "-gv",
+            "extended-keys",
+        ])
+        .output()
+        .unwrap();
+    assert!(ordinary_option.status.success());
+    assert_eq!(ordinary_option.stdout, b"off\n");
+
+    let tui = TmuxServer::start();
+    tui.start_tui("000096", "sleep 30", 1024);
+    let tui_option = Command::new("tmux")
+        .args(["-L", &tui.socket, "show-options", "-gv", "extended-keys"])
+        .output()
+        .unwrap();
+    assert!(tui_option.status.success());
+    assert_eq!(tui_option.stdout, b"on\n");
+}
+
+#[test]
 fn tui_wrapper_keeps_all_streams_on_the_pty_and_captures_early_output_and_input() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;
