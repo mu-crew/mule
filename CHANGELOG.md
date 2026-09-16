@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.1.2 — 2026-09-16
 
 `coop run --tui` keeps the command attached to its private tmux pane PTY while
 `pipe-pane` writes a capped durable transcript. A start barrier prevents early
@@ -11,12 +11,16 @@ bytes, and `tail -f` points at the screen and murmur picker instead of streaming
 redraws. TUI dispatch prints pasteable screen, picker, mu-control, and cleanup
 commands with shell-quoted target and forwarded workstream values.
 
-## 0.1.2 — 2026-09-15
-
-Jobs now identify as managed agents by default. The final command shell receives
+Jobs identify as managed agents by default. The final command shell receives
 `MU_MANAGED_AGENT=1`, `MU_AGENT_NAME=coop-<job-id>`, and the caller's non-empty
 `MU_WORKSTREAM`. Forwarded workstream values are encoded before they enter the
 remote wrapper. `coop run --human` omits all three variables.
+
+`coop ls --running` shows only live remote work. Removed jobs now report
+`not found` with exit 1 instead of being misclassified as orphans.
+
+TUI jobs enable tmux extended keys with CSI-u before startup, matching pi's
+keyboard protocol. Ordinary jobs keep tmux defaults.
 
 ## 0.1.1 — 2026-09-11
 
