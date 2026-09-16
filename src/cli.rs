@@ -163,11 +163,14 @@ pub enum Commands {
         /// Do not mark the job as a managed agent or forward MU_WORKSTREAM
         #[arg(long)]
         human: bool,
+        /// Keep stdin, stdout, and stderr attached to the remote tmux pane PTY
+        #[arg(long, conflicts_with_all = ["wait", "no_tail"])]
+        tui: bool,
         /// Block locally until the job finishes; unlike --max-secs, this does not kill it
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tui")]
         wait: bool,
         /// With --wait: print the log once at the end instead of streaming
-        #[arg(long, requires = "wait")]
+        #[arg(long, requires = "wait", conflicts_with = "tui")]
         no_tail: bool,
         /// The command to run.
         ///
@@ -694,6 +697,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             cwd,
             max_secs,
             human,
+            tui,
             wait,
             no_tail,
             cmd,
@@ -716,7 +720,20 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         .filter(|value| !value.is_empty()),
                 }
             };
-            match crate::run::dispatch(&Ssh, host, &command, cwd.as_deref(), max_secs, metadata) {
+            let mode = if tui {
+                crate::wrapper::JobMode::Tui
+            } else {
+                crate::wrapper::JobMode::Pipe
+            };
+            match crate::run::dispatch(
+                &Ssh,
+                host,
+                &command,
+                cwd.as_deref(),
+                max_secs,
+                metadata,
+                mode,
+            ) {
                 Ok(id) => {
                     println!("{id}");
                     std::io::stdout().flush()?;
@@ -1192,10 +1209,24 @@ fn collapse_whitespace(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{collapse_whitespace, command_from_args, display_command, host_info, poll_json};
+    use super::{
+        Cli, collapse_whitespace, command_from_args, display_command, host_info, poll_json,
+    };
     use crate::config::Config;
     use crate::probe::State;
     use crate::transport::{Fake, Output};
+    use clap::Parser;
+
+    #[test]
+    fn tui_run_is_explicit_and_rejects_local_wait_modes() {
+        assert!(Cli::try_parse_from(["coop", "run", "--tui", "true"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["coop", "run", "--tui", "--human", "--max-secs", "5", "true"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["coop", "run", "--tui", "--wait", "true"]).is_err());
+        assert!(Cli::try_parse_from(["coop", "run", "--tui", "--no-tail", "true"]).is_err());
+    }
 
     #[test]
     fn host_info_uses_one_round_trip_per_reachable_host() {

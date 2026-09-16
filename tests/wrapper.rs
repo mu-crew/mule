@@ -51,6 +51,7 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
         cwd: None,
         max_secs: 0,
         metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+        mode: coop::wrapper::JobMode::Pipe,
     };
 
     let script = dispatch_script(&host(), &job);
@@ -88,6 +89,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             metadata: JobMetadata::Managed {
                 workstream: Some(hostile.into()),
             },
+            mode: coop::wrapper::JobMode::Pipe,
         },
     );
 
@@ -109,6 +111,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             cwd: None,
             max_secs: 0,
             metadata: JobMetadata::Managed { workstream: None },
+            mode: coop::wrapper::JobMode::Pipe,
         },
     );
     assert!(absent.contains("env -u MU_WORKSTREAM"));
@@ -121,6 +124,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             cwd: None,
             max_secs: 0,
             metadata: JobMetadata::Human,
+            mode: coop::wrapper::JobMode::Pipe,
         },
     );
     assert!(human.contains("env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh"));
@@ -151,6 +155,7 @@ fn a_cwd_with_a_space_is_quoted() {
         cwd: Some("/tmp/my dir".into()),
         max_secs: 0,
         metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+        mode: coop::wrapper::JobMode::Pipe,
     };
     let script = dispatch_script(&host(), &job);
     assert!(
@@ -178,6 +183,7 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
             cwd: None,
             max_secs: 0,
             metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            mode: coop::wrapper::JobMode::Pipe,
         },
     );
     assert!(
@@ -204,6 +210,7 @@ fn watchdog_writes_124_only_when_rc_is_absent() {
             cwd: None,
             max_secs: 30,
             metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            mode: coop::wrapper::JobMode::Pipe,
         },
     );
     let watch = script
@@ -286,6 +293,7 @@ fn script_for(cwd: &str) -> String {
             cwd: Some(cwd.into()),
             max_secs: 0,
             metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            mode: coop::wrapper::JobMode::Pipe,
         },
     )
 }

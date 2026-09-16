@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use coop::config::Host;
-use coop::wrapper::{Job, dispatch_script};
+use coop::wrapper::{Job, JobMode, dispatch_script};
 
 struct TmuxServer {
     socket: String,
@@ -98,6 +98,7 @@ impl TmuxServer {
             cwd: cwd.map(str::to_owned),
             max_secs: 0,
             metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            mode: JobMode::Pipe,
         };
         let script = dispatch_script(&host, &job).replace(
             &format!("{}/{id}", coop::wrapper::JOBS_ROOT),
@@ -118,6 +119,60 @@ impl TmuxServer {
         }
         state
     }
+
+    fn start_tui(&self, id: &str, command: &str, max_log_bytes: u64) -> PathBuf {
+        let host = Host {
+            name: "local".into(),
+            target: "local".into(),
+            socket: PathBuf::new(),
+            tmux_socket: self.socket.clone(),
+            max_running: 4,
+            default_cwd: None,
+            keep_days: 14,
+            max_log_bytes,
+            max_job_secs: 0,
+        };
+        let job = Job {
+            id: id.parse().unwrap(),
+            cmd: command.into(),
+            cwd: None,
+            max_secs: 0,
+            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            mode: JobMode::Tui,
+        };
+        let script = dispatch_script(&host, &job).replace(
+            &format!("{}/{id}", coop::wrapper::JOBS_ROOT),
+            &self.root.join(id).display().to_string(),
+        );
+        let output = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "dispatch failed: {script}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.root.join(id)
+    }
+
+    fn wait_done(&self, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.root.join(id).join("rc").exists()
+            || Command::new("tmux")
+                .args([
+                    "-L",
+                    &self.socket,
+                    "has-session",
+                    "-t",
+                    &format!("coop-{id}"),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            assert!(Instant::now() < deadline, "timed out waiting for {id}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for TmuxServer {
@@ -132,6 +187,92 @@ impl Drop for TmuxServer {
 
 fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap()
+}
+
+#[test]
+fn tui_wrapper_keeps_all_streams_on_the_pty_and_captures_early_output_and_input() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let server = TmuxServer::start();
+    let id = "000099";
+    let dir = server.start_tui(
+        id,
+        "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 9; printf 'early\\n'; IFS= read -r answer; printf 'got:%s\\n' \"$answer\"",
+        1024,
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = Command::new("tmux")
+            .args([
+                "-L",
+                &server.socket,
+                "capture-pane",
+                "-p",
+                "-t",
+                &format!("coop-{id}"),
+            ])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&screen.stdout).contains("early") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "early output never reached the pane"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "send-keys",
+            "-t",
+            &format!("coop-{id}"),
+            "hello",
+            "Enter",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    server.wait_done(id);
+
+    assert_eq!(read(dir.join("mode")).trim(), "tui");
+    assert_eq!(read(dir.join("rc")).trim(), "0");
+    let transcript = read(dir.join("log"));
+    assert!(transcript.contains("early"), "{transcript:?}");
+    assert!(transcript.contains("got:hello"), "{transcript:?}");
+    assert!(read(dir.join("screen")).contains("got:hello"));
+}
+
+#[test]
+fn tui_transcript_cap_drains_without_killing_the_process() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    let server = TmuxServer::start();
+    let id = "000098";
+    let dir = server.start_tui(
+        id,
+        "i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i+1)); done; printf survived > \"$HOME/coop-tui-survived-000098\"; exit 4",
+        1024,
+    );
+    server.wait_done(id);
+
+    assert_eq!(read(dir.join("rc")).trim(), "4");
+    assert_eq!(fs::metadata(dir.join("log")).unwrap().len(), 1024);
+    assert!(dir.join("truncated").exists());
+    assert!(
+        std::path::Path::new(&std::env::var("HOME").unwrap())
+            .join("coop-tui-survived-000098")
+            .exists()
+    );
+    fs::remove_file(
+        std::path::Path::new(&std::env::var("HOME").unwrap()).join("coop-tui-survived-000098"),
+    )
+    .ok();
 }
 
 #[test]

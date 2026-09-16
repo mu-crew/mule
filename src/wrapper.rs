@@ -13,6 +13,13 @@ pub struct Job {
     pub cwd: Option<String>,
     pub max_secs: u64,
     pub metadata: JobMetadata,
+    pub mode: JobMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobMode {
+    Pipe,
+    Tui,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +43,13 @@ pub fn state_dir(id: &JobId) -> String {
 pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
+    match job.mode {
+        JobMode::Pipe => pipe_dispatch_script(host, job),
+        JobMode::Tui => tui_dispatch_script(host, job),
+    }
+}
+
+fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
     let dir = state_dir(&job.id);
     let command = encode_command(job.cmd.as_bytes());
     let cwd = job
@@ -131,6 +145,96 @@ pub fn dispatch_script(host: &Host, job: &Job) -> String {
                if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
                rm -f {dir}/.overflow; }}'",
         host.tmux_socket, job.id, host.max_log_bytes
+    )
+}
+
+fn tui_dispatch_script(host: &Host, job: &Job) -> String {
+    let dir = state_dir(&job.id);
+    let command = encode_command(job.cmd.as_bytes());
+    let cwd = job
+        .cwd
+        .as_deref()
+        .or(host.default_cwd.as_deref())
+        .unwrap_or("$HOME");
+    let cd = match home_relative(cwd) {
+        Some("") => "cd \"$HOME\"".to_string(),
+        Some(rest) => format!(
+            "cd \"$HOME/$(printf %s {} | base64 -d)\"",
+            encode_command(rest.as_bytes())
+        ),
+        None => format!(
+            "cd \"$(printf %s {} | base64 -d)\"",
+            encode_command(cwd.as_bytes())
+        ),
+    };
+    let shell = match &job.metadata {
+        JobMetadata::Managed { workstream } => {
+            let agent = format!("coop-{}", job.id);
+            match workstream {
+                Some(workstream) => format!(
+                    "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh \"$job_dir/cmd\"",
+                    encode_command(workstream.as_bytes())
+                ),
+                None => format!(
+                    "env -u MU_WORKSTREAM MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} sh \"$job_dir/cmd\""
+                ),
+            }
+        }
+        JobMetadata::Human => {
+            "env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh \"$job_dir/cmd\""
+                .to_string()
+        }
+    };
+    let watchdog = if job.max_secs == 0 {
+        String::new()
+    } else {
+        let body = format!(
+            "sleep {secs}; if tmux -L {socket} has-session -t coop-{id} 2>/dev/null; then \
+             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
+             tmux -L {socket} kill-session -t coop-{id}; fi",
+            socket = host.tmux_socket,
+            id = job.id,
+            secs = job.max_secs,
+        );
+        format!(
+            "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
+             \"printf %s {body} | base64 -d | sh\"; ",
+            socket = host.tmux_socket,
+            id = job.id,
+            body = encode_command(body.as_bytes()),
+        )
+    };
+    let wrapper = format!(
+        "job_dir=$PWD; tmux -L {socket} wait-for tui-{id}; rm -f \"$job_dir/wrapper\"; \
+         {watchdog}{cd} && {shell}; rc=$?; \
+         tmux -L {socket} capture-pane -p -J -t coop-{id} > \"$job_dir/screen\" 2>/dev/null || :; \
+         tmux -L {socket} pipe-pane -t coop-{id}; \
+         while [ ! -f \"$job_dir/.pipe-done\" ]; do sleep 0.01; done; \
+         rm -f \"$job_dir/.pipe-done\"; \
+         tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
+         if [ ! -f \"$job_dir/rc\" ]; then echo $rc > \"$job_dir/rc\"; fi",
+        socket = host.tmux_socket,
+        id = job.id,
+    );
+    let consumer = format!(
+        "rm -f ./pipe; head -c {max} > ./log; cat > ./.overflow; \
+         if [ -s ./.overflow ]; then echo 1 > ./truncated; fi; \
+         rm -f ./.overflow; echo 1 > ./.pipe-done",
+        max = host.max_log_bytes
+    );
+
+    format!(
+        "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
+         printf %s {wrapper} | base64 -d > {dir}/wrapper && \
+         printf %s {consumer} | base64 -d > {dir}/pipe && echo tui > {dir}/mode && \
+         tmux -L {socket} -f /dev/null new-session -d -s coop-{id} -c {dir} \
+           \"sh ./wrapper\" && \
+         tmux -L {socket} pipe-pane -O -t coop-{id} \"cd {dir} && sh ./pipe\" && \
+         tmux -L {socket} wait-for -S tui-{id}",
+        socket = host.tmux_socket,
+        id = job.id,
+        wrapper = encode_command(wrapper.as_bytes()),
+        consumer = encode_command(consumer.as_bytes()),
     )
 }
 

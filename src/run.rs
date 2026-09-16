@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
 use crate::transport::Transport;
-use crate::wrapper::{Job, JobId, JobMetadata, dispatch_script, new_id};
+use crate::wrapper::{Job, JobId, JobMetadata, JobMode, dispatch_script, new_id};
 
 pub fn dispatch(
     transport: &dyn Transport,
@@ -13,6 +13,7 @@ pub fn dispatch(
     cwd: Option<&str>,
     max_secs: Option<u64>,
     metadata: JobMetadata,
+    mode: JobMode,
 ) -> Result<JobId> {
     dispatch_with_warnings(
         transport,
@@ -21,11 +22,13 @@ pub fn dispatch(
         cwd,
         max_secs,
         metadata,
+        mode,
         &mut std::io::stderr(),
     )
 }
 
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // The test seam mirrors run's independent CLI fields plus its warning sink.
 pub fn dispatch_with_warnings(
     transport: &dyn Transport,
     host: &Host,
@@ -33,6 +36,7 @@ pub fn dispatch_with_warnings(
     cwd: Option<&str>,
     max_secs: Option<u64>,
     metadata: JobMetadata,
+    mode: JobMode,
     warnings: &mut dyn Write,
 ) -> Result<JobId> {
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
@@ -49,6 +53,7 @@ pub fn dispatch_with_warnings(
         cwd: cwd.map(str::to_owned),
         max_secs: max_secs.unwrap_or(host.max_job_secs),
         metadata,
+        mode,
     };
     let script = format!(
         "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",

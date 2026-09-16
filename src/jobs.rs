@@ -291,8 +291,9 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
             let dir = state_dir(id);
             format!(
                 "tmux -L {} kill-session -t coop-{id} 2>/dev/null; \
+                 tmux -L {} kill-session -t watch-{id} 2>/dev/null; \
                  if [ -d {dir} ]; then rm -rf {dir} && echo {id}; fi; exit 0",
-                host.tmux_socket
+                host.tmux_socket, host.tmux_socket
             )
         }
         // Presence of `rc` IS the definition of finished, the same test prune

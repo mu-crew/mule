@@ -37,8 +37,16 @@ fn dispatch_is_one_round_trip_and_returns_the_job_id() {
     let fake = Fake::new();
     fake.push(Output::ok("1\n"));
 
-    let id =
-        coop::run::dispatch(&fake, &host(), "echo hi", None, None, JobMetadata::Human).unwrap();
+    let id = coop::run::dispatch(
+        &fake,
+        &host(),
+        "echo hi",
+        None,
+        None,
+        JobMetadata::Human,
+        coop::wrapper::JobMode::Pipe,
+    )
+    .unwrap();
     let scripts = fake.scripts();
 
     assert_eq!(id.as_str().len(), 6);
@@ -58,6 +66,7 @@ fn no_master_error_prints_the_exact_command_to_open_one() {
         None,
         None,
         JobMetadata::Human,
+        coop::wrapper::JobMode::Pipe,
     )
     .unwrap_err();
     let message = error.to_string();
@@ -72,7 +81,18 @@ fn zero_running_sessions_is_a_successful_dispatch_reply() {
     let fake = Fake::new();
     fake.push(Output::ok("0\n"));
 
-    assert!(coop::run::dispatch(&fake, &host(), "true", None, None, JobMetadata::Human).is_ok());
+    assert!(
+        coop::run::dispatch(
+            &fake,
+            &host(),
+            "true",
+            None,
+            None,
+            JobMetadata::Human,
+            coop::wrapper::JobMode::Pipe,
+        )
+        .is_ok()
+    );
     assert!(
         fake.scripts()[0].contains("grep -c '^coop-' || true"),
         "grep reports no matches with status 1; the combined dispatch must normalize it"
@@ -92,6 +112,7 @@ fn warns_only_when_the_retrospective_count_exceeds_the_cap() {
         None,
         None,
         JobMetadata::Human,
+        coop::wrapper::JobMode::Pipe,
         &mut warning,
     )
     .unwrap();
@@ -110,6 +131,7 @@ fn warns_only_when_the_retrospective_count_exceeds_the_cap() {
         None,
         None,
         JobMetadata::Human,
+        coop::wrapper::JobMode::Pipe,
         &mut warning,
     )
     .unwrap();

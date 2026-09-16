@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 — unreleased
+
+`coop run --tui` keeps the command attached to its private tmux pane PTY while
+`pipe-pane` writes a capped durable transcript. A start barrier prevents early
+output loss; TUI jobs record their mode and final visible screen, and retain the
+existing timeout, kill, runtime, and cleanup lifecycle.
+
 ## 0.1.2 — 2026-09-15
 
 Jobs now identify as managed agents by default. The final command shell receives

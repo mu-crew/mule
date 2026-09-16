@@ -555,6 +555,107 @@ fn run_applies_crew_metadata_only_to_managed_job_shells() {
 }
 
 #[test]
+fn tui_job_uses_the_remote_pane_pty_and_accepts_input() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "tui-pty");
+    let config = sshd.write_config(&tmux.name);
+    let command = "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 9; printf 'ready\\n'; IFS= read -r answer; printf 'answer:%s\\n' \"$answer\"";
+
+    let out = sshd.coop(&config, &["run", "--tui", command]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = stdout(&out);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pane = sshd.ssh(&[
+            "tmux",
+            "-L",
+            &tmux.name,
+            "capture-pane",
+            "-p",
+            "-t",
+            &format!("coop-{id}"),
+        ]);
+        if String::from_utf8_lossy(&pane.stdout).contains("ready") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "early output never reached pane");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sent = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "send-keys",
+        "-t",
+        &format!("coop-{id}"),
+        "remote-input",
+        "Enter",
+    ]);
+    assert!(sent.status.success());
+    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+        assert!(Instant::now() < deadline, "TUI job never completed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let artifacts = sshd.ssh(&[&format!(
+        "d=$XDG_STATE_HOME/coop/jobs/{id}; cat $d/mode; cat $d/log; cat $d/screen"
+    )]);
+    assert!(artifacts.status.success());
+    let text = String::from_utf8_lossy(&artifacts.stdout);
+    assert!(text.contains("tui"), "{text:?}");
+    assert!(text.contains("ready"), "{text:?}");
+    assert!(text.contains("answer:remote-input"), "{text:?}");
+
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
+fn tui_timeout_and_kill_keep_existing_rc_and_cleanup_contracts() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "tui-lifecycle");
+    let config = sshd.write_config(&tmux.name);
+
+    let timed = stdout(&sshd.coop(
+        &config,
+        &["run", "--tui", "--max-secs", "1", "trap '' TERM; sleep 30"],
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stdout(&sshd.coop(&config, &["poll", &timed])) == "running" {
+        assert!(Instant::now() < deadline, "TUI timeout never fired");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &timed])), "124");
+
+    let killed = stdout(&sshd.coop(&config, &["run", "--tui", "sleep 30"]));
+    let kill = sshd.coop(&config, &["kill", &killed]);
+    assert!(kill.status.success());
+    assert_eq!(stdout(&sshd.coop(&config, &["poll", &killed])), "137");
+
+    let sessions = sshd.ssh(&[
+        "tmux",
+        "-L",
+        &tmux.name,
+        "list-sessions",
+        "-F",
+        "#{session_name}",
+    ]);
+    let names = String::from_utf8_lossy(&sessions.stdout);
+    for id in [&timed, &killed] {
+        assert!(!names.contains(&format!("coop-{id}")), "{names}");
+        assert!(!names.contains(&format!("watch-{id}")), "{names}");
+    }
+    clean_jobs(&sshd, &[timed, killed]);
+}
+
+#[test]
 fn dispatch_returns_before_the_job_finishes() {
     require_sshd!();
     let sshd = Sshd::start();
