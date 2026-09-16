@@ -1290,6 +1290,36 @@ fn kill_rm_ends_the_job_and_drops_its_state() {
 }
 
 #[test]
+fn removed_jobs_are_missing_not_orphaned() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "missing-job");
+    let config = sshd.write_config(&tmux.name);
+
+    let id = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
+    let removed = sshd.coop(&config, &["kill", "--rm", &id]);
+    assert!(removed.status.success());
+
+    for args in [
+        vec!["poll", &id],
+        vec!["poll", &id, "--json"],
+        vec!["wait", &id],
+        vec!["tail", &id],
+    ] {
+        let out = sshd.coop(&config, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {:?}", out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("job {id} not found")),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("orphan"), "{args:?}: {stderr}");
+    }
+}
+
+#[test]
 fn quiet_drops_hints_but_keeps_warnings() {
     require_sshd!();
     let sshd = Sshd::start();

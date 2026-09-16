@@ -32,7 +32,7 @@ fn host() -> Host {
 }
 
 fn reply(state: &str, size: u64, bytes: &[u8]) -> Output {
-    let mut stdout = format!("{state}\nsize={size}\nbytes:\n").into_bytes();
+    let mut stdout = format!("exists=1\n{state}\nsize={size}\nbytes:\n").into_bytes();
     stdout.extend_from_slice(bytes);
     Output::ok(stdout)
 }
@@ -224,9 +224,11 @@ fn a_job_that_finishes_within_one_probe_still_prints_its_output() {
     isolate_state();
     let fake = Fake::new();
     // First probe: already done, and no bytes yet.
-    fake.push(Output::ok("rc=0\nalive=0\nsize=6\nbytes:\n"));
+    fake.push(Output::ok("exists=1\nrc=0\nalive=0\nsize=6\nbytes:\n"));
     // The terminal re-read finds them.
-    fake.push(Output::ok("rc=0\nalive=0\nsize=6\nbytes:\nlate\n"));
+    fake.push(Output::ok(
+        "exists=1\nrc=0\nalive=0\nsize=6\nbytes:\nlate\n",
+    ));
 
     let mut out = Vec::new();
     let code = coop::tail::follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
@@ -263,7 +265,7 @@ fn a_plain_wait_does_not_pay_for_the_terminal_read() {
     // channel it is meant to protect.
     isolate_state();
     let fake = Fake::new();
-    fake.push(Output::ok("rc=2\nalive=0\nsize=0\nbytes:\n"));
+    fake.push(Output::ok("exists=1\nrc=2\nalive=0\nsize=0\nbytes:\n"));
 
     let code = coop::tail::wait_only(&fake, &host(), &"abc123".parse().unwrap(), None).unwrap();
 

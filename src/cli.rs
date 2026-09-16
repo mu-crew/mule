@@ -629,6 +629,9 @@ fn poll_with_hint(
     // cheapest verb in the tool.
     crate::errors::require_master(t, host)?;
     let result = probe(t, host, id, crate::probe::From::StateOnly)?;
+    if result.state == State::Missing {
+        return Err(crate::errors::CoopError::MissingJob { id: id.to_string() }.into());
+    }
     if json {
         println!(
             "{}",
@@ -639,6 +642,7 @@ fn poll_with_hint(
             State::Running => println!("running"),
             State::Done(code) => println!("{code}"),
             State::Orphan => println!("orphan"),
+            State::Missing => unreachable!("missing jobs return before output"),
         }
     }
     if !quiet {
@@ -659,6 +663,7 @@ fn poll_with_hint(
             State::Orphan => eprintln!(
                 "orphan: no exit code will arrive\nnext: coop tail {id} for output; coop rm {id} to drop its state"
             ),
+            State::Missing => unreachable!("missing jobs return before hints"),
         }
     }
     Ok(0)
@@ -669,6 +674,7 @@ fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String 
         State::Running => ("running", None),
         State::Done(code) => ("done", Some(*code)),
         State::Orphan => ("orphan", None),
+        State::Missing => ("missing", None),
     };
     serde_json::to_string(&PollJson {
         state,
@@ -1034,6 +1040,7 @@ fn print_jobs(
                     State::Running => ("running", None),
                     State::Done(code) => ("done", Some(code)),
                     State::Orphan => ("orphan", None),
+                    State::Missing => ("missing", None),
                 };
                 JobJson {
                     id: &row.id,
@@ -1099,6 +1106,7 @@ fn print_jobs(
                     State::Running => ("running", "-".to_string()),
                     State::Done(code) => ("done", code.to_string()),
                     State::Orphan => ("orphan", "-".to_string()),
+                    State::Missing => ("missing", "-".to_string()),
                 };
                 vec![
                     row.id.clone(),

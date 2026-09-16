@@ -37,7 +37,8 @@ pub fn once_mode_aware(
     let dir = state_dir(id);
     let read = selection_command(selection, &dir);
     let script = format!(
-        "if [ \"$(cat {dir}/mode 2>/dev/null)\" = tui ]; then \
+        "if [ ! -d {dir} ]; then exit 44; \
+         elif [ \"$(cat {dir}/mode 2>/dev/null)\" = tui ]; then \
            printf '\\036'; \
            if tmux -L {socket} capture-pane -p -J -t coop-{id} 2>/dev/null; then :; \
            elif [ -f {dir}/screen ]; then cat {dir}/screen; \
@@ -46,6 +47,9 @@ pub fn once_mode_aware(
         socket = host.tmux_socket,
     );
     let output = transport.run(host, &script)?;
+    if output.code == 44 {
+        return Err(CoopError::MissingJob { id: id.to_string() }.into());
+    }
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
     }
@@ -101,8 +105,13 @@ pub fn once(
     };
     // Ask about truncation in the SAME round trip -- a second call would take
     // the lock twice to answer a question that is one byte on disk.
-    let script = format!("{read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\"");
+    let script = format!(
+        "[ -d {dir} ] || exit 44; {read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\""
+    );
     let output = transport.run(host, &script)?;
+    if output.code == 44 {
+        return Err(CoopError::MissingJob { id: id.to_string() }.into());
+    }
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
     }
@@ -202,6 +211,9 @@ fn wait_loop(
             }
             State::Orphan => {
                 return Err(CoopError::Orphan { id: id.to_string() }.into());
+            }
+            State::Missing => {
+                return Err(CoopError::MissingJob { id: id.to_string() }.into());
             }
             State::Running => {}
         }

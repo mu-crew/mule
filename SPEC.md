@@ -80,9 +80,10 @@ The remote artifact is the only source of truth. There is no local job index. Th
 | --- | --- |
 | `running` | The tmux session exists and `rc` does not. |
 | `done` | `rc` exists. |
-| `orphan` | The session is gone and `rc` does not exist. |
+| `orphan` | The state directory exists, but the session is gone and `rc` does not exist. |
+| `missing` | The state directory does not exist. |
 
-`kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that coop did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
+A missing job is an ordinary error (exit 1), including for `poll --json`; it is not a poll result. `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that coop did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
 
 A job wrapper has this shape. The log is capped at `max_log_bytes`; `-f /dev/null` stops a personal `~/.tmux.conf` from inflating dispatch:
 
@@ -258,6 +259,7 @@ Truncation is recorded in a marker file and reported on stderr by `tail`, becaus
 - A missing master exits **3** and prints the command that opens it.
 - A timeout exits **4** while the remote job continues.
 - An orphan exits **5** because no `rc` can arrive.
+- A missing job exits **1** with `job <id> not found`.
 - A dropped connection during `wait` exits **6** while the remote job continues.
 - A refused channel reports a busy or down master rather than raw SSH authentication text.
 - An unreachable configured host remains visible in `ls` diagnostics.

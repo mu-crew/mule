@@ -41,11 +41,12 @@ fn host() -> Host {
 fn maps_rc_and_session_presence_to_job_state() {
     isolate_state();
     let cases = [
-        ("rc=0\nalive=0\nsize=0\nbytes:\n", State::Done(0)),
-        ("rc=3\nalive=0\nsize=0\nbytes:\n", State::Done(3)),
-        ("rc=\nalive=1\nsize=0\nbytes:\n", State::Running),
-        ("rc=\nalive=0\nsize=0\nbytes:\n", State::Orphan),
-        ("rc=7\nalive=1\nsize=0\nbytes:\n", State::Done(7)),
+        ("exists=1\nrc=0\nalive=0\nsize=0\nbytes:\n", State::Done(0)),
+        ("exists=1\nrc=3\nalive=0\nsize=0\nbytes:\n", State::Done(3)),
+        ("exists=1\nrc=\nalive=1\nsize=0\nbytes:\n", State::Running),
+        ("exists=1\nrc=\nalive=0\nsize=0\nbytes:\n", State::Orphan),
+        ("exists=0\nrc=\nalive=0\nsize=0\nbytes:\n", State::Missing),
+        ("exists=1\nrc=7\nalive=1\nsize=0\nbytes:\n", State::Done(7)),
     ];
 
     for (reply, expected) in cases {
@@ -63,7 +64,7 @@ fn maps_rc_and_session_presence_to_job_state() {
 #[test]
 fn preserves_arbitrary_log_bytes_after_the_header() {
     isolate_state();
-    let bytes = b"rc=\nalive=1\nsize=22\nbytes:\nrc=9\nbytes:\n\xff\0tail";
+    let bytes = b"exists=1\nrc=\nalive=1\nsize=22\nbytes:\nrc=9\nbytes:\n\xff\0tail";
     let fake = Fake::new();
     fake.push(Output::ok(bytes.as_slice()));
 
@@ -80,7 +81,7 @@ fn preserves_arbitrary_log_bytes_after_the_header() {
 fn probe_is_one_remote_round_trip() {
     isolate_state();
     let fake = Fake::new();
-    fake.push(Output::ok("rc=\nalive=1\nsize=0\nbytes:\n"));
+    fake.push(Output::ok("exists=1\nrc=\nalive=1\nsize=0\nbytes:\n"));
 
     probe(&fake, &host(), &"abc123".parse().unwrap(), 0).unwrap();
 
@@ -124,7 +125,7 @@ fn state_only_fetches_no_log_bytes() {
     // waiting", which reads as a network problem.
     isolate_state();
     let fake = Fake::new();
-    fake.push(Output::ok("rc=0\nalive=0\nsize=12\nbytes:\n"));
+    fake.push(Output::ok("exists=1\nrc=0\nalive=0\nsize=12\nbytes:\n"));
 
     let result = probe(
         &fake,
@@ -156,7 +157,9 @@ fn poll_does_not_download_the_log() {
     // make the cheapest verb in the tool the one that starves everything.
     isolate_state();
     let fake = Fake::new();
-    fake.push(Output::ok("rc=\nalive=1\nsize=209715200\nbytes:\n"));
+    fake.push(Output::ok(
+        "exists=1\nrc=\nalive=1\nsize=209715200\nbytes:\n",
+    ));
 
     coop::cli::poll(&fake, &host(), &"abc123".parse().unwrap(), false).unwrap();
 

@@ -39,6 +39,8 @@ pub enum CoopError {
     Timeout { id: String },
     #[error("job {id} is orphaned; no rc will ever arrive")]
     Orphan { id: String },
+    #[error("job {id} not found")]
+    MissingJob { id: String },
     #[error("lost contact while waiting; the job continues\n  resume: coop tail {id}")]
     Dropped { id: String },
 }
@@ -77,7 +79,8 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
         Some(CoopError::Orphan { .. }) => EXIT_ORPHAN,
         Some(CoopError::Dropped { .. }) => EXIT_DROPPED,
         Some(
-            CoopError::SessionChannelBusy
+            CoopError::MissingJob { .. }
+            | CoopError::SessionChannelBusy
             | CoopError::SshAgentUnreachable
             | CoopError::SshAgentHasNoKeys
             | CoopError::KeyboardInteractiveAmbiguous,

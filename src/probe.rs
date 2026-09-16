@@ -11,6 +11,7 @@ pub enum State {
     Running,
     Done(i32),
     Orphan,
+    Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +52,8 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let dir = state_dir(id);
     let from = from.into();
     let script = format!(
-        "d={dir}; rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
+        "d={dir}; [ -d $d ] && exists=1 || exists=0; printf 'exists=%s\\n' \"$exists\"; \
+         rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
          alive=$(tmux -L {} has-session -t coop-{id} 2>/dev/null && echo 1 || echo 0); \
          printf 'alive=%s\\n' \"$alive\"; \
          cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
@@ -82,12 +84,15 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let bytes = output.stdout[marker + MARKER.len()..].to_vec();
     output.stdout.truncate(marker);
 
+    let mut exists = None;
     let mut rc = None;
     let mut alive = None;
     let mut runtime_secs = None;
     let mut log_size = None;
     for line in output.text().lines() {
-        if let Some(value) = line.strip_prefix("rc=") {
+        if let Some(value) = line.strip_prefix("exists=") {
+            exists = Some(value == "1");
+        } else if let Some(value) = line.strip_prefix("rc=") {
             if !value.is_empty() {
                 rc = Some(value.parse::<i32>().context("invalid rc in probe reply")?);
             }
@@ -107,10 +112,11 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         }
     }
 
-    let state = match rc {
-        Some(code) => State::Done(code),
-        None if alive.context("invalid probe reply: missing alive")? => State::Running,
-        None => State::Orphan,
+    let state = match (exists.context("invalid probe reply: missing exists")?, rc) {
+        (false, _) => State::Missing,
+        (true, Some(code)) => State::Done(code),
+        (true, None) if alive.context("invalid probe reply: missing alive")? => State::Running,
+        (true, None) => State::Orphan,
     };
     Ok(Probe {
         state,
