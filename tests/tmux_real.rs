@@ -452,6 +452,21 @@ fn home_relative_cwds_actually_land_in_the_home_directory() {
 }
 
 #[test]
+fn a_script_larger_than_a_tmux_command_still_runs() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        return;
+    }
+    // tmux refuses a `new-session` command over ~16KB ("command too long").
+    // Inlining the encoded script into that command capped jobs at ~12KB, so a
+    // real launcher script -- T3 Code's is ~20KB -- could not be dispatched.
+    let server = TmuxServer::start();
+    let padding = format!("# {}\n", "x".repeat(200)).repeat(200);
+    let dir = server.run("000012", &format!("{padding}echo big; exit 5"), None);
+    assert_eq!(read(dir.join("rc")).trim(), "5");
+    assert_eq!(read(dir.join("log")).trim(), "big");
+}
+
+#[test]
 fn a_short_log_is_untouched_and_unflagged() {
     if Command::new("tmux").arg("-V").output().is_err() {
         return;

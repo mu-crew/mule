@@ -106,8 +106,13 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
         }
     };
 
+    // The job reads its script from the `cmd` file written before tmux starts,
+    // never from the tmux command string: tmux rejects a `new-session` command
+    // over ~16KB with "command too long", so inlining the payload capped every
+    // job at about 12KB of script. Redirecting the file keeps the old stdin
+    // semantics exactly -- `sh` still reads its script from standard input.
     let run = if job.max_secs == 0 {
-        format!("{cd} && printf %s {command} | base64 -d | {shell}; echo $? > {dir}/rc")
+        format!("{cd} && {shell} < {dir}/cmd; echo $? > {dir}/rc")
     } else {
         // POSIX sh has no portable process-group primitive, so the inner tmux
         // session supplies one: `kill-session` terminates the command and all
@@ -128,7 +133,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
         format!(
             "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
              \"printf %s {watchdog} | base64 -d | sh\"; \
-             {cd} && printf %s {command} | base64 -d | {shell}; rc=$?; \
+             {cd} && {shell} < {dir}/cmd; rc=$?; \
              tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
              if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
             socket = host.tmux_socket,
