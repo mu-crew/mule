@@ -3,7 +3,10 @@
   "version": "0.2.1",
   "description": "mule binary for Linux arm64",
   "license": "MIT",
-  "repository": "github:mu-crew/mule",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mu-crew/mule.git"
+  },
   "os": [
     "linux"
   ],
