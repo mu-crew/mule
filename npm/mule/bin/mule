@@ -1,0 +1,46 @@
+#!/usr/bin/env node
+
+const { spawn } = require("node:child_process");
+
+const packages = {
+  "linux-x64": "@mu-crew/mule-linux-x64",
+  "linux-arm64": "@mu-crew/mule-linux-arm64",
+  "darwin-arm64": "@mu-crew/mule-darwin-arm64",
+};
+const platform = `${process.platform}-${process.arch}`;
+const packageName = packages[platform];
+
+if (!packageName) {
+  console.error(
+    `mule: unsupported platform ${platform}; supported platforms: ${Object.keys(packages).join(", ")}`,
+  );
+  process.exit(1);
+}
+
+let binary;
+try {
+  binary = require.resolve(`${packageName}/bin/mule`);
+} catch {
+  console.error(
+    `mule: could not find ${packageName}; reinstall @mu-crew/mule for ${platform}`,
+  );
+  process.exit(1);
+}
+
+const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+for (const signal of signals) {
+  process.on(signal, () => child.kill(signal));
+}
+child.on("error", (error) => {
+  console.error(`mule: failed to run ${binary}: ${error.message}`);
+  process.exit(1);
+});
+child.on("exit", (code, signal) => {
+  if (signal) {
+    for (const handledSignal of signals) process.removeAllListeners(handledSignal);
+    process.kill(process.pid, signal);
+  } else {
+    process.exit(code ?? 1);
+  }
+});
