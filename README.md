@@ -5,6 +5,13 @@ Long remote commands occupy an SSH session; on a `MaxSessions 1` connection, con
 ## Install
 
 ```sh
+npm i -g @mu-crew/mule
+```
+
+The npm package provides prebuilt binaries for Linux x64, Linux arm64, and
+macOS arm64. Rust users can install from crates.io instead:
+
+```sh
 cargo install mule-cli
 ```
 

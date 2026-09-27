@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            package: mule-linux-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            package: mule-linux-arm64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            package: mule-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release versions
+        run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Add Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Build binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: target/${{ matrix.target }}/release/mule
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Check release versions
+        run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Fill platform packages
+        run: |
+          for package in mule-linux-x64 mule-linux-arm64 mule-darwin-arm64; do
+            mkdir -p "npm/$package/bin"
+            cp "artifacts/$package/mule" "npm/$package/bin/mule"
+            chmod +x "npm/$package/bin/mule"
+          done
+      - name: Publish npm packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for package in mule-linux-x64 mule-linux-arm64 mule-darwin-arm64; do
+            npm publish "npm/$package" --access public
+          done
+          npm publish npm/mule --access public
+      - name: Publish crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
