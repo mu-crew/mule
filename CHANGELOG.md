@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Breaking:** `coop` is now `mule`. Before upgrading, stop all running jobs,
+then move the config with `mv ~/.config/coop ~/.config/mule`. Reopen the SSH
+control master on the new `~/.ssh/mule/<host>.sock` path before dispatching new
+jobs. Cut over only when no jobs are running because the remote state and
+private tmux server also move to the `mule` name.
+
 ## 0.1.2 — 2026-09-16
 
 `coop run --tui` keeps the command attached to its private tmux pane PTY while

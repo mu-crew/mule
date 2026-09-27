@@ -1,8 +1,8 @@
 use clap::{CommandFactory, Parser};
 
-use coop::cli::Cli;
-use coop::errors::{
-    AgentState, CoopError, EXIT_DROPPED, EXIT_NO_MASTER, EXIT_ORPHAN, EXIT_TIMEOUT, classify,
+use mule::cli::Cli;
+use mule::errors::{
+    AgentState, EXIT_DROPPED, EXIT_NO_MASTER, EXIT_ORPHAN, EXIT_TIMEOUT, MuleError, classify,
     exit_code,
 };
 
@@ -14,7 +14,7 @@ fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mule-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
     });
@@ -28,7 +28,7 @@ fn refused_session_diagnostics_are_classified_case_insensitively() {
             classify(stderr, || panic!(
                 "unambiguous errors must not probe the agent"
             )),
-            Some(CoopError::SessionChannelBusy)
+            Some(MuleError::SessionChannelBusy)
         );
     }
 }
@@ -41,7 +41,7 @@ fn keyboard_interactive_with_an_unreachable_agent_names_the_credential_problem()
     })
     .unwrap();
 
-    assert_eq!(error, CoopError::SshAgentUnreachable);
+    assert_eq!(error, MuleError::SshAgentUnreachable);
     let text = error.to_string();
     assert!(text.contains("ssh-add -l"), "{text}");
     assert!(text.contains("SSH_AUTH_SOCK"), "{text}");
@@ -56,7 +56,7 @@ fn keyboard_interactive_with_keys_is_likely_a_busy_channel() {
         classify("Permission denied (keyboard-interactive)", || {
             AgentState::Keys
         }),
-        Some(CoopError::SessionChannelBusy)
+        Some(MuleError::SessionChannelBusy)
     );
 }
 
@@ -68,7 +68,7 @@ fn keyboard_interactive_with_no_keys_names_the_credential_problem() {
     })
     .unwrap();
 
-    assert_eq!(error, CoopError::SshAgentHasNoKeys);
+    assert_eq!(error, MuleError::SshAgentHasNoKeys);
     assert!(error.to_string().contains("ssh-add"));
 }
 
@@ -100,9 +100,9 @@ fn genuine_auth_failure_is_not_classified_as_a_busy_channel() {
 #[test]
 fn no_master_names_the_exact_recovery_command() {
     isolate_state();
-    let error = CoopError::NoMaster {
+    let error = MuleError::NoMaster {
         host: "dev".into(),
-        socket: "/tmp/coop-dev.sock".into(),
+        socket: "/tmp/mule-dev.sock".into(),
         target: "build.example".into(),
     };
 
@@ -110,7 +110,7 @@ fn no_master_names_the_exact_recovery_command() {
     assert_eq!(
         text,
         "no control master for dev\n  \
-         run: ssh -MNf -S /tmp/coop-dev.sock -o ControlPersist=8h build.example\n  \
+         run: ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h build.example\n  \
          a human may need to tap a hardware key; ask rather than retrying"
     );
     // The last line is for automated callers, which are the primary users: this
@@ -124,27 +124,27 @@ fn typed_failures_have_stable_distinct_exit_codes() {
     isolate_state();
     let cases = [
         (
-            CoopError::NoMaster {
+            MuleError::NoMaster {
                 host: "dev".into(),
-                socket: "/tmp/coop.sock".into(),
+                socket: "/tmp/mule.sock".into(),
                 target: "dev.example".into(),
             },
             EXIT_NO_MASTER,
         ),
         (
-            CoopError::Timeout {
+            MuleError::Timeout {
                 id: "abc123".into(),
             },
             EXIT_TIMEOUT,
         ),
         (
-            CoopError::Orphan {
+            MuleError::Orphan {
                 id: "abc123".into(),
             },
             EXIT_ORPHAN,
         ),
         (
-            CoopError::Dropped {
+            MuleError::Dropped {
                 id: "abc123".into(),
             },
             EXIT_DROPPED,
@@ -163,7 +163,7 @@ fn typed_failures_have_stable_distinct_exit_codes() {
 
 #[test]
 fn ls_all_and_running_are_mutually_exclusive() {
-    let error = Cli::try_parse_from(["coop", "ls", "--all", "--running"])
+    let error = Cli::try_parse_from(["mule", "ls", "--all", "--running"])
         .expect_err("--all and --running answer opposite questions");
     let text = error.to_string();
     assert!(text.contains("cannot be used with"), "{text}");
@@ -184,8 +184,8 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         "stdout and stderr are merged into one log",
         "poll and wait print NO job output",
         "do NOT pipe your command into head or tail",
-        "coop tail <id> -n 3",
-        "coop tail <id>",
+        "mule tail <id> -n 3",
+        "mule tail <id>",
         "never lent to local",
         "commands like rsync or git fetch",
         "3   no ssh control master",
@@ -204,22 +204,22 @@ fn every_job_verb_demands_a_master_with_exit_three() {
     // a generic failure with exit 1, instead of exit 3 and the one command that
     // fixes it. A caller cannot script around an error it cannot recognise.
     isolate_state();
-    let cfg = coop::config::Config::parse("[hosts.dev]\ntarget = \"h\"\n").unwrap();
+    let cfg = mule::config::Config::parse("[hosts.dev]\ntarget = \"h\"\n").unwrap();
     let host = cfg.host(None).unwrap();
-    let down = coop::transport::Fake::no_master();
+    let down = mule::transport::Fake::no_master();
     let id = "abc123".parse().unwrap();
     let mut sink = Vec::new();
 
     let failures: Vec<anyhow::Error> = vec![
-        coop::cli::poll(&down, host, &id, false).unwrap_err(),
-        coop::cli::wait(&down, host, &id, None).unwrap_err(),
-        coop::jobs::kill(&down, host, &id).unwrap_err(),
-        coop::jobs::remove(&down, host, &coop::jobs::Target::One(id.clone())).unwrap_err(),
-        coop::tail::once(
+        mule::cli::poll(&down, host, &id, false).unwrap_err(),
+        mule::cli::wait(&down, host, &id, None).unwrap_err(),
+        mule::jobs::kill(&down, host, &id).unwrap_err(),
+        mule::jobs::remove(&down, host, &mule::jobs::Target::One(id.clone())).unwrap_err(),
+        mule::tail::once(
             &down,
             host,
             &id,
-            coop::tail::Selection::LastBytes,
+            mule::tail::Selection::LastBytes,
             &mut sink,
         )
         .unwrap_err(),
@@ -227,7 +227,7 @@ fn every_job_verb_demands_a_master_with_exit_three() {
 
     for error in &failures {
         assert_eq!(
-            coop::errors::exit_code(error),
+            mule::errors::exit_code(error),
             3,
             "expected exit 3, got: {error:#}"
         );
@@ -244,16 +244,16 @@ fn every_job_verb_demands_a_master_with_exit_three() {
 fn reporting_a_missing_master_prepares_the_socket_directory() {
     // ssh will NOT create the directory holding a control socket: it binds a
     // temporary name inside it and fails with "unix_listener: cannot bind to
-    // path ...: No such file or directory". coop defaults the socket to
-    // ~/.ssh/coop/<host>.sock and never created that directory, so the command
-    // coop printed could not work -- and it failed AFTER the 2FA prompt, so the
-    // user paid a hardware-token tap to discover coop's own advice was wrong.
+    // path ...: No such file or directory". mule defaults the socket to
+    // ~/.ssh/mule/<host>.sock and never created that directory, so the command
+    // mule printed could not work -- and it failed AFTER the 2FA prompt, so the
+    // user paid a hardware-token tap to discover mule's own advice was wrong.
     isolate_state();
-    let base = std::env::temp_dir().join(format!("coop-sockdir-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("mule-sockdir-{}", std::process::id()));
     std::fs::remove_dir_all(&base).ok();
     let sock = base.join("nested").join("dev.sock");
 
-    let cfg = coop::config::Config::parse(&format!(
+    let cfg = mule::config::Config::parse(&format!(
         "[hosts.dev]\ntarget = \"h\"\nsocket = \"{}\"\n",
         sock.display()
     ))
@@ -262,8 +262,8 @@ fn reporting_a_missing_master_prepares_the_socket_directory() {
 
     assert!(!sock.parent().unwrap().exists(), "precondition");
 
-    let err = coop::errors::require_master(&coop::transport::Fake::no_master(), host).unwrap_err();
-    assert_eq!(coop::errors::exit_code(&err), 3);
+    let err = mule::errors::require_master(&mule::transport::Fake::no_master(), host).unwrap_err();
+    assert_eq!(mule::errors::exit_code(&err), 3);
 
     let parent = sock.parent().unwrap();
     assert!(
@@ -282,8 +282,8 @@ fn reporting_a_missing_master_prepares_the_socket_directory() {
 
     // Idempotent: a second report must not fail on the existing directory.
     let again =
-        coop::errors::require_master(&coop::transport::Fake::no_master(), host).unwrap_err();
-    assert_eq!(coop::errors::exit_code(&again), 3);
+        mule::errors::require_master(&mule::transport::Fake::no_master(), host).unwrap_err();
+    assert_eq!(mule::errors::exit_code(&again), 3);
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -292,16 +292,16 @@ fn reporting_a_missing_master_prepares_the_socket_directory() {
 fn the_master_command_is_rendered_in_one_place() {
     // `host list` and `ls` both print this advice; three copies would drift.
     isolate_state();
-    let cfg = coop::config::Config::parse(
-        "[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/coop-render/dev.sock\"\n",
+    let cfg = mule::config::Config::parse(
+        "[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/mule-render/dev.sock\"\n",
     )
     .unwrap();
-    let rendered = coop::errors::master_command(cfg.host(None).unwrap());
+    let rendered = mule::errors::master_command(cfg.host(None).unwrap());
     assert!(rendered.contains("ssh -MNf"), "{rendered}");
-    assert!(rendered.contains("/tmp/coop-render/dev.sock"), "{rendered}");
+    assert!(rendered.contains("/tmp/mule-render/dev.sock"), "{rendered}");
     assert!(rendered.contains("build.example"), "{rendered}");
     assert!(rendered.contains("ControlPersist=8h"), "{rendered}");
-    std::fs::remove_dir_all("/tmp/coop-render").ok();
+    std::fs::remove_dir_all("/tmp/mule-render").ok();
 }
 
 #[test]
@@ -321,18 +321,18 @@ fn every_verb_that_touches_the_log_says_the_streams_are_merged() {
             .to_string();
         assert!(
             help.contains(MERGED),
-            "`coop {verb} --help` must state the merging:\n{help}"
+            "`mule {verb} --help` must state the merging:\n{help}"
         );
         assert!(
             help.contains("redirect inside your command"),
-            "`coop {verb} --help` must say how to separate them:\n{help}"
+            "`mule {verb} --help` must say how to separate them:\n{help}"
         );
     }
 }
 
 #[test]
 fn run_help_warns_that_piping_the_command_destroys_the_exit_code() {
-    // Observed from a real agent: `coop run 'lake build 2>&1 | tail -3 && ...'`.
+    // Observed from a real agent: `mule run 'lake build 2>&1 | tail -3 && ...'`.
     // rc becomes the pipe's, so a failed build reports 0 and the `&&` proceeds.
     // rc is the artifact the whole design rests on, so this is silent.
     isolate_state();
@@ -345,7 +345,7 @@ fn run_help_warns_that_piping_the_command_destroys_the_exit_code() {
     for text in [
         "Do NOT pipe the command into head or tail",
         "exits 0",
-        "coop tail <id> -n 3",
+        "mule tail <id> -n 3",
         "set -o pipefail",
         "not portable POSIX",
     ] {

@@ -1,6 +1,6 @@
-# AGENTS.md — coop
+# AGENTS.md — mule
 
-`coop` fires jobs at a remote host over a private ssh control channel nothing
+`mule` fires jobs at a remote host over a private ssh control channel nothing
 else can contend with, and hands back a job id you poll, wait or tail against.
 The caller never holds an ssh connection.
 
@@ -45,12 +45,12 @@ the default suite precisely so this holds on a plane. Layer 3 uses a local
 
 ## If the master is down, stop and ask
 
-`coop` verbs exit **3** when there is no ssh control master. Opening one can
+`mule` verbs exit **3** when there is no ssh control master. Opening one can
 require a human to touch a hardware key, and `ssh -MNf` cannot prompt without a
 terminal — so this is the one failure no program resolves on its own.
 
 Working on this repo, you will hit it while testing against a real host. Ask the
-operator to run the command coop prints. Do not retry it, do not call
+operator to run the command mule prints. Do not retry it, do not call
 `ssh -MNf` from a tool call, and do not fall back to `ssh <host> <cmd>` "just to
 check something" — that holds the capped channel for the whole command and is
 the exact failure this tool exists to remove.
@@ -66,9 +66,9 @@ against a real capped host and none is reachable from a plain unit test.
 | layer | what | needs |
 | --- | --- | --- |
 | 1 | pure logic over the `Transport` trait with `Fake` | nothing |
-| 2 | the real wrapper against `tmux -L coop-test-<pid> -f /dev/null` | `tmux` |
+| 2 | the real wrapper against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
 | 3 | a local non-root `sshd` with `MaxSessions 1` on a loopback port | `sshd` |
-| 3b | a real capped host | operator-chosen host + a live coop master |
+| 3b | a real capped host | operator-chosen host + a live mule master |
 
 Layer 3 lives in `tests/local_sshd.rs`, on the fixture in `tests/common/sshd.rs`.
 It re-runs the measurements the design rests on — channel refusal, isolation in
@@ -99,16 +99,16 @@ task's worth at a time, atomic and revertible.
 
 ## Invariants — do not break these
 
-These are the tool. Breaking one silently makes coop worse than plain `ssh`.
+These are the tool. Breaking one silently makes mule worse than plain `ssh`.
 
-1. **coop uses its own `ControlPath`** (`~/.ssh/coop/<host>.sock`). The
-   `MaxSessions` cap is per-connection, not per-user, so coop cannot contend
+1. **mule uses its own `ControlPath`** (`~/.ssh/mule/<host>.sock`). The
+   `MaxSessions` cap is per-connection, not per-user, so mule cannot contend
    with tools on the default socket, and they cannot starve it.
-2. **Jobs run under a private tmux server** (`tmux -L coop`), invisible to the
+2. **Jobs run under a private tmux server** (`tmux -L mule`), invisible to the
    user's `tmux ls`.
-3. **Nothing long-running ever rides the channel.** Every ssh coop issues is a
+3. **Nothing long-running ever rides the channel.** Every ssh mule issues is a
    sub-second detached dispatch or an artifact read. This is why `--wait` polls
-   instead of staying attached, and why coop's channel is never lent to local
+   instead of staying attached, and why mule's channel is never lent to local
    commands like rsync.
 
 Consequences, each of which has cost someone real debugging time:
@@ -127,7 +127,7 @@ Consequences, each of which has cost someone real debugging time:
   until that last decode.
 - **Jobs get a non-login, non-interactive shell.** Do not add a flag to source
   login files: that would make a job depend on the host's config, and the
-  failure mode is "works when I ssh in, fails under coop". Measured and
+  failure mode is "works when I ssh in, fails under mule". Measured and
   rejected — see SPEC.md § Sourcing login files is out of scope. Note bash does
   source `~/.bashrc` over ssh, so a `PATH` set there already reaches jobs; what
   is missing is only `.bash_profile`, i.e. an environment manager's `activate`,
@@ -135,17 +135,17 @@ Consequences, each of which has cost someone real debugging time:
 - **The remote artifact is the only source of truth.** No local job index. `rc`
   is the completion signal; poll the artifact, not the process.
 - **Never pipe a job's command into `head` or `tail`.** Observed from a real
-  agent: `coop run 'lake build 2>&1 | tail -3 && ./check'`. `rc` becomes the
+  agent: `mule run 'lake build 2>&1 | tail -3 && ./check'`. `rc` becomes the
   pipe's -- measured, `sh -c 'echo x; exit 1' | tail -3` exits 0 -- so a failed
   build reports success, and the `&&` then runs the next stage against a broken
-  tree. The instinct is right (logs get big) and coop already serves it better:
-  `coop tail <id> -n 3` shapes the output, `max_log_bytes` caps the write, and a
+  tree. The instinct is right (logs get big) and mule already serves it better:
+  `mule tail <id> -n 3` shapes the output, `max_log_bytes` caps the write, and a
   one-shot `tail` caps the read at 64KB. `set -o pipefail` inside your own
-  command is the escape hatch if the remote `sh` supports it; coop does not
+  command is the escape hatch if the remote `sh` supports it; mule does not
   inject it, because the command belongs to the caller.
-- **coop never opens the ssh master.** `ssh -MNf` needs a TTY for a hardware
+- **mule never opens the ssh master.** `ssh -MNf` needs a TTY for a hardware
   token and cannot prompt from a background call. Exit 3 and print the command.
-- **No daemon, and no process between invocations.** This is what makes coop
+- **No daemon, and no process between invocations.** This is what makes mule
   honest rather than an orchestrator.
 - **Never pass ssh's stderr through raw.** A refused session channel surfaces as
   `Permission denied (keyboard-interactive)`, which reads as a credentials

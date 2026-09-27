@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::config::{Config, Host};
 use crate::dispatch_warn::{DispatchWarning, dispatch_warnings};
-use crate::errors::{CoopError, EXIT_NO_MASTER};
+use crate::errors::{EXIT_NO_MASTER, MuleError};
 use crate::probe::{State, probe};
 use crate::transport::{Ssh, Transport};
 
@@ -78,23 +78,23 @@ struct JobsJson<'a> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "coop",
-    // From Cargo.toml, so `coop --version` cannot drift from the published
+    name = "mule",
+    // From Cargo.toml, so `mule --version` cannot drift from the published
     // crate. A released binary that cannot say which version it is makes a bug
     // report unactionable.
     version,
     about = "Fire remote jobs down a private ssh channel nothing else can take.",
     long_about = "\
-Hand coop a command, get an id back, then poll, wait or tail against that id.
+Hand mule a command, get an id back, then poll, wait or tail against that id.
 You never see ssh, never see tmux, and never hold a connection.
 
-coop uses its OWN ssh ControlPath, so it cannot contend with git fetch, rsync or
-anything else on the default socket. The coop channel is never lent to local
+mule uses its OWN ssh ControlPath, so it cannot contend with git fetch, rsync or
+anything else on the default socket. The mule channel is never lent to local
 commands like rsync or git fetch.
 
 Operational facts:
 
-  * coop does NOT open the ssh master. `ssh -MNf` needs a TTY for a hardware
+  * mule does NOT open the ssh master. `ssh -MNf` needs a TTY for a hardware
     token and cannot prompt from a background call. This costs one token tap per
     ControlPersist window.
 
@@ -102,21 +102,21 @@ Operational facts:
     to touch a hardware key. If you are an agent or a script, STOP and ask the
     operator to run the printed command. Do not retry, do not run `ssh -MNf`
     yourself, and do not fall back to `ssh host command` -- that holds a session
-    channel for the whole job, which is the failure coop exists to remove.
+    channel for the whole job, which is the failure mule exists to remove.
   * jobs run in a NON-login, NON-interactive shell, so login profiles do not
     run. Bash still sources ~/.bashrc over ssh, so a PATH set there does reach
     a job; ~/.bash_profile does not run, so a version manager's `activate` has
     not happened. Put its shims dir on PATH in ~/.bashrc, or source what you
-    need in the command: coop run 'source ~/.zshrc && npm test'.
+    need in the command: mule run 'source ~/.zshrc && npm test'.
   * stdout and stderr are merged into one log, in the order the job wrote them;
     redirect inside your command to separate them.
-  * poll and wait print NO job output; `coop tail <id>` is the output verb.
+  * poll and wait print NO job output; `mule tail <id>` is the output verb.
   * do NOT pipe your command into head or tail. `rc` becomes the pipe's, so a
-    failed build reports 0 and every `&&` after it proceeds. coop already
-    shapes the output for you: `coop tail <id> -n 3` instead of `| tail -3`.
+    failed build reports 0 and every `&&` after it proceeds. mule already
+    shapes the output for you: `mule tail <id> -n 3` instead of `| tail -3`.
 
 Exit status:
-  0   coop operation or job succeeded
+  0   mule operation or job succeeded
   3   no ssh control master
   4   timed out waiting
   5   orphaned job
@@ -124,7 +124,7 @@ Exit status:
   <n> wait/--wait return the job's own exit code"
 )]
 pub struct Cli {
-    /// Config file (default: ~/.config/coop/config.toml)
+    /// Config file (default: ~/.config/mule/config.toml)
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
 
@@ -166,9 +166,9 @@ pub enum Commands {
         /// Run an interactive/full-screen program on the remote tmux pane PTY
         ///
         /// Use this for `pi-meta`, editors, REPLs, and other programs you plan
-        /// to view or control through murmur/mu. Without --tui, coop pipes the
+        /// to view or control through murmur/mu. Without --tui, mule pipes the
         /// command's output into its log artifact, so attaching reaches the
-        /// right pane but there is no live TUI to render. After dispatch, coop
+        /// right pane but there is no live TUI to render. After dispatch, mule
         /// prints pasteable screen, murmur jump, mu attach, and cleanup commands.
         #[arg(long, conflicts_with_all = ["wait", "no_tail"])]
         tui: bool,
@@ -180,10 +180,10 @@ pub enum Commands {
         no_tail: bool,
         /// The command to run.
         ///
-        /// Everything after the first word is part of the command, so coop's
-        /// own flags go BEFORE it: `coop run --wait ls`, not
-        /// `coop run ls --wait`. Use `--` when the command takes flags coop
-        /// also has: `coop run -- ls --all`.
+        /// Everything after the first word is part of the command, so mule's
+        /// own flags go BEFORE it: `mule run --wait ls`, not
+        /// `mule run ls --wait`. Use `--` when the command takes flags mule
+        /// also has: `mule run -- ls --all`.
         ///
         /// stdout and stderr are merged into one log, in the order the job
         /// wrote them; redirect inside your command to separate them.
@@ -191,19 +191,19 @@ pub enum Commands {
         /// Do NOT pipe the command into head or tail to keep the log small.
         /// `rc` becomes the pipe's -- measured: `sh -c 'echo x; exit 1' |
         /// tail -3` exits 0 -- so a failed job reports success and any `&&`
-        /// after it runs anyway, and `rc` is the artifact coop's whole design
-        /// rests on. Let the job be the work and let coop shape the output:
-        /// `coop tail <id> -n 3`, or plain `coop tail <id>`, which already
+        /// after it runs anyway, and `rc` is the artifact mule's whole design
+        /// rests on. Let the job be the work and let mule shape the output:
+        /// `mule tail <id> -n 3`, or plain `mule tail <id>`, which already
         /// caps the read at 64KB. If your remote sh supports it,
         /// `set -o pipefail` keeps a genuine pipeline honest; it is not
-        /// portable POSIX, so coop does not add it for you -- the command is
+        /// portable POSIX, so mule does not add it for you -- the command is
         /// yours.
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
-    /// Print state, but no job output; prints nothing from the job; use coop tail <id>
+    /// Print state, but no job output; prints nothing from the job; use mule tail <id>
     ///
-    /// What `coop tail` gives you is one log: stdout and stderr are merged into
+    /// What `mule tail` gives you is one log: stdout and stderr are merged into
     /// one log, in the order the job wrote them; redirect inside your command
     /// to separate them.
     Poll {
@@ -213,9 +213,9 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Block until done; prints nothing; use coop tail <id>
+    /// Block until done; prints nothing; use mule tail <id>
     ///
-    /// What `coop tail` gives you is one log: stdout and stderr are merged into
+    /// What `mule tail` gives you is one log: stdout and stderr are merged into
     /// one log, in the order the job wrote them; redirect inside your command
     /// to separate them.
     Wait {
@@ -298,7 +298,7 @@ pub enum Commands {
         /// Remove every FINISHED job, ignoring keep_days.
         ///
         /// Running jobs and orphans are kept: `--all` never stops work, and an
-        /// orphan is evidence rather than mud. Use `coop rm <id>` or `coop kill`
+        /// orphan is evidence rather than mud. Use `mule rm <id>` or `mule kill`
         /// to end a named job.
         #[arg(long, conflicts_with = "id")]
         all: bool,
@@ -344,14 +344,14 @@ pub fn load_config(path: Option<&std::path::Path>) -> Result<Config> {
         anyhow::bail!(
             "no hosts configured yet\n  \
              wrote a template to {}\n  \
-             edit it to name a host, then run `coop host list`",
+             edit it to name a host, then run `mule host list`",
             default.display()
         );
     }
     Config::load(&default)
 }
 
-/// `coop host list`.
+/// `mule host list`.
 ///
 /// A down master is *information* for this verb, not an error: "which of my
 /// hosts can I use right now" is the question being asked, so it prints the
@@ -399,7 +399,7 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
     );
     if rows.iter().any(|(_, up)| !up) {
         eprintln!(
-            "\nsome hosts have no control master. coop cannot open one \
+            "\nsome hosts have no control master. mule cannot open one \
              (ssh -MNf needs a TTY for a hardware token).\n\
              A human may need to tap a key; ask rather than retrying:"
         );
@@ -636,7 +636,7 @@ fn poll_with_hint(
     crate::errors::require_master(t, host)?;
     let result = probe(t, host, id, crate::probe::From::StateOnly)?;
     if result.state == State::Missing {
-        return Err(crate::errors::CoopError::MissingJob { id: id.to_string() }.into());
+        return Err(crate::errors::MuleError::MissingJob { id: id.to_string() }.into());
     }
     if json {
         println!(
@@ -656,18 +656,18 @@ fn poll_with_hint(
             State::Running => {
                 if let Some(runtime) = result.runtime_secs {
                     eprintln!(
-                        "running for {}; next: coop wait {id} to block; coop tail {id} -f to follow",
+                        "running for {}; next: mule wait {id} to block; mule tail {id} -f to follow",
                         format_age(runtime)
                     );
                 } else {
-                    eprintln!("next: coop wait {id} to block; coop tail {id} -f to follow");
+                    eprintln!("next: mule wait {id} to block; mule tail {id} -f to follow");
                 }
             }
             State::Done(_) => {
-                eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state")
+                eprintln!("next: mule tail {id} for output; mule rm {id} to drop its state")
             }
             State::Orphan => eprintln!(
-                "orphan: no exit code will arrive\nnext: coop tail {id} for output; coop rm {id} to drop its state"
+                "orphan: no exit code will arrive\nnext: mule tail {id} for output; mule rm {id} to drop its state"
             ),
             State::Missing => unreachable!("missing jobs return before hints"),
         }
@@ -754,13 +754,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     std::io::stdout().flush()?;
                     // Warn AFTER dispatch, so the advice can name the job it
                     // is about. Warning first meant printing a literal
-                    // `coop tail <id>` at the one moment a real id did not
+                    // `mule tail <id>` at the one moment a real id did not
                     // exist yet -- and the job starts regardless, so a reader
                     // was told something was wrong with no way to act on it.
-                    // coop never blocks on a heuristic: the command belongs to
+                    // mule never blocks on a heuristic: the command belongs to
                     // the caller (AGENTS.md), and a pipeline may be deliberate.
                     // Not gated on `quiet`: see the flag's own docs. A
-                    // caller piping coop through `tail -1` to get a bare id
+                    // caller piping mule through `tail -1` to get a bare id
                     // was already losing this warning to their own pipeline,
                     // so making `--quiet` the recommended alternative had to
                     // stop hiding it too.
@@ -770,8 +770,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                             if tui {
                                 eprint!("{}", tui_hints(&id, &host.target, workstream.as_deref()));
                             } else {
-                                eprintln!("next: coop wait {id} for the exit code");
-                                eprintln!("      coop tail {id} for output");
+                                eprintln!("next: mule wait {id} for the exit code");
+                                eprintln!("      mule tail {id} for output");
                             }
                         }
                         return Ok(0);
@@ -790,18 +790,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                             missing_tool_hint(&output.tail());
                         }
                         if !quiet {
-                            eprintln!("next: coop rm {id} to drop its state");
+                            eprintln!("next: mule rm {id} to drop its state");
                         }
                     }
                     result
                 }
                 Err(error)
                     if matches!(
-                        error.downcast_ref::<CoopError>(),
-                        Some(CoopError::NoMaster { .. })
+                        error.downcast_ref::<MuleError>(),
+                        Some(MuleError::NoMaster { .. })
                     ) =>
                 {
-                    eprintln!("coop: {error}");
+                    eprintln!("mule: {error}");
                     Ok(EXIT_NO_MASTER)
                 }
                 Err(error) => Err(error),
@@ -815,9 +815,9 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 // machine format, and dropping it for someone parsing JSON
                 // gives a parser a table. Same verb either way.
                 let next = if json {
-                    "coop host info --json"
+                    "mule host info --json"
                 } else {
-                    "coop host info"
+                    "mule host info"
                 };
                 eprintln!("next: {next} for OS, cores, RAM, and GPU");
             }
@@ -833,7 +833,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Wait { id, host, timeout } => {
             let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout);
             if result.is_ok() && !quiet {
-                eprintln!("next: coop tail {id} for output; coop rm {id} to drop its state");
+                eprintln!("next: mule tail {id} for output; mule rm {id} to drop its state");
             }
             result
         }
@@ -853,7 +853,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         "cannot follow a TUI job; streaming redraw bytes is not useful".to_string();
                     if !quiet {
                         message.push_str(&format!(
-                            "\n  view current screen: coop tail {id}\n  jump/interact:       murmur pick --all    # select coop-{id}"
+                            "\n  view current screen: mule tail {id}\n  jump/interact:       murmur pick --all    # select mule-{id}"
                         ));
                     }
                     anyhow::bail!(message);
@@ -916,7 +916,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             if !quiet {
                 eprintln!("killed {id}; now done {rc}");
-                eprintln!("next: coop rm {id} to drop its state, or kill --rm next time");
+                eprintln!("next: mule rm {id} to drop its state, or kill --rm next time");
             }
             Ok(0)
         }
@@ -930,20 +930,20 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 // printing a bare usage error.
                 (None, false) => anyhow::bail!(
                     "name a job, or pass --all to remove every finished one\n  \
-                     coop rm <id>\n  coop rm --all"
+                     mule rm <id>\n  mule rm --all"
                 ),
             };
             let removed = crate::jobs::remove(&Ssh, host, &target)?;
             // Report what happened: `--all` on a clean host is silent
             // otherwise, which reads as a failure.
             match removed.len() {
-                0 => eprintln!("coop: nothing to remove"),
+                0 => eprintln!("mule: nothing to remove"),
                 1 => println!("{}", removed[0]),
                 n => {
                     for id in &removed {
                         println!("{id}");
                     }
-                    eprintln!("coop: removed {n} finished jobs");
+                    eprintln!("mule: removed {n} finished jobs");
                 }
             }
             Ok(0)
@@ -956,18 +956,18 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn tui_hints(id: &crate::wrapper::JobId, target: &str, workstream: Option<&str>) -> String {
-    let agent = format!("coop-{id}");
+    let agent = format!("mule-{id}");
     let target = shell_quote(target);
     let workstream = workstream
         .map(|value| format!(" -w {}", shell_quote(value)))
         .unwrap_or_default();
     format!(
         "TUI job {id} is interactive\n\
-           view current screen: coop tail {id}\n\
+           view current screen: mule tail {id}\n\
            jump/interact:       murmur pick --all    # select {agent}\n\
            control through mu:  mu agent spawn {agent}{workstream} --command \\\n\
              \"$(murmur jump-command --host {target} --agent {agent})\"\n\
-           stop and remove:     coop kill --rm {id}\n"
+           stop and remove:     mule kill --rm {id}\n"
     )
 }
 
@@ -1017,7 +1017,7 @@ fn missing_tool_hint(log_tail: &[u8]) {
     .any(|pattern| text.contains(pattern))
     {
         eprintln!(
-            "coop: the job's shell is non-login, so ~/.bash_profile did not run. If this is a missing tool, put its shims dir on PATH: coop run 'export PATH=$HOME/.elan/bin:$PATH; <cmd>'"
+            "mule: the job's shell is non-login, so ~/.bash_profile did not run. If this is a missing tool, put its shims dir on PATH: mule run 'export PATH=$HOME/.elan/bin:$PATH; <cmd>'"
         );
     }
 }
@@ -1079,7 +1079,7 @@ fn print_jobs(
             .expect("serializing string-backed job rows cannot fail")
         );
         if rows.is_empty() && hidden == 0 && !quiet {
-            eprintln!("no jobs; next: coop run <cmd>");
+            eprintln!("no jobs; next: mule run <cmd>");
         }
         return;
     }
@@ -1087,11 +1087,11 @@ fn print_jobs(
     if rows.is_empty() {
         if !quiet {
             if running_only {
-                eprintln!("no running jobs; next: coop run <cmd>");
+                eprintln!("no running jobs; next: mule run <cmd>");
             } else if hidden == 0 {
-                eprintln!("no jobs; next: coop run <cmd>");
+                eprintln!("no jobs; next: mule run <cmd>");
             } else {
-                eprintln!("{hidden} older finished jobs hidden; next: coop ls --all");
+                eprintln!("{hidden} older finished jobs hidden; next: mule ls --all");
             }
         }
         return;
@@ -1133,9 +1133,9 @@ fn print_jobs(
     );
     if !quiet {
         let id = &rows[0].id;
-        eprintln!("next: coop poll {id}; coop tail {id}");
+        eprintln!("next: mule poll {id}; mule tail {id}");
         if hidden > 0 {
-            eprintln!("{hidden} older finished jobs hidden; next: coop ls --all");
+            eprintln!("{hidden} older finished jobs hidden; next: mule ls --all");
         }
     }
 }
@@ -1155,19 +1155,19 @@ fn command_from_args(args: &[String]) -> String {
     }
 }
 
-/// Warn when the command contains something that looks like a coop flag.
+/// Warn when the command contains something that looks like a mule flag.
 ///
-/// `run` takes the command as trailing arguments, so `coop run ls --wait` sends
-/// `--wait` to `ls` rather than to coop. That has to be true -- otherwise you
+/// `run` takes the command as trailing arguments, so `mule run ls --wait` sends
+/// `--wait` to `ls` rather than to mule. That has to be true -- otherwise you
 /// could not run a command that takes flags -- but it fails silently: the job
-/// dispatches, no output appears because `--wait` never reached coop, and the
+/// dispatches, no output appears because `--wait` never reached mule, and the
 /// exit code is whatever the command made of the stray argument. `ls` exits 1
-/// on an unknown flag, which reads as a coop bug.
+/// on an unknown flag, which reads as a mule bug.
 ///
 /// So this warns rather than erroring: the command really might want the flag,
-/// and refusing would break `coop run -- rsync --delete ...`.
+/// and refusing would break `mule run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
-    const COOP_FLAGS: [&str; 9] = [
+    const MULE_FLAGS: [&str; 9] = [
         "--wait",
         "--no-tail",
         "--max-secs",
@@ -1181,22 +1181,22 @@ fn warn_about_swallowed_flags(cmd: &[String]) {
     let found: Vec<&str> = cmd
         .iter()
         .skip(1)
-        .filter_map(|arg| COOP_FLAGS.iter().find(|f| *f == arg).copied())
+        .filter_map(|arg| MULE_FLAGS.iter().find(|f| *f == arg).copied())
         .collect();
     if found.is_empty() {
         return;
     }
     eprintln!(
-        "coop: warning: {} went to the command, not to coop",
+        "mule: warning: {} went to the command, not to mule",
         found.join(", ")
     );
     eprintln!(
-        "  coop flags go before the command: coop run {} {}",
+        "  mule flags go before the command: mule run {} {}",
         found.join(" "),
         cmd.first().map(String::as_str).unwrap_or("<cmd>")
     );
     eprintln!(
-        "  to silence this, separate them explicitly: coop run -- {}",
+        "  to silence this, separate them explicitly: mule run -- {}",
         command_from_args(cmd)
     );
 }
@@ -1204,7 +1204,7 @@ fn warn_about_swallowed_flags(cmd: &[String]) {
 /// Report dispatch-pattern warnings for a job that is already running.
 ///
 /// Every warning names the job and how to end it. The job exists by the time
-/// this runs -- coop warns rather than blocking, because the command belongs
+/// this runs -- mule warns rather than blocking, because the command belongs
 /// to the caller and a final pipeline may be exactly what they meant -- so
 /// "here is what looks wrong" without "here is how to stop it" leaves the
 /// reader holding a running job and no next step. That is worse for the
@@ -1214,17 +1214,17 @@ fn warn_about_dispatch_patterns(command: &str, has_max_secs: bool, id: &crate::w
     for warning in dispatch_warnings(command, has_max_secs) {
         match warning {
             DispatchWarning::PipelineStatus => eprintln!(
-                "coop: warning: a final head/tail pipeline may hide the job's failure\n  \
+                "mule: warning: a final head/tail pipeline may hide the job's failure\n  \
                  rc will be the pipe's, so a failed command can report success\n  \
-                 let coop shape the output instead: coop tail {id} -n 3\n  \
+                 let mule shape the output instead: mule tail {id} -n 3\n  \
                  if intentional, set -o pipefail before the pipeline\n  \
-                 to start over:  coop kill --rm {id}"
+                 to start over:  mule kill --rm {id}"
             ),
             DispatchWarning::UnboundedLoop => eprintln!(
-                "coop: warning: this looks like an unbounded loop, and nothing will stop it\n  \
+                "mule: warning: this looks like an unbounded loop, and nothing will stop it\n  \
                  it holds a tmux session and a growing log until the host reboots\n  \
-                 stop it now:   coop kill --rm {id}\n  \
-                 then bound it: coop run --max-secs <seconds> '<cmd>'"
+                 stop it now:   mule kill --rm {id}\n  \
+                 then bound it: mule run --max-secs <seconds> '<cmd>'"
             ),
         }
     }
@@ -1276,20 +1276,20 @@ mod tests {
 
     #[test]
     fn tui_run_is_explicit_and_rejects_local_wait_modes() {
-        assert!(Cli::try_parse_from(["coop", "run", "--tui", "true"]).is_ok());
+        assert!(Cli::try_parse_from(["mule", "run", "--tui", "true"]).is_ok());
         assert!(
-            Cli::try_parse_from(["coop", "run", "--tui", "--human", "--max-secs", "5", "true"])
+            Cli::try_parse_from(["mule", "run", "--tui", "--human", "--max-secs", "5", "true"])
                 .is_ok()
         );
-        assert!(Cli::try_parse_from(["coop", "run", "--tui", "--wait", "true"]).is_err());
-        assert!(Cli::try_parse_from(["coop", "run", "--tui", "--no-tail", "true"]).is_err());
+        assert!(Cli::try_parse_from(["mule", "run", "--tui", "--wait", "true"]).is_err());
+        assert!(Cli::try_parse_from(["mule", "run", "--tui", "--no-tail", "true"]).is_err());
     }
 
     #[test]
     fn tui_transcript_is_explicit_and_cannot_be_followed() {
-        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript"]).is_ok());
-        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript", "-n", "3"]).is_ok());
-        assert!(Cli::try_parse_from(["coop", "tail", "abc123", "--transcript", "-f"]).is_err());
+        assert!(Cli::try_parse_from(["mule", "tail", "abc123", "--transcript"]).is_ok());
+        assert!(Cli::try_parse_from(["mule", "tail", "abc123", "--transcript", "-n", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["mule", "tail", "abc123", "--transcript", "-f"]).is_err());
     }
 
     #[test]
@@ -1301,7 +1301,7 @@ mod tests {
             Some("crew '$(touch /tmp/workstream)'"),
         );
 
-        assert!(hints.contains("coop tail abc123"), "{hints}");
+        assert!(hints.contains("mule tail abc123"), "{hints}");
         assert!(hints.contains("murmur pick --all"), "{hints}");
         assert!(
             hints.contains("--host 'dev '\\''$(touch /tmp/target)'\\'''"),
@@ -1315,7 +1315,7 @@ mod tests {
             hints.contains("--command \\\n\"$(murmur jump-command"),
             "{hints}"
         );
-        assert!(hints.contains("coop kill --rm abc123"), "{hints}");
+        assert!(hints.contains("mule kill --rm abc123"), "{hints}");
     }
 
     #[test]
@@ -1398,7 +1398,7 @@ mod tests {
     /// The table truncates at 80 characters so one job stays one scannable
     /// row, which is right for scanning and wrong for "what did this actually
     /// run". Before this, the only way to recover the text was `--json`, so a
-    /// human debugging their own command had to pipe coop through a parser.
+    /// human debugging their own command had to pipe mule through a parser.
     ///
     /// Both paths still collapse whitespace: an embedded newline would split
     /// one job across rows that look like separate jobs. `--full` keeps every

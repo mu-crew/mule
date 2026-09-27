@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use coop::config::Host;
-use coop::probe::{State, next_interval, probe};
-use coop::transport::{Fake, Output};
+use mule::config::Host;
+use mule::probe::{State, next_interval, probe};
+use mule::transport::{Fake, Output};
 
 /// Point the lock directory at a temp dir for the whole test binary.
 ///
 /// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes one
-/// directory per test run into the developer's real `~/.local/state/coop`. A
+/// directory per test run into the developer's real `~/.local/state/mule`. A
 /// full run left 151 of them behind, mixed in with live job state.
 ///
 /// `set_var` is safe here because it runs once, before any thread that reads it.
@@ -16,7 +16,7 @@ fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mule-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
     });
@@ -27,8 +27,8 @@ fn host() -> Host {
     Host {
         name: format!("probe-test-{}", std::process::id()),
         target: "dev".into(),
-        socket: PathBuf::from("/tmp/coop.sock"),
-        tmux_socket: "coop".into(),
+        socket: PathBuf::from("/tmp/mule.sock"),
+        tmux_socket: "mule".into(),
         max_running: 4,
         default_cwd: None,
         keep_days: 14,
@@ -131,7 +131,7 @@ fn state_only_fetches_no_log_bytes() {
         &fake,
         &host(),
         &"abc123".parse().unwrap(),
-        coop::probe::From::StateOnly,
+        mule::probe::From::StateOnly,
     )
     .unwrap();
 
@@ -161,7 +161,7 @@ fn poll_does_not_download_the_log() {
         "exists=1\nrc=\nalive=1\nsize=209715200\nbytes:\n",
     ));
 
-    coop::cli::poll(&fake, &host(), &"abc123".parse().unwrap(), false).unwrap();
+    mule::cli::poll(&fake, &host(), &"abc123".parse().unwrap(), false).unwrap();
 
     let script = &fake.scripts()[0];
     assert!(

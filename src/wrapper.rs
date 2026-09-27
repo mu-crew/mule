@@ -32,7 +32,7 @@ pub enum JobMetadata {
 ///
 /// Jobs live under `jobs/` rather than directly in the state dir because the
 /// ticket lock keeps `<host>.lock` in the same tree. Sharing one parent made
-/// `coop ls` report `dev.lock` as an orphaned job, and would have let prune
+/// `mule ls` report `dev.lock` as an orphaned job, and would have let prune
 /// delete a live lock. They collide whenever the orchestrator and the target
 /// are the same machine, which is exactly the local-sshd test setup.
 pub fn state_dir(id: &JobId) -> String {
@@ -40,7 +40,7 @@ pub fn state_dir(id: &JobId) -> String {
 }
 
 /// Parent of every job's state directory.
-pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs";
+pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
     match job.mode {
@@ -61,7 +61,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
     // The cwd is encoded for the same reason the command is: it is user input
     // crossing the same four expansion layers. Interpolated raw, a path with a
     // space splits into two words and `cd` either fails or -- worse -- succeeds
-    // against the wrong directory. `$HOME` is the one value coop supplies
+    // against the wrong directory. `$HOME` is the one value mule supplies
     // itself, and it must stay unencoded so the remote shell expands it.
     // The cwd is a PATH, not a shell expression, and those two goals conflict:
     // encoding it keeps a space or a `$(...)` from being interpreted, but it
@@ -73,7 +73,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
     // other spelling became a literal directory name that cannot exist: `cd`
     // failed, the `&&` short-circuited, and the job reported rc 1 with an empty
     // log. Measured as broken: `~/`, `~/work`, `$HOME/work`, `${HOME}/work` --
-    // and coop's own config template suggested `~/work`, so following the
+    // and mule's own config template suggested `~/work`, so following the
     // documentation produced a host where nothing ran.
     let cd = match home_relative(cwd) {
         // Nothing after the home directory.
@@ -92,7 +92,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
 
     let shell = match &job.metadata {
         JobMetadata::Managed { workstream } => {
-            let agent = format!("coop-{}", job.id);
+            let agent = format!("mule-{}", job.id);
             match workstream {
                 Some(workstream) => format!(
                     "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh",
@@ -115,12 +115,12 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
         // background `sleep` inside the job session would keep that session
         // alive after a fast command exits. Whichever path finishes first
         // destroys the other session. 124 follows GNU timeout and is distinct
-        // from coop kill's 137. Write 124 only when rc is missing, matching
+        // from mule kill's 137. Write 124 only when rc is missing, matching
         // the job path, so a concurrent kill's 137 is not overwritten.
         let watchdog = format!(
-            "sleep {secs}; if tmux -L {socket} has-session -t coop-{id} 2>/dev/null; then \
+            "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
              if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
-             tmux -L {socket} kill-session -t coop-{id}; fi",
+             tmux -L {socket} kill-session -t mule-{id}; fi",
             socket = host.tmux_socket,
             id = job.id,
             secs = job.max_secs,
@@ -139,7 +139,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
 
     format!(
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
-         tmux -L {} -f /dev/null new-session -d -s coop-{} \
+         tmux -L {} -f /dev/null new-session -d -s mule-{} \
          '{{ {run}; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
                if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
@@ -169,7 +169,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     };
     let shell = match &job.metadata {
         JobMetadata::Managed { workstream } => {
-            let agent = format!("coop-{}", job.id);
+            let agent = format!("mule-{}", job.id);
             match workstream {
                 Some(workstream) => format!(
                     "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh \"$job_dir/cmd\"",
@@ -189,9 +189,9 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
         String::new()
     } else {
         let body = format!(
-            "sleep {secs}; if tmux -L {socket} has-session -t coop-{id} 2>/dev/null; then \
+            "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
              if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
-             tmux -L {socket} kill-session -t coop-{id}; fi",
+             tmux -L {socket} kill-session -t mule-{id}; fi",
             socket = host.tmux_socket,
             id = job.id,
             secs = job.max_secs,
@@ -207,8 +207,8 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     let wrapper = format!(
         "job_dir=$PWD; tmux -L {socket} wait-for tui-{id}; rm -f \"$job_dir/wrapper\"; \
          {watchdog}{cd} && {shell}; rc=$?; \
-         tmux -L {socket} capture-pane -p -J -t coop-{id} > \"$job_dir/screen\" 2>/dev/null || :; \
-         tmux -L {socket} pipe-pane -t coop-{id}; \
+         tmux -L {socket} capture-pane -p -J -t mule-{id} > \"$job_dir/screen\" 2>/dev/null || :; \
+         tmux -L {socket} pipe-pane -t mule-{id}; \
          while [ ! -f \"$job_dir/.pipe-done\" ]; do sleep 0.01; done; \
          rm -f \"$job_dir/.pipe-done\"; \
          tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
@@ -227,13 +227,13 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
         "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
          printf %s {wrapper} | base64 -d > {dir}/wrapper && \
          printf %s {consumer} | base64 -d > {dir}/pipe && echo tui > {dir}/mode && \
-         tmux -L {socket} -f /dev/null new-session -d -s coop-{id} -c {dir} \
+         tmux -L {socket} -f /dev/null new-session -d -s mule-{id} -c {dir} \
            \"sh ./wrapper\" && \
          {{ tmux -L {socket} set-option -g extended-keys on 2>/dev/null && \
             tmux -L {socket} set-option -g extended-keys-format csi-u 2>/dev/null || \
-            {{ tmux -L {socket} kill-session -t coop-{id} 2>/dev/null; \
-               echo 'coop: tmux 3.2 or newer is required for --tui' >&2; false; }}; }} && \
-         tmux -L {socket} pipe-pane -O -t coop-{id} \"cd {dir} && sh ./pipe\" && \
+            {{ tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
+               echo 'mule: tmux 3.2 or newer is required for --tui' >&2; false; }}; }} && \
+         tmux -L {socket} pipe-pane -O -t mule-{id} \"cd {dir} && sh ./pipe\" && \
          tmux -L {socket} wait-for -S tui-{id}",
         socket = host.tmux_socket,
         id = job.id,
@@ -290,7 +290,7 @@ pub fn encode_command(input: &[u8]) -> String {
 ///
 /// Every verb takes an id from the command line and interpolates it into a
 /// remote path, a tmux target, and a shell script. Unvalidated, that is command
-/// injection: `coop poll 'x$(touch /tmp/pwn)y'` reached the remote shell as
+/// injection: `mule poll 'x$(touch /tmp/pwn)y'` reached the remote shell as
 /// syntax and would have executed. Parsing at the boundary makes the unsafe
 /// value unrepresentable rather than relying on every call site to quote.
 ///
@@ -314,7 +314,7 @@ impl std::str::FromStr for JobId {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
         if !ok {
             anyhow::bail!(
-                "invalid job id {raw:?}: expected {ID_HEX_LEN} lowercase hex digits, as printed by `coop run`"
+                "invalid job id {raw:?}: expected {ID_HEX_LEN} lowercase hex digits, as printed by `mule run`"
             );
         }
         Ok(Self(raw.to_string()))

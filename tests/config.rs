@@ -1,11 +1,11 @@
 //! Config loading: a hand-edited TOML file, and the host-name-derived defaults
 //! that make a minimal entry two lines.
 
-use coop::config::Config;
+use mule::config::Config;
 
 /// A temp dir unique to this test binary run, so concurrent runs cannot collide.
 fn tmp(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("coop-cfg-{}-{tag}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("mule-cfg-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -32,14 +32,14 @@ fn minimal_host_entry_gets_defaults() {
     let h = c.host(Some("bubba")).unwrap();
 
     assert_eq!(h.target, "bubba");
-    assert_eq!(h.tmux_socket, "coop");
+    assert_eq!(h.tmux_socket, "mule");
     assert_eq!(h.max_running, 4);
     assert_eq!(h.keep_days, 14);
     assert_eq!(h.max_job_secs, 0);
     assert_eq!(h.default_cwd, None);
 
     let sock = h.socket.to_string_lossy();
-    assert!(sock.ends_with(".ssh/coop/bubba.sock"), "got {sock}");
+    assert!(sock.ends_with(".ssh/mule/bubba.sock"), "got {sock}");
     // `~` must be expanded at load time: it reaches ssh -S as a real path, and
     // ssh does not expand it for us.
     assert!(!sock.starts_with('~'), "~ must be expanded, got {sock}");
@@ -116,7 +116,7 @@ fn unknown_host_names_the_choices_too() {
 
 #[test]
 fn hosts_are_listed_in_a_stable_order() {
-    // `coop host list` output should not reshuffle between invocations.
+    // `mule host list` output should not reshuffle between invocations.
     let p = write_config("order", "[hosts.zed]\n[hosts.alpha]\n[hosts.mid]\n");
     let c = Config::load(&p).unwrap();
     let names: Vec<_> = c.hosts().iter().map(|h| h.name.as_str()).collect();
@@ -146,7 +146,7 @@ fn a_hostile_tmux_socket_is_rejected() {
     // syntax here would be command injection from a config file. tmux socket
     // names are a filename component, so the restriction costs nothing real.
     for hostile in [
-        "coop; touch /tmp/PWNED",
+        "mule; touch /tmp/PWNED",
         "$(id)",
         "`id`",
         "a b",
@@ -170,7 +170,7 @@ fn a_hostile_tmux_socket_is_rejected() {
 
 #[test]
 fn ordinary_tmux_socket_names_are_accepted() {
-    for ok in ["coop", "coop-test-123", "coop_2", "coop.alt"] {
+    for ok in ["mule", "mule-test-123", "mule_2", "mule.alt"] {
         let body = format!("[hosts.dev]\ntmux_socket = \"{ok}\"\n");
         assert_eq!(
             Config::parse(&body)
@@ -190,17 +190,17 @@ fn seeding_writes_a_template_and_never_clobbers() {
     std::fs::remove_file(&p).ok();
 
     assert!(
-        coop::config::seed(&p).unwrap(),
+        mule::config::seed(&p).unwrap(),
         "should create on first call"
     );
     assert!(
-        !coop::config::seed(&p).unwrap(),
+        !mule::config::seed(&p).unwrap(),
         "must not report a second create"
     );
 
     // Idempotent and non-destructive: a real config must survive a stray seed.
     std::fs::write(&p, "[hosts.mine]\n").unwrap();
-    assert!(!coop::config::seed(&p).unwrap());
+    assert!(!mule::config::seed(&p).unwrap());
     assert_eq!(std::fs::read_to_string(&p).unwrap(), "[hosts.mine]\n");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -210,16 +210,16 @@ fn seeding_writes_a_template_and_never_clobbers() {
 fn seeding_creates_missing_parent_directories() {
     let dir = tmp("seed-deep");
     let p = dir.join("nested").join("deeper").join("config.toml");
-    assert!(coop::config::seed(&p).unwrap());
+    assert!(mule::config::seed(&p).unwrap());
     assert!(p.exists());
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn the_template_is_a_valid_but_empty_config() {
-    // As written it configures nothing, so coop still says "no hosts" rather
+    // As written it configures nothing, so mule still says "no hosts" rather
     // than inventing a host that does not exist.
-    let err = chain(Config::parse(coop::config::TEMPLATE).unwrap_err());
+    let err = chain(Config::parse(mule::config::TEMPLATE).unwrap_err());
     assert!(err.contains("no hosts"), "{err}");
 }
 
@@ -228,7 +228,7 @@ fn the_template_parses_once_uncommented() {
     // A template that produces a broken config is worse than no template. An
     // earlier draft had two `[hosts.build]` blocks, so following the
     // instructions literally gave `duplicate key` -- caught only by doing it.
-    let uncommented: String = coop::config::TEMPLATE
+    let uncommented: String = mule::config::TEMPLATE
         .lines()
         .filter_map(|line| line.strip_prefix("# "))
         // Keep only the config lines, dropping prose and the shell example
@@ -247,7 +247,7 @@ fn the_template_parses_once_uncommented() {
         .unwrap_or_else(|e| panic!("uncommented template must parse: {e:#}\n{uncommented}"));
     let host = cfg.host(Some("build")).unwrap();
     assert_eq!(host.target, "build");
-    assert_eq!(host.tmux_socket, "coop");
+    assert_eq!(host.tmux_socket, "mule");
     assert_eq!(host.max_running, 4);
     assert_eq!(host.keep_days, 14);
     assert_eq!(host.default_cwd.as_deref(), Some("~/work"));
@@ -257,11 +257,11 @@ fn the_template_parses_once_uncommented() {
 fn a_host_name_cannot_escape_the_state_tree() {
     // TOML allows a quoted key, so a host section name is arbitrary text --
     // and that name is appended to two paths: `{host}.lock` under the state
-    // dir (src/lock.rs) and the default `~/.ssh/coop/{host}.sock`. Measured
-    // before this validation existed: `[hosts."../../../../tmp/coop-escape"]`
+    // dir (src/lock.rs) and the default `~/.ssh/mule/{host}.sock`. Measured
+    // before this validation existed: `[hosts."../../../../tmp/mule-escape"]`
     // parsed happily and `host list` printed
-    // `/Users/me/.ssh/coop/../../../../tmp/coop-escape.sock`, i.e. a socket and
-    // a lock outside the directory coop owns. A `/` in the name nests instead,
+    // `/Users/me/.ssh/mule/../../../../tmp/mule-escape.sock`, i.e. a socket and
+    // a lock outside the directory mule owns. A `/` in the name nests instead,
     // so the lock lands somewhere `create_dir_all` may not reach and two hosts
     // can collide on one lock -- which silently breaks the per-host
     // serialisation the whole fairness gate rests on.

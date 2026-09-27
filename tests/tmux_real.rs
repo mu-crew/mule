@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use coop::config::Host;
-use coop::wrapper::{Job, JobMode, dispatch_script};
+use mule::config::Host;
+use mule::wrapper::{Job, JobMode, dispatch_script};
 
 struct TmuxServer {
     socket: String,
@@ -32,8 +32,8 @@ impl TmuxServer {
         // parallel threads, so a pid-only name gave every test the same server
         // and the second `keeper` session failed as a duplicate. The nanosecond
         // suffix is already unique, so reuse it.
-        let socket = format!("coop-test-{suffix}");
-        let root = std::env::temp_dir().join(format!("coop-test-state-{suffix}"));
+        let socket = format!("mule-test-{suffix}");
+        let root = std::env::temp_dir().join(format!("mule-test-state-{suffix}"));
         fs::create_dir_all(&root).unwrap();
 
         let status = Command::new("tmux")
@@ -97,11 +97,11 @@ impl TmuxServer {
             cmd: command.into(),
             cwd: cwd.map(str::to_owned),
             max_secs: 0,
-            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
             mode: JobMode::Pipe,
         };
         let script = dispatch_script(&host, &job).replace(
-            &format!("{}/{id}", coop::wrapper::JOBS_ROOT),
+            &format!("{}/{id}", mule::wrapper::JOBS_ROOT),
             &self.root.join(id).display().to_string(),
         );
         let status = Command::new("sh")
@@ -137,11 +137,11 @@ impl TmuxServer {
             cmd: command.into(),
             cwd: None,
             max_secs: 0,
-            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
+            metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
             mode: JobMode::Tui,
         };
         let script = dispatch_script(&host, &job).replace(
-            &format!("{}/{id}", coop::wrapper::JOBS_ROOT),
+            &format!("{}/{id}", mule::wrapper::JOBS_ROOT),
             &self.root.join(id).display().to_string(),
         );
         let output = Command::new("sh").args(["-c", &script]).output().unwrap();
@@ -162,7 +162,7 @@ impl TmuxServer {
                     &self.socket,
                     "has-session",
                     "-t",
-                    &format!("coop-{id}"),
+                    &format!("mule-{id}"),
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -259,7 +259,7 @@ fn tui_wrapper_keeps_all_streams_on_the_pty_and_captures_early_output_and_input(
                 "capture-pane",
                 "-p",
                 "-t",
-                &format!("coop-{id}"),
+                &format!("mule-{id}"),
             ])
             .output()
             .unwrap();
@@ -278,7 +278,7 @@ fn tui_wrapper_keeps_all_streams_on_the_pty_and_captures_early_output_and_input(
             &server.socket,
             "send-keys",
             "-t",
-            &format!("coop-{id}"),
+            &format!("mule-{id}"),
             "hello",
             "Enter",
         ])
@@ -304,7 +304,7 @@ fn tui_transcript_cap_drains_without_killing_the_process() {
     let id = "000098";
     let dir = server.start_tui(
         id,
-        "i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i+1)); done; printf survived > \"$HOME/coop-tui-survived-000098\"; exit 4",
+        "i=0; while [ $i -lt 4000 ]; do printf 0123456789; i=$((i+1)); done; printf survived > \"$HOME/mule-tui-survived-000098\"; exit 4",
         1024,
     );
     server.wait_done(id);
@@ -314,11 +314,11 @@ fn tui_transcript_cap_drains_without_killing_the_process() {
     assert!(dir.join("truncated").exists());
     assert!(
         std::path::Path::new(&std::env::var("HOME").unwrap())
-            .join("coop-tui-survived-000098")
+            .join("mule-tui-survived-000098")
             .exists()
     );
     fs::remove_file(
-        std::path::Path::new(&std::env::var("HOME").unwrap()).join("coop-tui-survived-000098"),
+        std::path::Path::new(&std::env::var("HOME").unwrap()).join("mule-tui-survived-000098"),
     )
     .ok();
 }
@@ -351,7 +351,7 @@ fn generated_wrapper_runs_jobs_on_a_real_private_tmux_server() {
     let bad_cwd = server.run(
         "000004",
         "echo this-must-not-run",
-        Some("/coop/nonexistent/directory"),
+        Some("/mule/nonexistent/directory"),
     );
     assert_ne!(read(bad_cwd.join("rc")).trim(), "0");
     assert!(
@@ -435,16 +435,16 @@ fn home_relative_cwds_actually_land_in_the_home_directory() {
 
     // A home-relative SUB-path, including one with a space: expansion and
     // quoting must both hold at once.
-    let spaced = std::path::Path::new(&home).join("coop test dir");
+    let spaced = std::path::Path::new(&home).join("mule test dir");
     fs::create_dir_all(&spaced).unwrap();
-    for (i, cwd) in ["~/coop test dir", "$HOME/coop test dir"]
+    for (i, cwd) in ["~/mule test dir", "$HOME/mule test dir"]
         .iter()
         .enumerate()
     {
         let dir = server.run(&format!("00003{i}"), "pwd", Some(cwd));
         assert_eq!(read(dir.join("rc")).trim(), "0", "cwd {cwd:?} failed");
         assert!(
-            read(dir.join("log")).trim().ends_with("/coop test dir"),
+            read(dir.join("log")).trim().ends_with("/mule test dir"),
             "cwd {cwd:?} must land in the spaced sub-directory"
         );
     }
