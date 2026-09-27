@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — 2026-09-27
+
+First release on npm: `npm i -g @mu-crew/mule` installs a prebuilt binary for
+Linux x64, Linux arm64 and macOS arm64. `cargo install mule-cli` still works.
+
+**Jobs over ~12KB of script dispatch again.** The job's script was inlined
+into the tmux `new-session` command, which tmux rejects past ~16KB with
+"command too long". The job now reads its script from the `cmd` file written
+before tmux starts. Measured with a 54KB script.
+
+## 0.2.0 — 2026-09-27
 
 **Breaking:** `coop` is now `mule`. Before upgrading, stop all running jobs,
 then move the config with `mv ~/.config/coop ~/.config/mule`. Reopen the SSH

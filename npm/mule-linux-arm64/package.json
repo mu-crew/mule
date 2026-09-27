@@ -1,6 +1,6 @@
 {
   "name": "@mu-crew/mule-linux-arm64",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "mule binary for Linux arm64",
   "license": "MIT",
   "repository": "github:mu-crew/mule",
