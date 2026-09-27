@@ -1,4 +1,4 @@
-//! Fair, per-host serialization for access to coop's private ssh channel.
+//! Fair, per-host serialization for access to mule's private ssh channel.
 
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -35,7 +35,7 @@ pub fn lock_path(host: &str) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".local/state")))
         .unwrap_or_else(|| PathBuf::from(".local/state"));
-    state.join("coop").join(format!("{host}.lock"))
+    state.join("mule").join(format!("{host}.lock"))
 }
 
 /// Run `f` while holding the fair lock for `host`.
@@ -127,7 +127,7 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
             let serving = read_counter(&path.join("serving")).unwrap_or(ticket);
             let holder = read_pid(&path.join("holder")).ok().flatten();
             eprintln!(
-                "coop: waiting for lock ticket {ticket} ({} ahead, holder pid {})",
+                "mule: waiting for lock ticket {ticket} ({} ahead, holder pid {})",
                 ticket.saturating_sub(serving),
                 holder.map_or_else(|| "unknown".into(), |pid| pid.to_string())
             );
@@ -149,7 +149,7 @@ impl Drop for HeldLock {
             write_counter(&self.path.join("serving"), serving + 1)
         });
         if let Err(error) = result {
-            eprintln!("coop: could not release lock: {error:#}");
+            eprintln!("mule: could not release lock: {error:#}");
         }
     }
 }

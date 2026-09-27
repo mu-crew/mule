@@ -2,7 +2,7 @@
 //!
 //! This reverses an early instinct to copy murmur's `peers` table. murmur's
 //! peers carry *discovered* state (snapshots, `fetched_at`, `last_error`),
-//! which is why they need a store. coop's hosts are pure user intent, so a
+//! which is why they need a store. mule's hosts are pure user intent, so a
 //! file is editable, diffable, and needs no migration story.
 
 use std::collections::BTreeMap;
@@ -28,13 +28,13 @@ const DEFAULT_KEEP_DAYS: u32 = 14;
 const DEFAULT_MAX_LOG_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Jobs are unbounded unless the host or caller opts into a limit. A six-hour
-/// build is legitimate work, and an arbitrary default would make coop the
+/// build is legitimate work, and an arbitrary default would make mule the
 /// process that unexpectedly kills it.
 const DEFAULT_MAX_JOB_SECS: u64 = 0;
 
-/// The private tmux server name. Jobs run under `tmux -L coop`, which does not
+/// The private tmux server name. Jobs run under `tmux -L mule`, which does not
 /// appear in the user's `tmux ls`.
-const DEFAULT_TMUX_SOCKET: &str = "coop";
+const DEFAULT_TMUX_SOCKET: &str = "mule";
 
 /// A configured host, after name-derived defaults have been applied.
 ///
@@ -47,7 +47,7 @@ pub struct Host {
     pub name: String,
     /// The ssh target. Defaults to `name`.
     pub target: String,
-    /// coop's *private* `ControlPath`. Everything else on the machine uses the
+    /// mule's *private* `ControlPath`. Everything else on the machine uses the
     /// default `~/.ssh/control/...` and so cannot contend with it.
     pub socket: PathBuf,
     /// `tmux -L <this>`: a private server, invisible to the user's `tmux ls`.
@@ -82,7 +82,7 @@ struct RawHost {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    /// `BTreeMap` rather than `HashMap` so `coop host list` does not reshuffle
+    /// `BTreeMap` rather than `HashMap` so `mule host list` does not reshuffle
     /// between invocations.
     #[serde(default)]
     hosts: BTreeMap<String, RawHost>,
@@ -128,22 +128,22 @@ fn expand_tilde(raw: &str) -> Result<PathBuf> {
     Ok(home.join(rest.trim_start_matches('/')))
 }
 
-/// Where the config lives: `~/.config/coop/config.toml`.
-/// Written to the config path the first time coop runs without one.
+/// Where the config lives: `~/.config/mule/config.toml`.
+/// Written to the config path the first time mule runs without one.
 ///
 /// Every host is commented out, so the file is a prompt rather than a guess:
-/// coop cannot know a host name, and inventing one would produce confusing
+/// mule cannot know a host name, and inventing one would produce confusing
 /// failures against a target that does not exist.
 pub const TEMPLATE: &str = "\
-# coop hosts. Uncomment and edit -- the section name is what you pass to --host.
+# mule hosts. Uncomment and edit -- the section name is what you pass to --host.
 #
 # One block per host. `target` is the only key worth setting by hand; every
 # other line below shows its default and can stay commented out.
 #
 # [hosts.build]
 # target      = \"build\"                    # ssh target (default: section name)
-# socket      = \"~/.ssh/coop/build.sock\"   # coop's own ControlPath
-# tmux_socket = \"coop\"                     # private tmux server
+# socket      = \"~/.ssh/mule/build.sock\"   # mule's own ControlPath
+# tmux_socket = \"mule\"                     # private tmux server
 # max_running = 4                          # warn past this; not a queue
 # default_cwd = \"~/work\"                   # where `run` starts, unless --cwd
 # keep_days   = 14                         # prune finished jobs older than this
@@ -151,15 +151,15 @@ pub const TEMPLATE: &str = "\
 # max_job_secs = 0                         # remote runtime cap; 0 is unbounded
 #
 # Then open the control master, once per ControlPersist window. This may ask
-# you to touch a hardware key; coop cannot do it for you:
+# you to touch a hardware key; mule cannot do it for you:
 #
-#   ssh -MNf -S ~/.ssh/coop/build.sock -o ControlPersist=8h build
+#   ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
 ";
 
 /// Write [`TEMPLATE`] to `path` unless something is already there.
 ///
 /// Returns whether it created the file. Uses `create_new`, so a race with
-/// another coop process cannot clobber a real config.
+/// another mule process cannot clobber a real config.
 pub fn seed(path: &Path) -> Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -185,12 +185,12 @@ pub fn default_path() -> Result<PathBuf> {
     let dirs =
         directories::BaseDirs::new().ok_or_else(|| anyhow!("cannot locate a home directory"))?;
     // `config_dir()` is `~/Library/Application Support` on macOS, which is not
-    // where a hand-edited dotfile belongs. coop is a terminal tool, so it uses
+    // where a hand-edited dotfile belongs. mule is a terminal tool, so it uses
     // the XDG layout on every platform and stays greppable.
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs.home_dir().join(".config"));
-    Ok(base.join("coop").join("config.toml"))
+    Ok(base.join("mule").join("config.toml"))
 }
 
 impl Config {
@@ -217,10 +217,10 @@ impl Config {
             .map(|(name, h)| {
                 // The section name is not just a label: it is appended to
                 // `{host}.lock` under the state dir and to the default
-                // `~/.ssh/coop/{host}.sock`. TOML allows a quoted key, so
+                // `~/.ssh/mule/{host}.sock`. TOML allows a quoted key, so
                 // without this a name is arbitrary text reaching two paths.
-                // Measured: `[hosts."../../../../tmp/coop-escape"]` parsed and
-                // produced a socket outside the directory coop owns, and a `/`
+                // Measured: `[hosts."../../../../tmp/mule-escape"]` parsed and
+                // produced a socket outside the directory mule owns, and a `/`
                 // nests the lock somewhere `create_dir_all` may not reach --
                 // which lets two hosts share one lock and silently breaks the
                 // per-host serialisation the fairness gate depends on.
@@ -249,7 +249,7 @@ impl Config {
                 }
                 let socket = match h.socket {
                     Some(s) => expand_tilde(&s)?,
-                    None => expand_tilde(&format!("~/.ssh/coop/{name}.sock"))?,
+                    None => expand_tilde(&format!("~/.ssh/mule/{name}.sock"))?,
                 };
                 Ok(Host {
                     target: h.target.unwrap_or_else(|| name.clone()),

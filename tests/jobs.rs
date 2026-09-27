@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use coop::config::{Config, Host};
-use coop::jobs::{decode_command, kill, list, list_with_hidden, prune};
-use coop::probe::State;
-use coop::transport::{Fake, Output, Transport};
+use mule::config::{Config, Host};
+use mule::jobs::{decode_command, kill, list, list_with_hidden, prune};
+use mule::probe::State;
+use mule::transport::{Fake, Output, Transport};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -14,7 +14,7 @@ fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mule-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
     });
@@ -25,8 +25,8 @@ fn host() -> Host {
     Host {
         name: format!("jobs-test-{}", std::process::id()),
         target: "dev".into(),
-        socket: PathBuf::from("/tmp/coop.sock"),
-        tmux_socket: "coop".into(),
+        socket: PathBuf::from("/tmp/mule.sock"),
+        tmux_socket: "mule".into(),
         max_running: 4,
         default_cwd: None,
         keep_days: 14,
@@ -38,7 +38,7 @@ fn host() -> Host {
 #[test]
 fn ls_json_is_stable_for_every_job_state() {
     let dir = std::env::temp_dir().join(format!(
-        "coop-jobs-json-{}-{}",
+        "mule-jobs-json-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -49,7 +49,7 @@ fn ls_json_is_stable_for_every_job_state() {
     let config = dir.join("config.toml");
     std::fs::write(
         &config,
-        "[hosts.dev]\ntarget = \"dev\"\nsocket = \"/tmp/coop.sock\"\n",
+        "[hosts.dev]\ntarget = \"dev\"\nsocket = \"/tmp/mule.sock\"\n",
     )
     .unwrap();
     let ssh = dir.join("ssh");
@@ -61,7 +61,7 @@ fn ls_json_is_stable_for_every_job_state() {
     #[cfg(unix)]
     std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["ls", "--json"])
@@ -91,7 +91,7 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
          def456\t34\t9\t9\t0\tZmFsc2U=\n\
          fed987\t56\t\t\t0\tdHJ1ZQ==\n",
     ));
-    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
+    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/mule.sock\"\n").unwrap();
 
     let (rows, unreachable) = list(&cfg, &fake, None, false).unwrap();
 
@@ -125,7 +125,7 @@ fn command_codec_round_trips_protocol_values() {
     ];
 
     for value in values {
-        let encoded = coop::wrapper::encode_command(value);
+        let encoded = mule::wrapper::encode_command(value);
         assert_eq!(decode_command(&encoded).unwrap(), *value);
     }
 }
@@ -144,18 +144,18 @@ fn command_decoder_rejects_malformed_input() {
 fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
     let fake = Fake::new();
     fake.push(Output::ok(""));
-    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
+    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/mule.sock\"\n").unwrap();
     list(&cfg, &fake, None, true).unwrap();
     let script = fake.scripts().pop().unwrap();
 
     // The listing runs inside the ticket lock, so its duration is a channel
-    // outage for every other coop call. The original script forked four
+    // outage for every other mule call. The original script forked four
     // processes per job and measured 14.1s at 300 jobs. The current script
     // measured 0.13s for 300 jobs, a 108x improvement. Execute the real script
     // over 300 directories with PATH shims that count every external process;
     // unlike a wall-clock bound, this asserts the shape regardless of load.
     let dir = std::env::temp_dir().join(format!(
-        "coop-list-processes-{}-{}",
+        "mule-list-processes-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -195,7 +195,7 @@ fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
         }
     }
     let script = script.replace(
-        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs",
+        "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs",
         jobs.to_str().unwrap(),
     );
     let out = std::process::Command::new("sh")
@@ -222,7 +222,7 @@ fn listing_uses_a_fixed_number_of_processes_for_hundreds_of_jobs() {
 #[test]
 fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
     isolate_state();
-    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/coop.sock\"\n").unwrap();
+    let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/mule.sock\"\n").unwrap();
     let week = 7 * 24 * 60 * 60;
 
     // A week-old job in each state.

@@ -1,14 +1,14 @@
 use std::io::Cursor;
 
-use coop::config::{Config, Host};
-use coop::errors::{CoopError, EXIT_DROPPED, EXIT_ORPHAN, EXIT_TIMEOUT, exit_code};
-use coop::tail::{Selection, follow, follow_deferred, once, once_mode_aware};
-use coop::transport::{Fake, Output};
+use mule::config::{Config, Host};
+use mule::errors::{EXIT_DROPPED, EXIT_ORPHAN, EXIT_TIMEOUT, MuleError, exit_code};
+use mule::tail::{Selection, follow, follow_deferred, once, once_mode_aware};
+use mule::transport::{Fake, Output};
 
 /// Point the lock directory at a temp dir for the whole test binary.
 ///
 /// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes
-/// lock directories into the developer's real `~/.local/state/coop`, mixed in
+/// lock directories into the developer's real `~/.local/state/mule`, mixed in
 /// with live job state.
 ///
 /// `set_var` is safe here because it runs once, before any thread reads it.
@@ -16,7 +16,7 @@ fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mule-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
     });
@@ -24,7 +24,7 @@ fn isolate_state() {
 
 fn host() -> Host {
     isolate_state();
-    Config::parse("[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/coop.sock\"\n")
+    Config::parse("[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/mule.sock\"\n")
         .unwrap()
         .host(None)
         .unwrap()
@@ -83,8 +83,8 @@ fn follow_reports_an_orphan_instead_of_inventing_an_exit_code() {
     let error = follow(&fake, &host(), &"dead42".parse().unwrap(), 0, &mut out).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<CoopError>(),
-        Some(CoopError::Orphan { id }) if id == "dead42"
+        error.downcast_ref::<MuleError>(),
+        Some(MuleError::Orphan { id }) if id == "dead42"
     ));
     assert_eq!(exit_code(&error), EXIT_ORPHAN);
     assert_eq!(out.into_inner(), b"last");
@@ -101,11 +101,11 @@ fn follow_names_the_resume_command_after_a_connection_error() {
     let error = follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<CoopError>(),
-        Some(CoopError::Dropped { id }) if id == "abc123"
+        error.downcast_ref::<MuleError>(),
+        Some(MuleError::Dropped { id }) if id == "abc123"
     ));
     assert_eq!(exit_code(&error), EXIT_DROPPED);
-    assert!(error.to_string().contains("coop tail abc123"));
+    assert!(error.to_string().contains("mule tail abc123"));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn tui_tail_selects_running_screen_saved_screen_and_explicit_transcript() {
             false,
             Selection::All,
             b"saved screen".as_slice(),
-            "cat ${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs/abc123/screen",
+            "cat ${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs/abc123/screen",
         ),
         (
             Output::ok(b"raw\x1f"),
@@ -220,7 +220,7 @@ fn a_job_that_finishes_within_one_probe_still_prints_its_output() {
     // land while the log's last bytes are still in flight -- measured, with the
     // log file not yet created. Returning on the first `Done` therefore dropped
     // the output of any job short enough to finish inside one probe interval,
-    // which is most of them: `coop run --wait ls` printed the id and nothing.
+    // which is most of them: `mule run --wait ls` printed the id and nothing.
     isolate_state();
     let fake = Fake::new();
     // First probe: already done, and no bytes yet.
@@ -231,7 +231,7 @@ fn a_job_that_finishes_within_one_probe_still_prints_its_output() {
     ));
 
     let mut out = Vec::new();
-    let code = coop::tail::follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
+    let code = mule::tail::follow(&fake, &host(), &"abc123".parse().unwrap(), 0, &mut out).unwrap();
 
     assert_eq!(code, 0);
     assert_eq!(
@@ -249,11 +249,11 @@ fn a_zero_timeout_returns_a_typed_timeout_after_one_state_probe() {
     fake.push(reply("rc=\nalive=1", 0, b""));
     let id = "abc123".parse().unwrap();
 
-    let error = coop::tail::wait_only(&fake, &host(), &id, Some(0)).unwrap_err();
+    let error = mule::tail::wait_only(&fake, &host(), &id, Some(0)).unwrap_err();
 
     assert!(matches!(
-        error.downcast_ref::<CoopError>(),
-        Some(CoopError::Timeout { id }) if id == "abc123"
+        error.downcast_ref::<MuleError>(),
+        Some(MuleError::Timeout { id }) if id == "abc123"
     ));
     assert_eq!(exit_code(&error), EXIT_TIMEOUT);
     assert_eq!(fake.scripts().len(), 1);
@@ -267,7 +267,7 @@ fn a_plain_wait_does_not_pay_for_the_terminal_read() {
     let fake = Fake::new();
     fake.push(Output::ok("exists=1\nrc=2\nalive=0\nsize=0\nbytes:\n"));
 
-    let code = coop::tail::wait_only(&fake, &host(), &"abc123".parse().unwrap(), None).unwrap();
+    let code = mule::tail::wait_only(&fake, &host(), &"abc123".parse().unwrap(), None).unwrap();
 
     assert_eq!(code, 2);
     assert_eq!(fake.scripts().len(), 1, "no terminal read when not tailing");

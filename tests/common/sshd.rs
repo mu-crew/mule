@@ -1,6 +1,6 @@
 //! A throwaway `sshd` with `MaxSessions 1`, on loopback.
 //!
-//! Test layer 3. Every invariant coop exists for is a property of a
+//! Test layer 3. Every invariant mule exists for is a property of a
 //! session-capped ssh connection, and the original design notes concluded none
 //! of it was reachable without a real capped host. That was wrong: a non-root
 //! `sshd` on an ephemeral port reproduces the contention exactly, including the
@@ -24,12 +24,12 @@ use std::process::{Command, Stdio};
 /// Where the real `sshd` lives. Not on `PATH` for a non-root user on macOS.
 const SSHD: &str = "/usr/sbin/sshd";
 
-/// A running `sshd`, its key material, and a `PATH` shim so coop's `ssh` calls
+/// A running `sshd`, its key material, and a `PATH` shim so mule's `ssh` calls
 /// reach it.
 pub struct Sshd {
     pub dir: PathBuf,
     pub port: u16,
-    /// coop's private `ControlPath`, once [`Sshd::open_master`] has run.
+    /// mule's private `ControlPath`, once [`Sshd::open_master`] has run.
     pub socket: PathBuf,
     pub state_root: PathBuf,
     pid: Option<u32>,
@@ -95,7 +95,7 @@ impl Sshd {
         assert!(unavailable().is_none(), "checked by the caller");
 
         let dir =
-            std::env::temp_dir().join(format!("coop-sshd-{}-{}", std::process::id(), next_seq()));
+            std::env::temp_dir().join(format!("mule-sshd-{}-{}", std::process::id(), next_seq()));
         std::fs::create_dir_all(&dir).unwrap();
         let port = free_port();
 
@@ -144,8 +144,8 @@ impl Sshd {
             .arg("-E")
             .arg(dir.join("sshd.log")));
 
-        // An `ssh` shim on PATH, so coop's own `Command::new("ssh")` reaches
-        // this daemon with the right key and port. coop must not learn about
+        // An `ssh` shim on PATH, so mule's own `Command::new("ssh")` reaches
+        // this daemon with the right key and port. mule must not learn about
         // test ports.
         let shim = dir.join("ssh");
         {
@@ -164,7 +164,7 @@ impl Sshd {
         run(Command::new("chmod").arg("755").arg(&shim));
 
         let mut sshd = Self {
-            socket: dir.join("coop.sock"),
+            socket: dir.join("mule.sock"),
             state_root: dir.join("state"),
             dir,
             port,
@@ -193,7 +193,7 @@ impl Sshd {
         }
     }
 
-    /// `PATH` with the shim first, for spawning coop.
+    /// `PATH` with the shim first, for spawning mule.
     pub fn path_env(&self) -> String {
         format!(
             "{}:{}",
@@ -253,7 +253,7 @@ impl Sshd {
             .unwrap_or(false)
     }
 
-    /// A coop config naming this daemon, with a private tmux server.
+    /// A mule config naming this daemon, with a private tmux server.
     pub fn write_config(&self, tmux_socket: &str) -> PathBuf {
         let path = self.dir.join("config.toml");
         std::fs::write(
@@ -270,9 +270,9 @@ impl Sshd {
         path
     }
 
-    /// Run the coop binary under test against this daemon.
-    pub fn coop(&self, config: &Path, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_coop"))
+    /// Run the mule binary under test against this daemon.
+    pub fn mule(&self, config: &Path, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_mule"))
             .arg("--config")
             .arg(config)
             .args(args)
@@ -280,7 +280,7 @@ impl Sshd {
             .env("XDG_STATE_HOME", &self.state_root)
             .stdin(Stdio::null())
             .output()
-            .expect("coop failed to spawn")
+            .expect("mule failed to spawn")
     }
 }
 

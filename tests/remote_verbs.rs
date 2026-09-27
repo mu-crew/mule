@@ -27,7 +27,7 @@ use common::sshd::{Master, Sshd};
 /// A lock rather than per-test isolation because the sharing is real: sshd
 /// derives HOME from the user database and ignores a client-sent override
 /// (verified -- `SetEnv HOME=` has no effect even with `AcceptEnv HOME`), so
-/// there is no way to give each test its own root without teaching coop a test
+/// there is no way to give each test its own root without teaching mule a test
 /// hook, which is worse than a mutex in the test file.
 static GLOBAL_JOBS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -50,10 +50,19 @@ fn shared() -> std::sync::MutexGuard<'static, ()> {
 /// horizon the test is probing, and then the test asserts the opposite of what
 /// it means.
 fn own_stamp(days_ago: u64) -> String {
-    let out = std::process::Command::new("date")
+    let bsd = std::process::Command::new("date")
         .args([&format!("-v-{days_ago}d"), "+%Y%m%d0000"])
         .output()
         .expect("date failed");
+    let out = if bsd.status.success() {
+        bsd
+    } else {
+        std::process::Command::new("date")
+            .args(["-d", &format!("{days_ago} days ago"), "+%Y%m%d0000"])
+            .output()
+            .expect("date failed")
+    };
+    assert!(out.status.success(), "date could not compute an old stamp");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -71,7 +80,7 @@ impl Fixture {
     fn new(tag: &str) -> Self {
         let sshd = Sshd::start();
         let master = sshd.open_master(&sshd.socket);
-        let tmux = format!("coop-rv-{}-{tag}", std::process::id());
+        let tmux = format!("mule-rv-{}-{tag}", std::process::id());
         let config = sshd.write_config(&tmux);
         Self {
             _master: master,
@@ -82,18 +91,18 @@ impl Fixture {
         }
     }
 
-    fn coop(&self, args: &[&str]) -> std::process::Output {
-        self.sshd.coop(&self.config, args)
+    fn mule(&self, args: &[&str]) -> std::process::Output {
+        self.sshd.mule(&self.config, args)
     }
 
     fn out(&self, args: &[&str]) -> String {
-        let o = self.coop(args);
+        let o = self.mule(args);
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
     /// Dispatch and remember the id for cleanup.
     fn run(&mut self, cmd: &str) -> String {
-        let o = self.coop(&["run", cmd]);
+        let o = self.mule(&["run", cmd]);
         assert!(
             o.status.success(),
             "dispatch failed: {}",
@@ -113,7 +122,7 @@ impl Fixture {
     }
 
     fn job_dir(&self, id: &str) -> String {
-        format!("$XDG_STATE_HOME/coop/jobs/{id}")
+        format!("$XDG_STATE_HOME/mule/jobs/{id}")
     }
 
     /// Read a job artifact, or empty when absent.
@@ -163,40 +172,40 @@ fn probe_reports_every_state_from_real_artifacts() {
     // Running: no rc, session alive.
     let running = f.run("sleep 30");
     std::thread::sleep(Duration::from_millis(600));
-    let running_poll = f.coop(&["poll", &running]);
+    let running_poll = f.mule(&["poll", &running]);
     assert_eq!(
         String::from_utf8_lossy(&running_poll.stdout).trim(),
         "running"
     );
     let hint = String::from_utf8_lossy(&running_poll.stderr);
-    assert!(hint.contains(&format!("coop wait {running}")), "{hint}");
-    assert!(hint.contains(&format!("coop tail {running} -f")), "{hint}");
+    assert!(hint.contains(&format!("mule wait {running}")), "{hint}");
+    assert!(hint.contains(&format!("mule tail {running} -f")), "{hint}");
 
     // Done: rc present, and the code is the job's.
     let done = f.run("echo hi; exit 6");
     f.await_done(&done);
-    let done_poll = f.coop(&["poll", &done]);
+    let done_poll = f.mule(&["poll", &done]);
     assert_eq!(String::from_utf8_lossy(&done_poll.stdout).trim(), "6");
     let hint = String::from_utf8_lossy(&done_poll.stderr);
-    assert!(hint.contains(&format!("coop tail {done}")), "{hint}");
-    assert!(hint.contains(&format!("coop rm {done}")), "{hint}");
+    assert!(hint.contains(&format!("mule tail {done}")), "{hint}");
+    assert!(hint.contains(&format!("mule rm {done}")), "{hint}");
 
     // Orphan: no rc, session gone. Kill the tmux session directly, bypassing
-    // `coop kill` so no rc is written.
+    // `mule kill` so no rc is written.
     let orphan = f.run("sleep 30");
     std::thread::sleep(Duration::from_millis(600));
     let _ = f
         .sshd
-        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
-    let orphan_poll = f.coop(&["poll", &orphan]);
+        .ssh(&[&format!("tmux -L {} kill-session -t mule-{orphan}", f.tmux)]);
+    let orphan_poll = f.mule(&["poll", &orphan]);
     assert_eq!(
         String::from_utf8_lossy(&orphan_poll.stdout).trim(),
         "orphan"
     );
     let hint = String::from_utf8_lossy(&orphan_poll.stderr);
     assert!(hint.contains("no exit code will arrive"), "{hint}");
-    assert!(hint.contains(&format!("coop tail {orphan}")), "{hint}");
-    assert!(hint.contains(&format!("coop rm {orphan}")), "{hint}");
+    assert!(hint.contains(&format!("mule tail {orphan}")), "{hint}");
+    assert!(hint.contains(&format!("mule rm {orphan}")), "{hint}");
 
     // rc wins over a live session: a job that finished between the two reads is
     // Done, not Running. Write an rc under a still-alive session to force it.
@@ -210,8 +219,8 @@ fn probe_reports_every_state_from_real_artifacts() {
         "3",
         "rc must take precedence over session presence"
     );
-    let _ = f.coop(&["kill", &racing]);
-    let _ = f.coop(&["kill", &running]);
+    let _ = f.mule(&["kill", &racing]);
+    let _ = f.mule(&["kill", &running]);
 }
 
 #[test]
@@ -231,7 +240,7 @@ fn probe_survives_arbitrary_log_bytes() {
 
     assert_eq!(f.out(&["poll", &id]), "0", "the real rc is 0");
 
-    let tailed = f.coop(&["tail", &id, "--all"]);
+    let tailed = f.mule(&["tail", &id, "--all"]);
     assert!(tailed.status.success());
     let bytes = tailed.stdout;
     assert!(
@@ -257,7 +266,7 @@ fn kill_writes_rc_137_and_destroys_the_session() {
     let id = f.run("sleep 60");
     std::thread::sleep(Duration::from_millis(600));
 
-    let out = f.coop(&["kill", &id]);
+    let out = f.mule(&["kill", &id]);
     assert!(
         out.status.success(),
         "{}",
@@ -269,10 +278,10 @@ fn kill_writes_rc_137_and_destroys_the_session() {
         hint.contains(&format!("killed {id}; now done 137")),
         "{hint}"
     );
-    assert!(hint.contains(&format!("coop rm {id}")), "{hint}");
+    assert!(hint.contains(&format!("mule rm {id}")), "{hint}");
 
     // 137 rather than an absent rc is what earns `orphan` its meaning: an
-    // orphan means "not coop's doing".
+    // orphan means "not mule's doing".
     let deadline = Instant::now() + Duration::from_secs(5);
     while f.artifact(&id, "rc").trim() != "137" {
         assert!(
@@ -285,7 +294,7 @@ fn kill_writes_rc_137_and_destroys_the_session() {
     assert_eq!(f.out(&["poll", &id]), "137");
 
     let session = f.sshd.ssh(&[&format!(
-        "tmux -L {} has-session -t coop-{id} 2>/dev/null",
+        "tmux -L {} has-session -t mule-{id} 2>/dev/null",
         f.tmux
     )]);
     assert!(!session.status.success(), "the session must be gone");
@@ -298,13 +307,13 @@ fn kill_never_overwrites_a_real_exit_code() {
     let mut f = Fixture::new("killrace");
 
     // The job may finish between the decision to kill and the kill itself. The
-    // `[ -f rc ] ||` guard is what stops coop replacing a real exit code with
+    // `[ -f rc ] ||` guard is what stops mule replacing a real exit code with
     // 137 -- losing the actual result of completed work.
     let id = f.run("echo done; exit 5");
     f.await_done(&id);
     assert_eq!(f.artifact(&id, "rc").trim(), "5");
 
-    let out = f.coop(&["kill", &id]);
+    let out = f.mule(&["kill", &id]);
     assert!(
         out.status.success(),
         "kill of a finished job must succeed: {}",
@@ -348,7 +357,7 @@ fn ls_enumerates_real_jobs_with_their_commands() {
         "lock files are not jobs: {listing}"
     );
 
-    let _ = f.coop(&["kill", &running]);
+    let _ = f.mule(&["kill", &running]);
 }
 
 #[test]
@@ -365,7 +374,7 @@ fn ls_and_poll_report_runtime_from_real_artifact_mtimes() {
     std::thread::sleep(Duration::from_millis(600));
     let _ = f
         .sshd
-        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
+        .ssh(&[&format!("tmux -L {} kill-session -t mule-{orphan}", f.tmux)]);
 
     let listing = f.out(&["ls", "--all"]);
     let header = listing.lines().next().unwrap_or_default();
@@ -408,7 +417,7 @@ fn ls_and_poll_report_runtime_from_real_artifact_mtimes() {
             None => assert!(poll["runtime_secs"].is_null(), "{poll}"),
         }
     }
-    let running_poll = f.coop(&["poll", &running]);
+    let running_poll = f.mule(&["poll", &running]);
     assert_eq!(
         String::from_utf8_lossy(&running_poll.stdout).trim(),
         "running"
@@ -419,7 +428,7 @@ fn ls_and_poll_report_runtime_from_real_artifact_mtimes() {
         String::from_utf8_lossy(&running_poll.stderr)
     );
 
-    let _ = f.coop(&["kill", &running]);
+    let _ = f.mule(&["kill", &running]);
 }
 
 #[test]
@@ -440,8 +449,8 @@ fn tail_reads_offsets_and_caps_against_a_real_log() {
     // read happens while holding the single channel and the ticket lock.
     let big = f.run("i=0; while [ $i -lt 3000 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done");
     f.await_done(&big);
-    let full = f.coop(&["tail", &big, "--all"]).stdout.len();
-    let capped = f.coop(&["tail", &big]).stdout.len();
+    let full = f.mule(&["tail", &big, "--all"]).stdout.len();
+    let capped = f.mule(&["tail", &big]).stdout.len();
     assert!(full > 65536, "expected a log past the cap, got {full}");
     assert_eq!(capped, 65536, "default tail must cap the read");
 }
@@ -461,7 +470,7 @@ fn prune_removes_finished_jobs_and_spares_running_and_orphans() {
     std::thread::sleep(Duration::from_millis(600));
     let _ = f
         .sshd
-        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
+        .ssh(&[&format!("tmux -L {} kill-session -t mule-{orphan}", f.tmux)]);
 
     // Older than keep_days (14) but well inside the orphan horizon (56).
     // A fixed date rots: it was ~8 months old when written, which is past 56
@@ -508,7 +517,7 @@ fn prune_removes_finished_jobs_and_spares_running_and_orphans() {
         "an orphan past the long horizon must be pruned"
     );
 
-    let _ = f.coop(&["kill", &running]);
+    let _ = f.mule(&["kill", &running]);
 }
 
 #[test]
@@ -521,7 +530,7 @@ fn rm_drops_state_and_tolerates_a_missing_job() {
     f.await_done(&id);
     assert!(f.dir_exists(&id));
 
-    let out = f.coop(&["rm", &id]);
+    let out = f.mule(&["rm", &id]);
     assert!(
         out.status.success(),
         "{}",
@@ -531,11 +540,11 @@ fn rm_drops_state_and_tolerates_a_missing_job() {
 
     // Removing something already gone is not an error: `rm` is how a caller
     // cleans up, and it must be safe to repeat.
-    let again = f.coop(&["rm", &id]);
+    let again = f.mule(&["rm", &id]);
     assert!(again.status.success(), "rm must be idempotent");
 
     // A well-formed id that was never a job behaves the same way.
-    let never = f.coop(&["rm", "abc123"]);
+    let never = f.mule(&["rm", "abc123"]);
     assert!(never.status.success(), "rm of an unknown id must not fail");
 }
 
@@ -546,9 +555,9 @@ fn a_hostile_job_id_never_reaches_the_remote_shell() {
     let f = Fixture::new("hostile");
 
     // The end-to-end proof for the injection fix: this once produced
-    //   d=$HOME/.local/state/coop/jobs/x$(touch /tmp/PWNED)y; ...
+    //   d=$HOME/.local/state/mule/jobs/x$(touch /tmp/PWNED)y; ...
     // on the host. Assert both the refusal AND that nothing executed.
-    let canary = "/tmp/coop-injection-canary";
+    let canary = "/tmp/mule-injection-canary";
     let _ = f.sshd.ssh(&[&format!("rm -f {canary}")]);
 
     for hostile in [
@@ -557,7 +566,7 @@ fn a_hostile_job_id_never_reaches_the_remote_shell() {
         format!("`touch {canary}`"),
     ] {
         for verb in ["poll", "tail", "kill", "rm"] {
-            let out = f.coop(&[verb, &hostile]);
+            let out = f.mule(&[verb, &hostile]);
             assert!(
                 !out.status.success(),
                 "{verb} accepted a hostile id: {hostile}"
@@ -575,7 +584,7 @@ fn run_wait_prints_the_output_of_an_instant_command() {
     let _lane = shared();
     let mut f = Fixture::new("runwait");
 
-    // `coop run --wait ls` printed the id and nothing else. `rc` and `log` are
+    // `mule run --wait ls` printed the id and nothing else. `rc` and `log` are
     // written by opposite ends of a pipeline, so `rc` can land while the log's
     // last bytes are still in flight; the wait loop returned on the first
     // `Done` and dropped them. Any command fast enough to finish inside one
@@ -585,7 +594,7 @@ fn run_wait_prints_the_output_of_an_instant_command() {
     // order the test queues, so the race does not exist there. This is the
     // plainest possible use of the tool and it needs a real host to verify.
     for _ in 0..3 {
-        let out = f.coop(&["run", "--wait", "echo instant-output"]);
+        let out = f.mule(&["run", "--wait", "echo instant-output"]);
         assert!(
             out.status.success(),
             "run --wait failed: {}",
@@ -608,7 +617,7 @@ fn run_wait_prints_the_output_of_an_instant_command() {
     }
 
     // The exit code is the job's own, not the tail's.
-    let failed = f.coop(&["run", "--wait", "echo before-failing; exit 7"]);
+    let failed = f.mule(&["run", "--wait", "echo before-failing; exit 7"]);
     let text = String::from_utf8_lossy(&failed.stdout);
     let mut lines = text.lines();
     f.ids.push(lines.next().unwrap_or_default().to_string());
@@ -637,7 +646,7 @@ fn a_trivially_successful_job_reports_rc_zero() {
     let _lane = shared();
     let mut f = Fixture::new("rczero");
 
-    // `coop run true` reported rc 1. The wrapper ended with
+    // `mule run true` reported rc 1. The wrapper ended with
     // `[ -s .overflow ] && echo 1 > truncated`, and that test is the last
     // command in the pipeline, so an empty overflow file made it exit 1 -- which
     // became the job's status. Every successful job was affected.
@@ -653,17 +662,17 @@ fn a_trivially_successful_job_reports_rc_zero() {
 }
 
 #[test]
-fn a_coop_flag_after_the_command_warns_but_still_runs() {
+fn a_mule_flag_after_the_command_warns_but_still_runs() {
     require_sshd!();
     let _lane = shared();
     let mut f = Fixture::new("flagpos");
 
-    // `coop run ls --wait` sends `--wait` to `ls`, which must stay true --
-    // otherwise no command could take a flag coop also has. But it failed
+    // `mule run ls --wait` sends `--wait` to `ls`, which must stay true --
+    // otherwise no command could take a flag mule also has. But it failed
     // silently: the job dispatched, no output appeared because `--wait` never
-    // reached coop, and `ls` exited 1 on the unknown flag, which reads as a
-    // coop bug rather than a usage mistake.
-    let out = f.coop(&["run", "echo", "hi", "--wait"]);
+    // reached mule, and `ls` exited 1 on the unknown flag, which reads as a
+    // mule bug rather than a usage mistake.
+    let out = f.mule(&["run", "echo", "hi", "--wait"]);
     assert!(out.status.success());
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     f.ids.push(id.clone());
@@ -674,7 +683,7 @@ fn a_coop_flag_after_the_command_warns_but_still_runs() {
         "must warn about the swallowed flag: {warning}"
     );
     assert!(
-        warning.contains("coop run --wait echo"),
+        warning.contains("mule run --wait echo"),
         "must show the corrected form: {warning}"
     );
 
@@ -684,7 +693,7 @@ fn a_coop_flag_after_the_command_warns_but_still_runs() {
 
     // `--` is the caller asserting the flags are the command's, so it silences
     // the warning. Without this the escape hatch would nag on every use.
-    let explicit = f.coop(&["run", "--", "echo", "hi", "--wait"]);
+    let explicit = f.mule(&["run", "--", "echo", "hi", "--wait"]);
     let id2 = String::from_utf8_lossy(&explicit.stdout).trim().to_string();
     f.ids.push(id2);
     assert!(
@@ -692,13 +701,13 @@ fn a_coop_flag_after_the_command_warns_but_still_runs() {
         "an explicit -- must silence the warning"
     );
 
-    // Correct usage stays silent, and a flag coop does not own is not its
+    // Correct usage stays silent, and a flag mule does not own is not its
     // business.
     for args in [
         vec!["run", "--wait", "echo", "quiet"],
         vec!["run", "ls", "-la"],
     ] {
-        let quiet = f.coop(&args);
+        let quiet = f.mule(&args);
         let text = String::from_utf8_lossy(&quiet.stdout);
         if let Some(line) = text.lines().next()
             && line.len() == 6
@@ -725,12 +734,12 @@ fn rm_all_clears_finished_jobs_and_never_stops_work() {
     let running = f.run("sleep 300");
     let orphan = f.run("sleep 300");
     std::thread::sleep(Duration::from_millis(600));
-    // An orphan: session gone, no rc. Killed directly so coop writes no 137.
+    // An orphan: session gone, no rc. Killed directly so mule writes no 137.
     let _ = f
         .sshd
-        .ssh(&[&format!("tmux -L {} kill-session -t coop-{orphan}", f.tmux)]);
+        .ssh(&[&format!("tmux -L {} kill-session -t mule-{orphan}", f.tmux)]);
 
-    let out = f.coop(&["rm", "--all"]);
+    let out = f.mule(&["rm", "--all"]);
     assert!(
         out.status.success(),
         "{}",
@@ -759,7 +768,7 @@ fn rm_all_clears_finished_jobs_and_never_stops_work() {
     );
 
     // Idempotent, and says so rather than being silently empty.
-    let again = f.coop(&["rm", "--all"]);
+    let again = f.mule(&["rm", "--all"]);
     assert!(again.status.success());
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("nothing to remove"),
@@ -767,9 +776,9 @@ fn rm_all_clears_finished_jobs_and_never_stops_work() {
     );
 
     // `kill` first, then the job is finished and `--all` reaches it.
-    let _ = f.coop(&["kill", &running]);
+    let _ = f.mule(&["kill", &running]);
     std::thread::sleep(Duration::from_millis(400));
-    let after_kill = f.coop(&["rm", "--all"]);
+    let after_kill = f.mule(&["rm", "--all"]);
     assert!(
         String::from_utf8_lossy(&after_kill.stdout).contains(&running),
         "a killed job is finished (rc 137) and so is removable"
@@ -786,11 +795,11 @@ fn rm_with_no_target_says_what_to_do() {
 
     // clap cannot express "one of a positional or a flag is required", so
     // without this the user gets a bare usage dump for a reasonable command.
-    let out = f.coop(&["rm"]);
+    let out = f.mule(&["rm"]);
     assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stderr);
-    assert!(text.contains("coop rm <id>"), "{text}");
-    assert!(text.contains("coop rm --all"), "{text}");
+    assert!(text.contains("mule rm <id>"), "{text}");
+    assert!(text.contains("mule rm --all"), "{text}");
 }
 
 #[test]
@@ -800,16 +809,16 @@ fn ls_explains_empty_and_hidden_results() {
     let mut f = Fixture::new("lshints");
     assert!(
         f.sshd
-            .ssh(&["rm -rf $XDG_STATE_HOME/coop/jobs"])
+            .ssh(&["rm -rf $XDG_STATE_HOME/mule/jobs"])
             .status
             .success()
     );
 
-    let empty = f.coop(&["ls"]);
+    let empty = f.mule(&["ls"]);
     assert!(empty.stdout.is_empty());
     let hint = String::from_utf8_lossy(&empty.stderr);
     assert!(hint.contains("no jobs"), "{hint}");
-    assert!(hint.contains("coop run <cmd>"), "{hint}");
+    assert!(hint.contains("mule run <cmd>"), "{hint}");
 
     let old = f.run("true");
     f.await_done(&old);
@@ -821,11 +830,11 @@ fn ls_explains_empty_and_hidden_results() {
             .success()
     );
 
-    let hidden = f.coop(&["ls"]);
+    let hidden = f.mule(&["ls"]);
     assert!(hidden.stdout.is_empty());
     let hint = String::from_utf8_lossy(&hidden.stderr);
     assert!(hint.contains("1 older finished jobs hidden"), "{hint}");
-    assert!(hint.contains("coop ls --all"), "{hint}");
+    assert!(hint.contains("mule ls --all"), "{hint}");
 }
 
 #[test]

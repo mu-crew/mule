@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use coop::config::Host;
-use coop::wrapper::{Job, JobMetadata, dispatch_script, new_id, state_dir};
+use mule::config::Host;
+use mule::wrapper::{Job, JobMetadata, dispatch_script, new_id, state_dir};
 
 fn host() -> Host {
     Host {
         name: "dev".into(),
         target: "dev".into(),
-        socket: PathBuf::from("/tmp/coop.sock"),
-        tmux_socket: "coop".into(),
+        socket: PathBuf::from("/tmp/mule.sock"),
+        tmux_socket: "mule".into(),
         max_running: 4,
         default_cwd: None,
         keep_days: 14,
@@ -21,8 +21,8 @@ fn host() -> Host {
 #[test]
 fn default_jobs_root_stays_in_the_remote_home() {
     assert_eq!(
-        coop::wrapper::JOBS_ROOT,
-        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs"
+        mule::wrapper::JOBS_ROOT,
+        "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs"
     );
 }
 
@@ -38,7 +38,7 @@ fn dispatch_uses_canonical_padded_base64() {
     ];
 
     for (input, expected) in cases {
-        assert_eq!(coop::wrapper::encode_command(input), *expected);
+        assert_eq!(mule::wrapper::encode_command(input), *expected);
     }
 }
 
@@ -50,13 +50,13 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
         cmd: command.into(),
         cwd: None,
         max_secs: 0,
-        metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
-        mode: coop::wrapper::JobMode::Pipe,
+        metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+        mode: mule::wrapper::JobMode::Pipe,
     };
 
     let script = dispatch_script(&host(), &job);
 
-    assert!(script.contains("tmux -L coop -f /dev/null new-session -d -s coop-a1b2c3"));
+    assert!(script.contains("tmux -L mule -f /dev/null new-session -d -s mule-a1b2c3"));
     // `-f /dev/null` is not cosmetic: a cold server that sources the user's
     // ~/.tmux.conf took 4.5s to start against 0.03s with an empty config,
     // measured. Every job pays it, and status hooks that shell out are the
@@ -68,17 +68,17 @@ fn dispatch_encodes_the_command_in_a_detached_tmux_job() {
     assert!(!script.contains(command));
     assert_eq!(script.matches('\'').count() % 2, 0);
     // Under `jobs/`, not the state dir root: the ticket lock keeps
-    // `<host>.lock` in that tree, and sharing one parent made `coop ls` report
+    // `<host>.lock` in that tree, and sharing one parent made `mule ls` report
     // `dev.lock` as an orphaned job.
     assert_eq!(
         state_dir(&job.id),
-        "${XDG_STATE_HOME:-$HOME/.local/state}/coop/jobs/a1b2c3"
+        "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs/a1b2c3"
     );
 }
 
 #[test]
 fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
-    let hostile = "crew ' \"$(touch /tmp/coop-workstream-injection)\"\nnext";
+    let hostile = "crew ' \"$(touch /tmp/mule-workstream-injection)\"\nnext";
     let managed = dispatch_script(
         &host(),
         &Job {
@@ -89,7 +89,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             metadata: JobMetadata::Managed {
                 workstream: Some(hostile.into()),
             },
-            mode: coop::wrapper::JobMode::Pipe,
+            mode: mule::wrapper::JobMode::Pipe,
         },
     );
 
@@ -98,10 +98,10 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
         "workstream must not be interpolated"
     );
     assert!(
-        managed.contains(&coop::wrapper::encode_command(hostile.as_bytes())),
+        managed.contains(&mule::wrapper::encode_command(hostile.as_bytes())),
         "workstream must enter the wrapper encoded"
     );
-    assert!(managed.contains("env MU_MANAGED_AGENT=1 MU_AGENT_NAME=coop-a1b2c3"));
+    assert!(managed.contains("env MU_MANAGED_AGENT=1 MU_AGENT_NAME=mule-a1b2c3"));
 
     let absent = dispatch_script(
         &host(),
@@ -111,7 +111,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             cwd: None,
             max_secs: 0,
             metadata: JobMetadata::Managed { workstream: None },
-            mode: coop::wrapper::JobMode::Pipe,
+            mode: mule::wrapper::JobMode::Pipe,
         },
     );
     assert!(absent.contains("env -u MU_WORKSTREAM"));
@@ -124,7 +124,7 @@ fn managed_jobs_apply_encoded_crew_metadata_only_to_the_final_shell() {
             cwd: None,
             max_secs: 0,
             metadata: JobMetadata::Human,
-            mode: coop::wrapper::JobMode::Pipe,
+            mode: mule::wrapper::JobMode::Pipe,
         },
     );
     assert!(human.contains("env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh"));
@@ -154,8 +154,8 @@ fn a_cwd_with_a_space_is_quoted() {
         cmd: "echo hi".into(),
         cwd: Some("/tmp/my dir".into()),
         max_secs: 0,
-        metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
-        mode: coop::wrapper::JobMode::Pipe,
+        metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+        mode: mule::wrapper::JobMode::Pipe,
     };
     let script = dispatch_script(&host(), &job);
     assert!(
@@ -173,7 +173,7 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
     // `[ -s .overflow ] && echo 1 > truncated` is the last command in the
     // pipeline's right-hand side, so with an empty overflow file it exits 1 --
     // and that became the exit status of the whole wrapper. Every successful
-    // job reported `rc 1`, `coop run true` included. An `if` form has no such
+    // job reported `rc 1`, `mule run true` included. An `if` form has no such
     // result.
     let script = dispatch_script(
         &host(),
@@ -182,8 +182,8 @@ fn the_truncation_check_cannot_become_the_jobs_exit_code() {
             cmd: "true".into(),
             cwd: None,
             max_secs: 0,
-            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
-            mode: coop::wrapper::JobMode::Pipe,
+            metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+            mode: mule::wrapper::JobMode::Pipe,
         },
     );
     assert!(
@@ -209,8 +209,8 @@ fn watchdog_writes_124_only_when_rc_is_absent() {
             cmd: "true".into(),
             cwd: None,
             max_secs: 30,
-            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
-            mode: coop::wrapper::JobMode::Pipe,
+            metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+            mode: mule::wrapper::JobMode::Pipe,
         },
     );
     let watch = script
@@ -222,7 +222,7 @@ fn watchdog_writes_124_only_when_rc_is_absent() {
         .expect("watchdog is base64-encoded")
         .1;
     let b64 = rest.split_whitespace().next().expect("watchdog payload");
-    let payload = String::from_utf8(coop::jobs::decode_command(b64).unwrap()).unwrap();
+    let payload = String::from_utf8(mule::jobs::decode_command(b64).unwrap()).unwrap();
     assert!(
         payload.contains("if [ ! -f") && payload.contains("echo 124"),
         "124 must be gated on a missing rc: {payload}"
@@ -292,8 +292,8 @@ fn script_for(cwd: &str) -> String {
             cmd: "true".into(),
             cwd: Some(cwd.into()),
             max_secs: 0,
-            metadata: coop::wrapper::JobMetadata::Managed { workstream: None },
-            mode: coop::wrapper::JobMode::Pipe,
+            metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+            mode: mule::wrapper::JobMode::Pipe,
         },
     )
 }

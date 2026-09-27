@@ -1,13 +1,13 @@
 use std::io::Cursor;
 
-use coop::config::Config;
-use coop::transport::{Fake, Output};
-use coop::wrapper::JobMetadata;
+use mule::config::Config;
+use mule::transport::{Fake, Output};
+use mule::wrapper::JobMetadata;
 
 /// Point the lock directory at a temp dir for the whole test binary.
 ///
 /// `lock_path` honours `$XDG_STATE_HOME`, and without this the suite writes
-/// lock directories into the developer's real `~/.local/state/coop`, mixed in
+/// lock directories into the developer's real `~/.local/state/mule`, mixed in
 /// with live job state.
 ///
 /// `set_var` is safe here because it runs once, before any thread reads it.
@@ -15,15 +15,15 @@ fn isolate_state() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let dir = std::env::temp_dir().join(format!("coop-state-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mule-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
     });
 }
 
-fn host() -> coop::config::Host {
+fn host() -> mule::config::Host {
     Config::parse(
-        "[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/coop-dev.sock\"\nmax_running = 4\n",
+        "[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/mule-dev.sock\"\nmax_running = 4\n",
     )
     .unwrap()
     .host(None)
@@ -37,14 +37,14 @@ fn dispatch_is_one_round_trip_and_returns_the_job_id() {
     let fake = Fake::new();
     fake.push(Output::ok("1\n"));
 
-    let id = coop::run::dispatch(
+    let id = mule::run::dispatch(
         &fake,
         &host(),
         "echo hi",
         None,
         None,
         JobMetadata::Human,
-        coop::wrapper::JobMode::Pipe,
+        mule::wrapper::JobMode::Pipe,
     )
     .unwrap();
     let scripts = fake.scripts();
@@ -59,20 +59,20 @@ fn dispatch_is_one_round_trip_and_returns_the_job_id() {
 #[test]
 fn no_master_error_prints_the_exact_command_to_open_one() {
     isolate_state();
-    let error = coop::run::dispatch(
+    let error = mule::run::dispatch(
         &Fake::no_master(),
         &host(),
         "true",
         None,
         None,
         JobMetadata::Human,
-        coop::wrapper::JobMode::Pipe,
+        mule::wrapper::JobMode::Pipe,
     )
     .unwrap_err();
     let message = error.to_string();
 
     assert!(message.contains("no control master for dev"));
-    assert!(message.contains("ssh -MNf -S /tmp/coop-dev.sock -o ControlPersist=8h build.example"));
+    assert!(message.contains("ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h build.example"));
 }
 
 #[test]
@@ -82,19 +82,19 @@ fn zero_running_sessions_is_a_successful_dispatch_reply() {
     fake.push(Output::ok("0\n"));
 
     assert!(
-        coop::run::dispatch(
+        mule::run::dispatch(
             &fake,
             &host(),
             "true",
             None,
             None,
             JobMetadata::Human,
-            coop::wrapper::JobMode::Pipe,
+            mule::wrapper::JobMode::Pipe,
         )
         .is_ok()
     );
     assert!(
-        fake.scripts()[0].contains("grep -c '^coop-' || true"),
+        fake.scripts()[0].contains("grep -c '^mule-' || true"),
         "grep reports no matches with status 1; the combined dispatch must normalize it"
     );
 }
@@ -105,33 +105,33 @@ fn warns_only_when_the_retrospective_count_exceeds_the_cap() {
     let above = Fake::new();
     above.push(Output::ok("5\n"));
     let mut warning = Cursor::new(Vec::new());
-    let id = coop::run::dispatch_with_warnings(
+    let id = mule::run::dispatch_with_warnings(
         &above,
         &host(),
         "true",
         None,
         None,
         JobMetadata::Human,
-        coop::wrapper::JobMode::Pipe,
+        mule::wrapper::JobMode::Pipe,
         &mut warning,
     )
     .unwrap();
     assert_eq!(
         String::from_utf8(warning.into_inner()).unwrap(),
-        format!("coop: dispatched {id}; 5 now running on dev, cap 4\n")
+        format!("mule: dispatched {id}; 5 now running on dev, cap 4\n")
     );
 
     let at_cap = Fake::new();
     at_cap.push(Output::ok("4\n"));
     let mut warning = Cursor::new(Vec::new());
-    coop::run::dispatch_with_warnings(
+    mule::run::dispatch_with_warnings(
         &at_cap,
         &host(),
         "true",
         None,
         None,
         JobMetadata::Human,
-        coop::wrapper::JobMode::Pipe,
+        mule::wrapper::JobMode::Pipe,
         &mut warning,
     )
     .unwrap();

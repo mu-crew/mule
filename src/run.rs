@@ -56,7 +56,7 @@ pub fn dispatch_with_warnings(
         mode,
     };
     let script = format!(
-        "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^coop-' || true; }}",
+        "{}; {} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^mule-' || true; }}",
         crate::jobs::prune(host),
         dispatch_script(host, &job),
         host.tmux_socket
@@ -81,7 +81,7 @@ pub fn dispatch_with_warnings(
     if running > host.max_running {
         writeln!(
             warnings,
-            "coop: dispatched {}; {running} now running on {}, cap {}",
+            "mule: dispatched {}; {running} now running on {}, cap {}",
             job.id, host.name, host.max_running
         )?;
     }

@@ -89,7 +89,7 @@ pub fn list_with_hidden(
 /// The previous version was a shell loop forking four processes PER JOB -- a
 /// `cat` for `rc`, a `tmux has-session`, a `stat`, and a `base64` for `cmd`.
 /// Measured at 300 jobs: **14.1s**, all of it inside the ticket lock, so
-/// nothing else coop-related could run. That breaks coop's own rule against
+/// nothing else mule-related could run. That breaks mule's own rule against
 /// holding a capped channel for more than about a second, and since `keep_days`
 /// defaults to 14, a few hundred jobs is ordinary rather than pathological.
 ///
@@ -113,7 +113,7 @@ pub fn list_with_hidden(
 fn list_script(host: &Host) -> String {
     format!(
         "root={JOBS_ROOT}; [ -d \"$root\" ] || exit 0; \
-         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | sed 's/^coop-//'); \
+         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | sed 's/^mule-//'); \
          {{ find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -c '%Y %n' {{}} + 2>/dev/null \
             || find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -f '%m %N' {{}} + ; }} \
          | awk -v now=\"$(date +%s)\" -v live=\"$live\" '\
@@ -246,7 +246,7 @@ pub fn kill(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<i32> {
     // capped job's sleeper lives until max_secs and can overwrite rc with 124.
     let script = format!(
         "d={dir}; [ -f $d/rc ] || echo 137 > $d/rc; \
-         tmux -L {socket} kill-session -t coop-{id} 2>/dev/null; \
+         tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
          tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
          cat $d/rc",
         socket = host.tmux_socket
@@ -290,7 +290,7 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
         Target::One(id) => {
             let dir = state_dir(id);
             format!(
-                "tmux -L {} kill-session -t coop-{id} 2>/dev/null; \
+                "tmux -L {} kill-session -t mule-{id} 2>/dev/null; \
                  tmux -L {} kill-session -t watch-{id} 2>/dev/null; \
                  if [ -d {dir} ]; then rm -rf {dir} && echo {id}; fi; exit 0",
                 host.tmux_socket, host.tmux_socket
@@ -323,7 +323,7 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
 /// How much longer an `orphan` is kept than a finished job.
 ///
 /// An orphan is evidence -- the host rebooted, or something killed the session
-/// -- and since `kill` writes rc 137, it means strictly "not coop's doing". So
+/// -- and since `kill` writes rc 137, it means strictly "not mule's doing". So
 /// it outlives ordinary output by a wide margin. But not forever: a disk-full
 /// incident produces orphans holding the largest logs on the host, and those
 /// were exactly the directories an unconditional exemption refused to touch,
@@ -337,7 +337,7 @@ pub fn prune(host: &Host) -> String {
     // becoming unreadable.
     //
     // A `running` job has no `rc`, so the orphan pass would match it by age
-    // alone. Skip live `coop-{id}` sessions: keep_days can be 1, which makes
+    // alone. Skip live `mule-{id}` sessions: keep_days can be 1, which makes
     // the orphan horizon four days, and a multi-day job is legitimate work.
     format!(
         "root={JOBS_ROOT}; [ ! -d \"$root\" ] || {{ \
@@ -347,7 +347,7 @@ pub fn prune(host: &Host) -> String {
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days} \
            -exec test ! -f '{{}}/rc' \\; -print | while IFS= read -r d; do \
              id=\"${{d##*/}}\"; \
-             echo \"$live\" | grep -qx \"coop-$id\" && continue; \
+             echo \"$live\" | grep -qx \"mule-$id\" && continue; \
              rm -rf \"$d\"; \
            done; }}",
         host.tmux_socket, host.keep_days

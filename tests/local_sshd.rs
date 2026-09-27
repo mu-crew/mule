@@ -27,7 +27,7 @@ impl<'a> Tmux<'a> {
     fn new(sshd: &'a Sshd, tag: &str) -> Self {
         Self {
             sshd,
-            name: format!("coop-l3-{}-{tag}", std::process::id()),
+            name: format!("mule-l3-{}-{tag}", std::process::id()),
         }
     }
 }
@@ -71,7 +71,7 @@ impl Drop for Tmux<'_> {
 /// state is this machine's real state directory.
 fn clean_jobs(sshd: &Sshd, ids: &[String]) {
     for id in ids {
-        let _ = sshd.ssh(&["rm", "-rf", &format!("$XDG_STATE_HOME/coop/jobs/{id}")]);
+        let _ = sshd.ssh(&["rm", "-rf", &format!("$XDG_STATE_HOME/mule/jobs/{id}")]);
     }
 }
 
@@ -116,14 +116,14 @@ fn the_cap_refuses_a_second_session_on_one_connection() {
 }
 
 #[test]
-fn coop_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
+fn mule_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
     require_sshd!();
     let sshd = Sshd::start();
     let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "busy");
     let config = sshd.write_config(&tmux.name);
 
-    // Occupy the single MaxSessions slot outside coop's lock. The next coop
+    // Occupy the single MaxSessions slot outside mule's lock. The next mule
     // verb still takes the lock, then ssh, and must classify the refusal
     // rather than dump Permission denied (keyboard-interactive).
     let mut holder = std::process::Command::new(sshd.dir.join("ssh"))
@@ -137,7 +137,7 @@ fn coop_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(400));
 
-    let out = sshd.coop(&config, &["poll", "abc123"]);
+    let out = sshd.mule(&config, &["poll", "abc123"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("one slot is held") || err.contains("master is down"),
@@ -187,7 +187,7 @@ fn a_second_connection_is_unaffected_by_a_starved_first() {
     }
 
     // And symmetrically: `ssh -O check` on the starved socket still answers,
-    // because it opens no session channel. That is why it is the one call coop
+    // because it opens no session channel. That is why it is the one call mule
     // exempts from the ticket lock.
     assert!(
         sshd.master_alive(&first),
@@ -207,10 +207,10 @@ fn concurrent_dispatches_all_succeed_through_the_gate() {
     let config = sshd.write_config(&tmux.name);
 
     // THE defining measurement. Five concurrent ungated calls on one capped
-    // connection produced 1 success in 5; through coop's lock, 5 of 5.
+    // connection produced 1 success in 5; through mule's lock, 5 of 5.
     let handles: Vec<_> = (0..5)
         .map(|_| {
-            let bin = PathBuf::from(env!("CARGO_BIN_EXE_coop"));
+            let bin = PathBuf::from(env!("CARGO_BIN_EXE_mule"));
             let config = config.clone();
             let path = sshd.path_env();
             std::thread::spawn(move || {
@@ -221,7 +221,7 @@ fn concurrent_dispatches_all_succeed_through_the_gate() {
                     .env("PATH", path)
                     .stdin(std::process::Stdio::null())
                     .output()
-                    .expect("coop failed to spawn")
+                    .expect("mule failed to spawn")
             })
         })
         .collect();
@@ -251,7 +251,7 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
     let tmux = Tmux::new(&sshd, "run-hint");
     let config = sshd.write_config(&tmux.name);
 
-    let out = sshd.coop(&config, &["run", "sleep 30"]);
+    let out = sshd.mule(&config, &["run", "sleep 30"]);
     assert!(out.status.success());
     let output_text = String::from_utf8_lossy(&out.stdout);
     let id = output_text.trim();
@@ -267,10 +267,10 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains(&format!("coop wait {id}")), "{stderr}");
-    assert!(stderr.contains(&format!("coop tail {id}")), "{stderr}");
+    assert!(stderr.contains(&format!("mule wait {id}")), "{stderr}");
+    assert!(stderr.contains(&format!("mule tail {id}")), "{stderr}");
 
-    let quiet = sshd.coop(&config, &["--quiet", "run", "true"]);
+    let quiet = sshd.mule(&config, &["--quiet", "run", "true"]);
     assert!(quiet.status.success());
     assert!(
         quiet.stderr.is_empty(),
@@ -279,7 +279,7 @@ fn run_prints_next_steps_on_stderr_and_only_the_id_on_stdout() {
     );
     let quiet_id = stdout(&quiet);
 
-    let _ = sshd.coop(&config, &["--quiet", "kill", id]);
+    let _ = sshd.mule(&config, &["--quiet", "kill", id]);
     clean_jobs(&sshd, &[id.to_string(), quiet_id]);
 }
 
@@ -293,7 +293,7 @@ fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
     let sentinel = sshd.dir.join("hint-expanded-workstream");
     let workstream = format!("crew '$(touch {})'", sentinel.display());
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["run", "--tui", "sleep 30"])
@@ -313,8 +313,8 @@ fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
         hints.contains(&format!("TUI job {id} is interactive")),
         "{hints}"
     );
-    assert!(hints.contains(&format!("coop tail {id}")), "{hints}");
-    assert!(hints.contains(&format!("# select coop-{id}")), "{hints}");
+    assert!(hints.contains(&format!("mule tail {id}")), "{hints}");
+    assert!(hints.contains(&format!("# select mule-{id}")), "{hints}");
     assert!(hints.contains("--host '127.0.0.1'"), "{hints}");
     assert!(
         hints.contains(&format!(
@@ -323,14 +323,14 @@ fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
         )),
         "{hints}"
     );
-    assert!(hints.contains(&format!("--agent coop-{id})\"")), "{hints}");
-    assert!(hints.contains(&format!("coop kill --rm {id}")), "{hints}");
+    assert!(hints.contains(&format!("--agent mule-{id})\"")), "{hints}");
+    assert!(hints.contains(&format!("mule kill --rm {id}")), "{hints}");
     assert!(
         !sentinel.exists(),
         "rendering the hint executed workstream text"
     );
 
-    let quiet = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let quiet = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["--quiet", "run", "--tui", "true"])
@@ -342,7 +342,7 @@ fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
     assert!(quiet.status.success());
     assert!(quiet.stderr.is_empty(), "--quiet must suppress TUI hints");
 
-    let _ = sshd.coop(&config, &["--quiet", "kill", "--rm", &id]);
+    let _ = sshd.mule(&config, &["--quiet", "kill", "--rm", &id]);
     clean_jobs(&sshd, &[stdout(&quiet)]);
 }
 
@@ -354,7 +354,7 @@ fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
     let tmux = Tmux::new(&sshd, "dispatch-warning");
     let config = sshd.write_config(&tmux.name);
 
-    let out = sshd.coop(&config, &["run", "printf ok | tail -1"]);
+    let out = sshd.mule(&config, &["run", "printf ok | tail -1"]);
     assert!(
         out.status.success(),
         "{}",
@@ -376,11 +376,11 @@ fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
     // so it reported a problem the reader could not act on, while the job ran
     // anyway. Every suggested command has to be pasteable.
     assert!(
-        stderr.contains(&format!("coop tail {id} -n 3")),
+        stderr.contains(&format!("mule tail {id} -n 3")),
         "the hint must name the real id: {stderr}"
     );
     assert!(
-        stderr.contains(&format!("coop kill --rm {id}")),
+        stderr.contains(&format!("mule kill --rm {id}")),
         "a warning about a running job must say how to end it: {stderr}"
     );
     assert!(
@@ -392,11 +392,11 @@ fn suspicious_dispatch_warns_on_stderr_without_changing_the_id() {
     // quiet_drops_hints_but_keeps_warnings for the full contract. This test
     // previously required stderr to be empty, which made the documented way
     // to get a clean id also disable the safety net.
-    let quiet = sshd.coop(&config, &["--quiet", "run", "printf ok | tail -1"]);
+    let quiet = sshd.mule(&config, &["--quiet", "run", "printf ok | tail -1"]);
     assert!(quiet.status.success());
     let quiet_err = String::from_utf8_lossy(&quiet.stderr);
     assert!(
-        !quiet_err.contains("next: coop"),
+        !quiet_err.contains("next: mule"),
         "--quiet must suppress the hints: {quiet_err}"
     );
     assert!(
@@ -416,9 +416,9 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
     let tmux = Tmux::new(&sshd, "missing-path-hint");
     let config = sshd.write_config(&tmux.name);
 
-    let failed = sshd.coop(
+    let failed = sshd.mule(
         &config,
-        &["run", "--wait", "coop_definitely_missing_binary 2>&1"],
+        &["run", "--wait", "mule_definitely_missing_binary 2>&1"],
     );
     assert_eq!(failed.status.code(), Some(127));
     let failed_stdout = String::from_utf8_lossy(&failed.stdout);
@@ -432,7 +432,7 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
         "the hint must not alter stdout: {failed_stdout:?}"
     );
     assert!(
-        log_lines[0].contains("coop_definitely_missing_binary: command not found"),
+        log_lines[0].contains("mule_definitely_missing_binary: command not found"),
         "{failed_stdout:?}"
     );
     let hint = String::from_utf8_lossy(&failed.stderr);
@@ -440,13 +440,13 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
     assert!(hint.contains("If this is a missing tool"), "{hint}");
     assert!(hint.contains("export PATH=$HOME/.elan/bin:$PATH"), "{hint}");
 
-    let quiet = sshd.coop(
+    let quiet = sshd.mule(
         &config,
         &[
             "--quiet",
             "run",
             "--wait",
-            "coop_definitely_missing_binary 2>&1",
+            "mule_definitely_missing_binary 2>&1",
         ],
     );
     assert_eq!(quiet.status.code(), Some(127));
@@ -461,7 +461,7 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
         .expect("run must print its recovery id")
         .to_string();
 
-    let successful = sshd.coop(&config, &["run", "--wait", "printf 'not found on PATH\\n'"]);
+    let successful = sshd.mule(&config, &["run", "--wait", "printf 'not found on PATH\\n'"]);
     assert!(successful.status.success());
     let successful_stdout = String::from_utf8_lossy(&successful.stdout);
     let mut lines = successful_stdout.lines();
@@ -502,7 +502,7 @@ fn dispatch_preserves_command_argument_boundaries() {
     for (args, expected_log, expected_cmd) in cases {
         let mut run_args = vec!["run", "--wait"];
         run_args.extend_from_slice(args);
-        let output = sshd.coop(&config, &run_args);
+        let output = sshd.mule(&config, &run_args);
         assert!(
             output.status.success(),
             "{}",
@@ -517,7 +517,7 @@ fn dispatch_preserves_command_argument_boundaries() {
             "arguments must reach the remote shell intact"
         );
 
-        let recorded = sshd.ssh(&["cat", &format!("$XDG_STATE_HOME/coop/jobs/{id}/cmd")]);
+        let recorded = sshd.ssh(&["cat", &format!("$XDG_STATE_HOME/mule/jobs/{id}/cmd")]);
         assert!(recorded.status.success());
         assert_eq!(String::from_utf8_lossy(&recorded.stdout), expected_cmd);
         ids.push(id.to_string());
@@ -538,7 +538,7 @@ fn run_applies_crew_metadata_only_to_managed_job_shells() {
     let command =
         "printf '%s|%s|<%s>' \"$MU_MANAGED_AGENT\" \"$MU_AGENT_NAME\" \"${MU_WORKSTREAM-}\"";
 
-    let managed = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let managed = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["run", "--wait", command])
@@ -554,13 +554,13 @@ fn run_applies_crew_metadata_only_to_managed_job_shells() {
     );
     let managed_stdout = String::from_utf8_lossy(&managed.stdout);
     let (managed_id, managed_log) = managed_stdout.split_once('\n').unwrap();
-    assert_eq!(managed_log, format!("1|coop-{managed_id}|<{hostile}>"));
+    assert_eq!(managed_log, format!("1|mule-{managed_id}|<{hostile}>"));
     assert!(
         !sentinel.exists(),
         "workstream text executed as shell syntax"
     );
 
-    let absent = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let absent = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args([
@@ -580,9 +580,9 @@ fn run_applies_crew_metadata_only_to_managed_job_shells() {
     );
     let absent_stdout = String::from_utf8_lossy(&absent.stdout);
     let (absent_id, absent_log) = absent_stdout.split_once('\n').unwrap();
-    assert_eq!(absent_log, format!("1|coop-{absent_id}|"));
+    assert_eq!(absent_log, format!("1|mule-{absent_id}|"));
 
-    let human = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let human = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args([
@@ -626,7 +626,7 @@ fn tui_job_uses_the_remote_pane_pty_and_accepts_input() {
     let config = sshd.write_config(&tmux.name);
     let command = "[ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 9; printf 'ready\\n'; IFS= read -r answer; printf 'answer:%s\\n' \"$answer\"";
 
-    let out = sshd.coop(&config, &["run", "--tui", command]);
+    let out = sshd.mule(&config, &["run", "--tui", command]);
     assert!(
         out.status.success(),
         "{}",
@@ -642,7 +642,7 @@ fn tui_job_uses_the_remote_pane_pty_and_accepts_input() {
             "capture-pane",
             "-p",
             "-t",
-            &format!("coop-{id}"),
+            &format!("mule-{id}"),
         ]);
         if String::from_utf8_lossy(&pane.stdout).contains("ready") {
             break;
@@ -656,18 +656,18 @@ fn tui_job_uses_the_remote_pane_pty_and_accepts_input() {
         &tmux.name,
         "send-keys",
         "-t",
-        &format!("coop-{id}"),
+        &format!("mule-{id}"),
         "remote-input",
         "Enter",
     ]);
     assert!(sent.status.success());
-    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
         assert!(Instant::now() < deadline, "TUI job never completed");
         std::thread::sleep(Duration::from_millis(20));
     }
 
     let artifacts = sshd.ssh(&[&format!(
-        "d=$XDG_STATE_HOME/coop/jobs/{id}; cat $d/mode; cat $d/log; cat $d/screen"
+        "d=$XDG_STATE_HOME/mule/jobs/{id}; cat $d/mode; cat $d/log; cat $d/screen"
     )]);
     assert!(artifacts.status.success());
     let text = String::from_utf8_lossy(&artifacts.stdout);
@@ -687,10 +687,10 @@ fn tui_tail_reads_screen_by_default_and_raw_transcript_only_when_requested() {
     let config = sshd.write_config(&tmux.name);
     let command = "printf 'first\\n'; printf '\\033[2Jvisible\\n'; IFS= read -r answer; printf 'final:%s\\n' \"$answer\"";
 
-    let id = stdout(&sshd.coop(&config, &["--quiet", "run", "--tui", command]));
+    let id = stdout(&sshd.mule(&config, &["--quiet", "run", "--tui", command]));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let screen = sshd.coop(&config, &["tail", &id]);
+        let screen = sshd.mule(&config, &["tail", &id]);
         if String::from_utf8_lossy(&screen.stdout).contains("visible") {
             assert!(screen.status.success());
             assert!(
@@ -713,17 +713,17 @@ fn tui_tail_reads_screen_by_default_and_raw_transcript_only_when_requested() {
         &tmux.name,
         "send-keys",
         "-t",
-        &format!("coop-{id}"),
+        &format!("mule-{id}"),
         "done",
         "Enter",
     ]);
     assert!(sent.status.success());
-    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
         assert!(Instant::now() < deadline, "TUI job never completed");
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let completed = sshd.coop(&config, &["tail", &id]);
+    let completed = sshd.mule(&config, &["tail", &id]);
     assert!(completed.status.success());
     assert!(
         String::from_utf8_lossy(&completed.stdout).contains("final:done"),
@@ -731,7 +731,7 @@ fn tui_tail_reads_screen_by_default_and_raw_transcript_only_when_requested() {
         completed.stdout
     );
 
-    let transcript = sshd.coop(&config, &["tail", "--transcript", "--all", &id]);
+    let transcript = sshd.mule(&config, &["tail", "--transcript", "--all", &id]);
     assert!(transcript.status.success());
     assert!(
         transcript
@@ -752,17 +752,17 @@ fn tui_follow_refuses_with_screen_and_picker_hints() {
     let _master = sshd.open_master(&sshd.socket);
     let tmux = Tmux::new(&sshd, "tui-follow");
     let config = sshd.write_config(&tmux.name);
-    let id = stdout(&sshd.coop(&config, &["--quiet", "run", "--tui", "sleep 30"]));
+    let id = stdout(&sshd.mule(&config, &["--quiet", "run", "--tui", "sleep 30"]));
 
-    let out = sshd.coop(&config, &["tail", "-f", &id]);
+    let out = sshd.mule(&config, &["tail", "-f", &id]);
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
     let error = String::from_utf8_lossy(&out.stderr);
-    assert!(error.contains(&format!("coop tail {id}")), "{error}");
+    assert!(error.contains(&format!("mule tail {id}")), "{error}");
     assert!(error.contains("murmur pick --all"), "{error}");
     assert!(!error.contains("--transcript"), "{error}");
 
-    let _ = sshd.coop(&config, &["--quiet", "kill", "--rm", &id]);
+    let _ = sshd.mule(&config, &["--quiet", "kill", "--rm", &id]);
 }
 
 #[test]
@@ -773,21 +773,21 @@ fn tui_timeout_and_kill_keep_existing_rc_and_cleanup_contracts() {
     let tmux = Tmux::new(&sshd, "tui-lifecycle");
     let config = sshd.write_config(&tmux.name);
 
-    let timed = stdout(&sshd.coop(
+    let timed = stdout(&sshd.mule(
         &config,
         &["run", "--tui", "--max-secs", "1", "trap '' TERM; sleep 30"],
     ));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while stdout(&sshd.coop(&config, &["poll", &timed])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &timed])) == "running" {
         assert!(Instant::now() < deadline, "TUI timeout never fired");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &timed])), "124");
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &timed])), "124");
 
-    let killed = stdout(&sshd.coop(&config, &["run", "--tui", "sleep 30"]));
-    let kill = sshd.coop(&config, &["kill", &killed]);
+    let killed = stdout(&sshd.mule(&config, &["run", "--tui", "sleep 30"]));
+    let kill = sshd.mule(&config, &["kill", &killed]);
     assert!(kill.status.success());
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &killed])), "137");
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &killed])), "137");
 
     let sessions = sshd.ssh(&[
         "tmux",
@@ -799,7 +799,7 @@ fn tui_timeout_and_kill_keep_existing_rc_and_cleanup_contracts() {
     ]);
     let names = String::from_utf8_lossy(&sessions.stdout);
     for id in [&timed, &killed] {
-        assert!(!names.contains(&format!("coop-{id}")), "{names}");
+        assert!(!names.contains(&format!("mule-{id}")), "{names}");
         assert!(!names.contains(&format!("watch-{id}")), "{names}");
     }
     clean_jobs(&sshd, &[timed, killed]);
@@ -820,7 +820,7 @@ fn dispatch_returns_before_the_job_finishes() {
     // real dispatch measured ~125ms. Those measurements explain the design,
     // but elapsed time also measures scheduler load. Block the job on a file
     // instead and assert the ordering directly.
-    let dispatch = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let dispatch = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["run", &command])
@@ -849,7 +849,7 @@ fn dispatch_returns_before_the_job_finishes() {
     );
     let id = stdout(&output);
     assert_eq!(
-        stdout(&sshd.coop(&config, &["poll", &id])),
+        stdout(&sshd.mule(&config, &["poll", &id])),
         "running",
         "the detached job must still be blocked on the release file"
     );
@@ -857,7 +857,7 @@ fn dispatch_returns_before_the_job_finishes() {
     done_tx.send(()).unwrap();
     watchdog.join().unwrap();
 
-    let _ = sshd.coop(&config, &["kill", &id]);
+    let _ = sshd.mule(&config, &["kill", &id]);
     clean_jobs(&sshd, &[id]);
 }
 
@@ -872,7 +872,7 @@ fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
     text.push_str("max_job_secs = 1\n");
     std::fs::write(&config, text).unwrap();
 
-    let out = sshd.coop(&config, &["run", "trap '' TERM; sleep 30"]);
+    let out = sshd.mule(&config, &["run", "trap '' TERM; sleep 30"]);
     assert!(
         out.status.success(),
         "{}",
@@ -881,11 +881,11 @@ fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
     let id = stdout(&out);
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
         assert!(Instant::now() < deadline, "timed-out job never finished");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "124");
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "124");
 
     let sessions = sshd.ssh(&[
         "tmux",
@@ -896,7 +896,7 @@ fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
         "#{session_name}",
     ]);
     assert!(
-        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("mule-{id}")),
         "timed-out job left its tmux session alive"
     );
 
@@ -919,7 +919,7 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     // "a job finishing inside its cap is untouched", and a cap the harness
     // itself can breach tests the harness instead.
     const CAP_SECS: u64 = 5;
-    let out = sshd.coop(
+    let out = sshd.mule(
         &config,
         &["run", "--max-secs", &CAP_SECS.to_string(), "exit 7"],
     );
@@ -931,11 +931,11 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     let id = stdout(&out);
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
         assert!(Instant::now() < deadline, "fast job never finished");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "7");
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "7");
 
     // Now outlive the cap. This is the assertion the test exists for, and it
     // cannot be replaced by checking that the watchdog session is gone: the
@@ -949,7 +949,7 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     // smallest value that comfortably clears a loaded dispatch.
     std::thread::sleep(Duration::from_secs(CAP_SECS + 2));
     assert_eq!(
-        stdout(&sshd.coop(&config, &["poll", &id])),
+        stdout(&sshd.mule(&config, &["poll", &id])),
         "7",
         "the watchdog fired after the command had already finished and \
          overwrote its rc"
@@ -963,7 +963,7 @@ fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
         "#{session_name}",
     ]);
     assert!(
-        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("mule-{id}")),
         "fast job left its tmux session or watchdog alive"
     );
 
@@ -979,7 +979,7 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
     let config = sshd.write_config(&tmux.name);
     let command = "python3 -c \"print('ok')\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\n#\ttabbed\"";
 
-    let run = sshd.coop(&config, &["run", command]);
+    let run = sshd.mule(&config, &["run", command]);
     assert!(
         run.status.success(),
         "{}",
@@ -987,7 +987,7 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
     );
     let id = stdout(&run);
 
-    let table = stdout(&sshd.coop(&config, &["ls", "--all"]));
+    let table = stdout(&sshd.mule(&config, &["ls", "--all"]));
     let row = table
         .lines()
         .find(|line| line.starts_with(&id))
@@ -1003,7 +1003,7 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
         "embedded whitespace must not create a continuation row: {table}"
     );
 
-    let json = stdout(&sshd.coop(&config, &["ls", "--all", "--json"]));
+    let json = stdout(&sshd.mule(&config, &["ls", "--all", "--json"]));
     assert!(
         json.contains(
             "\"cmd\":\"python3 -c \\\"print('ok')\\n# this deliberately long comment makes the human listing truncate rather than wrap across the terminal\\n#\\ttabbed\\\"\""
@@ -1011,7 +1011,7 @@ fn ls_keeps_multiline_commands_on_one_row_without_shortening_json() {
         "json must keep the complete command: {json}"
     );
 
-    let full = stdout(&sshd.coop(&config, &["ls", "--all", "--full"]));
+    let full = stdout(&sshd.mule(&config, &["ls", "--all", "--full"]));
     let full_row = full
         .lines()
         .find(|line| line.starts_with(&id))
@@ -1036,26 +1036,26 @@ fn a_job_survives_the_loss_of_its_tmux_server() {
     let tmux = Tmux::new(&sshd, "durable");
     let config = sshd.write_config(&tmux.name);
 
-    let out = sshd.coop(&config, &["run", "echo durable; exit 9"]);
+    let out = sshd.mule(&config, &["run", "echo durable; exit 9"]);
     let id = stdout(&out);
 
     // Wait for completion, then destroy the tmux server entirely. `rc` and
     // `log` are files, so the record must outlive the process container.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while stdout(&sshd.coop(&config, &["poll", &id])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
         assert!(Instant::now() < deadline, "job never finished");
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(tmux); // destroy the server on purpose: the record must outlive it
 
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "9");
-    assert_eq!(stdout(&sshd.coop(&config, &["tail", &id])), "durable");
-    let wait = sshd.coop(&config, &["wait", &id]);
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "9");
+    assert_eq!(stdout(&sshd.mule(&config, &["tail", &id])), "durable");
+    let wait = sshd.mule(&config, &["wait", &id]);
     assert_eq!(wait.status.code(), Some(9), "wait returns the job's code");
     assert!(wait.stdout.is_empty(), "wait must keep stdout clean");
     let hint = String::from_utf8_lossy(&wait.stderr);
-    assert!(hint.contains(&format!("coop tail {id}")), "{hint}");
-    assert!(hint.contains(&format!("coop rm {id}")), "{hint}");
+    assert!(hint.contains(&format!("mule tail {id}")), "{hint}");
+    assert!(hint.contains(&format!("mule rm {id}")), "{hint}");
 
     clean_jobs(&sshd, &[id]);
 }
@@ -1068,10 +1068,10 @@ fn the_private_tmux_server_is_invisible_to_the_default_one() {
     let tmux = Tmux::new(&sshd, "private");
     let config = sshd.write_config(&tmux.name);
 
-    let id = stdout(&sshd.coop(&config, &["run", "sleep 30"]));
+    let id = stdout(&sshd.mule(&config, &["run", "sleep 30"]));
 
     // Invariant 2. `tmux ls` with no -L talks to the user's own server, which
-    // must never show coop's sessions.
+    // must never show mule's sessions.
     let default = sshd.ssh(&["tmux", "ls"]);
     let listing = format!(
         "{}{}",
@@ -1079,18 +1079,18 @@ fn the_private_tmux_server_is_invisible_to_the_default_one() {
         String::from_utf8_lossy(&default.stderr)
     );
     assert!(
-        !listing.contains(&format!("coop-{id}")),
-        "coop's session leaked into the default tmux server: {listing}"
+        !listing.contains(&format!("mule-{id}")),
+        "mule's session leaked into the default tmux server: {listing}"
     );
 
-    // It is present on coop's own server, so the check above is meaningful.
+    // It is present on mule's own server, so the check above is meaningful.
     let private = sshd.ssh(&["tmux", "-L", &tmux.name, "ls"]);
     assert!(
-        String::from_utf8_lossy(&private.stdout).contains(&format!("coop-{id}")),
-        "expected the session on coop's private server"
+        String::from_utf8_lossy(&private.stdout).contains(&format!("mule-{id}")),
+        "expected the session on mule's private server"
     );
 
-    let _ = sshd.coop(&config, &["kill", &id]);
+    let _ = sshd.mule(&config, &["kill", &id]);
     clean_jobs(&sshd, &[id]);
 }
 
@@ -1110,7 +1110,7 @@ fn a_missing_master_exits_three_with_the_recovery_command() {
         vec!["kill", "abc123"],
         vec!["rm", "abc123"],
     ] {
-        let out = sshd.coop(&config, &verb);
+        let out = sshd.mule(&config, &verb);
         assert_eq!(
             out.status.code(),
             Some(3),
@@ -1134,7 +1134,7 @@ fn a_missing_master_exits_three_with_the_recovery_command() {
     // exactly the situation a caller reaches for it -- and both were covered
     // only over `Fake`, which has no process and so no exit status to check.
     for verb in [vec!["ls"], vec!["host", "list"]] {
-        let out = sshd.coop(&config, &verb);
+        let out = sshd.mule(&config, &verb);
         assert_eq!(
             out.status.code(),
             Some(0),
@@ -1165,13 +1165,13 @@ fn host_info_probes_real_capabilities_and_reports_a_down_master() {
     )
     .unwrap();
 
-    let list = sshd.coop(&config, &["host", "list"]);
+    let list = sshd.mule(&config, &["host", "list"]);
     assert!(list.status.success());
     // The hint names the verb, in the surface the caller asked for -- a table
     // reader gets the table form. `--json` is asserted against `host list
     // --json` in tests/host_list.rs, where both branches are covered.
     assert!(
-        String::from_utf8_lossy(&list.stderr).contains("coop host info"),
+        String::from_utf8_lossy(&list.stderr).contains("mule host info"),
         "host list must point agents at the opt-in probe"
     );
 
@@ -1181,7 +1181,7 @@ fn host_info_probes_real_capabilities_and_reports_a_down_master() {
     let expected_ram = stdout(&sshd.ssh(&[
         "if [ -r /proc/meminfo ]; then awk '/MemTotal/{printf \"%.0f\", $2/1048576}' /proc/meminfo; else echo $(( $(sysctl -n hw.memsize) / 1073741824 )); fi",
     ]));
-    let out = sshd.coop(&config, &["host", "info", "--json"]);
+    let out = sshd.mule(&config, &["host", "info", "--json"]);
     assert!(
         out.status.success(),
         "host info failed: {}",
@@ -1242,19 +1242,19 @@ fn kill_rm_ends_the_job_and_drops_its_state() {
     let tmux = Tmux::new(&sshd, "kill-rm");
     let config = sshd.write_config(&tmux.name);
 
-    let out = sshd.coop(&config, &["run", "sleep 60"]);
+    let out = sshd.mule(&config, &["run", "sleep 60"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let id = stdout(&out);
-    assert_eq!(stdout(&sshd.coop(&config, &["poll", &id])), "running");
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
 
     // One verb, one decision. `kill` then `rm` was two round trips on the
     // capped channel for what is nearly always a single intent: ending a job
     // you did not mean to start also means discarding its output.
-    let killed = sshd.coop(&config, &["kill", "--rm", &id]);
+    let killed = sshd.mule(&config, &["kill", "--rm", &id]);
     assert!(
         killed.status.success(),
         "{}",
@@ -1268,7 +1268,7 @@ fn kill_rm_ends_the_job_and_drops_its_state() {
 
     // The state directory is gone, so the job is absent from `ls --all`
     // entirely rather than listed as done.
-    let listed = stdout(&sshd.coop(&config, &["ls", "--all", "--quiet"]));
+    let listed = stdout(&sshd.mule(&config, &["ls", "--all", "--quiet"]));
     assert!(
         !listed.contains(&id),
         "kill --rm must leave no job state: {listed}"
@@ -1284,7 +1284,7 @@ fn kill_rm_ends_the_job_and_drops_its_state() {
         "#{session_name}",
     ]);
     assert!(
-        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("coop-{id}")),
+        !String::from_utf8_lossy(&sessions.stdout).contains(&format!("mule-{id}")),
         "kill --rm must end the job, not just forget it"
     );
 }
@@ -1297,8 +1297,8 @@ fn removed_jobs_are_missing_not_orphaned() {
     let tmux = Tmux::new(&sshd, "missing-job");
     let config = sshd.write_config(&tmux.name);
 
-    let id = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
-    let removed = sshd.coop(&config, &["kill", "--rm", &id]);
+    let id = stdout(&sshd.mule(&config, &["run", "sleep 60"]));
+    let removed = sshd.mule(&config, &["kill", "--rm", &id]);
     assert!(removed.status.success());
 
     for args in [
@@ -1307,7 +1307,7 @@ fn removed_jobs_are_missing_not_orphaned() {
         vec!["wait", &id],
         vec!["tail", &id],
     ] {
-        let out = sshd.coop(&config, &args);
+        let out = sshd.mule(&config, &args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}: {:?}", out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1331,21 +1331,21 @@ fn quiet_drops_hints_but_keeps_warnings() {
     // session: the pipeline's `head` becomes the job's rc.
     let command = "grep -rn proxy /etc/hosts 2>/dev/null | head -12";
 
-    let loud = sshd.coop(&config, &["run", command]);
+    let loud = sshd.mule(&config, &["run", command]);
     assert!(loud.status.success());
     let loud_err = String::from_utf8_lossy(&loud.stderr);
     assert!(
         loud_err.contains("may hide the job's failure"),
         "{loud_err}"
     );
-    assert!(loud_err.contains("next: coop wait"), "{loud_err}");
+    assert!(loud_err.contains("next: mule wait"), "{loud_err}");
 
     // `--quiet` means "stop holding my hand", not "disable the safety net".
     // Those are different classes: a hint is convenience, a warning is
     // correctness. Sharing one flag meant the documented way to get a clean
-    // id -- which is what a caller piping coop through `tail -1` is after --
+    // id -- which is what a caller piping mule through `tail -1` is after --
     // also silenced the warning about their own command.
-    let quiet = sshd.coop(&config, &["--quiet", "run", command]);
+    let quiet = sshd.mule(&config, &["--quiet", "run", command]);
     assert!(quiet.status.success());
     let quiet_err = String::from_utf8_lossy(&quiet.stderr);
     assert!(
@@ -1353,11 +1353,11 @@ fn quiet_drops_hints_but_keeps_warnings() {
         "--quiet must keep the warning: {quiet_err:?}"
     );
     assert!(
-        !quiet_err.contains("next: coop wait"),
+        !quiet_err.contains("next: mule wait"),
         "--quiet must drop the hints: {quiet_err:?}"
     );
 
-    // stdout stays exactly the id on both paths, so `id=$(coop run ...)` is
+    // stdout stays exactly the id on both paths, so `id=$(mule run ...)` is
     // the clean way to get a handle and needs no piping at all.
     for out in [&loud, &quiet] {
         let id = stdout(out);
@@ -1375,13 +1375,13 @@ fn ls_running_excludes_finished_and_orphaned_jobs() {
     let tmux = Tmux::new(&sshd, "ls-running");
     let config = sshd.write_config(&tmux.name);
 
-    let running = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
-    let done = stdout(&sshd.coop(&config, &["run", "exit 0"]));
-    let orphan = stdout(&sshd.coop(&config, &["run", "sleep 60"]));
+    let running = stdout(&sshd.mule(&config, &["run", "sleep 60"]));
+    let done = stdout(&sshd.mule(&config, &["run", "exit 0"]));
+    let orphan = stdout(&sshd.mule(&config, &["run", "sleep 60"]));
 
     // Wait for the short job to finish; ordering, not a guessed sleep.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while stdout(&sshd.coop(&config, &["poll", &done])) == "running" {
+    while stdout(&sshd.mule(&config, &["poll", &done])) == "running" {
         assert!(
             std::time::Instant::now() < deadline,
             "short job never finished"
@@ -1397,11 +1397,11 @@ fn ls_running_excludes_finished_and_orphaned_jobs() {
         &tmux.name,
         "kill-session",
         "-t",
-        &format!("coop-{orphan}"),
+        &format!("mule-{orphan}"),
     ]);
     assert!(killed.status.success());
 
-    let table = stdout(&sshd.coop(&config, &["ls", "--running", "--quiet"]));
+    let table = stdout(&sshd.mule(&config, &["ls", "--running", "--quiet"]));
     assert!(table.contains(&running), "running job missing: {table}");
     assert!(
         !table.contains(&done),
@@ -1412,12 +1412,12 @@ fn ls_running_excludes_finished_and_orphaned_jobs() {
         "orphan leaked into --running: {table}"
     );
 
-    let json = stdout(&sshd.coop(&config, &["ls", "--running", "--json", "--quiet"]));
+    let json = stdout(&sshd.mule(&config, &["ls", "--running", "--json", "--quiet"]));
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value["items"].as_array().unwrap().len(), 1);
     assert_eq!(value["items"][0]["id"], running);
     assert_eq!(value["items"][0]["state"], "running");
 
-    let _ = sshd.coop(&config, &["kill", "--rm", &running]);
+    let _ = sshd.mule(&config, &["kill", "--rm", &running]);
     clean_jobs(&sshd, &[done, orphan]);
 }

@@ -54,7 +54,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let script = format!(
         "d={dir}; [ -d $d ] && exists=1 || exists=0; printf 'exists=%s\\n' \"$exists\"; \
          rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
-         alive=$(tmux -L {} has-session -t coop-{id} 2>/dev/null && echo 1 || echo 0); \
+         alive=$(tmux -L {} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
          printf 'alive=%s\\n' \"$alive\"; \
          cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
          if [ -n \"$rc\" ]; then end_mtime=$(stat -c %Y $d/rc 2>/dev/null || stat -f %m $d/rc 2>/dev/null); \

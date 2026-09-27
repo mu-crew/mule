@@ -1,14 +1,14 @@
 //! Job ids are parsed at the CLI boundary, so a hostile id cannot reach the
 //! remote shell.
 
-use coop::wrapper::JobId;
+use mule::wrapper::JobId;
 
 #[test]
 fn hostile_ids_are_rejected() {
     // Every one of these was previously interpolated raw into a remote path, a
     // tmux target, and a shell script. `$(...)` in particular executed: a probe
     // built with the first of these produced
-    //   d=$HOME/.local/state/coop/jobs/x$(touch /tmp/PWNED)y; ...
+    //   d=$HOME/.local/state/mule/jobs/x$(touch /tmp/PWNED)y; ...
     // which is command execution on the remote host from a CLI argument.
     let hostile = [
         "x$(touch /tmp/PWNED)y",
@@ -25,7 +25,7 @@ fn hostile_ids_are_rejected() {
         // tmux's target grammar reserves these two.
         "abc:12",
         "abc.12",
-        // Wrong shape, so not an id coop ever minted.
+        // Wrong shape, so not an id mule ever minted.
         "",
         "abc12",
         "abc1234",
@@ -55,7 +55,7 @@ fn generated_ids_always_parse() {
     // `run` mints ids and then parses them; if that ever failed it would be a
     // panic on the dispatch path rather than a rejected argument.
     for _ in 0..500 {
-        let generated = coop::wrapper::new_id();
+        let generated = mule::wrapper::new_id();
         assert!(
             generated.parse::<JobId>().is_ok(),
             "generated id {generated:?} does not parse"
@@ -67,5 +67,5 @@ fn generated_ids_always_parse() {
 fn the_rejection_message_says_what_a_valid_id_looks_like() {
     let err = "nope".parse::<JobId>().unwrap_err().to_string();
     assert!(err.contains("hex"), "{err}");
-    assert!(err.contains("coop run"), "{err}");
+    assert!(err.contains("mule run"), "{err}");
 }

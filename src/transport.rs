@@ -1,11 +1,11 @@
-//! The seam between coop's logic and the ssh channel.
+//! The seam between mule's logic and the ssh channel.
 //!
 //! Every invariant that matters was measured against a real capped host and is
 //! unreachable from a plain unit test. This trait is what makes test layer 1
-//! possible at all: `Fake` records the exact script coop would have run, so
+//! possible at all: `Fake` records the exact script mule would have run, so
 //! wrapper construction and state mapping are tested as pure functions.
 //!
-//! One rule shapes the whole file: **`run` takes coop's ticket lock, and
+//! One rule shapes the whole file: **`run` takes mule's ticket lock, and
 //! `master_alive` does not.** `ssh -O check` talks only to the mux socket, opens
 //! no session channel, and measured at 0s — so exempting it is safe, and having
 //! it be a *different method* makes the exemption structural instead of a rule
@@ -45,7 +45,7 @@ impl Output {
 
     /// The stdout as text, for the many call sites parsing a known-ASCII reply
     /// (`rc=0`, a session count). Lossy on purpose and only here: these fields
-    /// are coop's own output, not the user's.
+    /// are mule's own output, not the user's.
     pub fn text(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.stdout)
     }
@@ -65,7 +65,7 @@ pub trait Transport {
     /// Callers outside this module want [`Transport::run`], which is the same
     /// thing with the lock held. This is the unlocked primitive an
     /// implementation provides; calling it directly opens a session channel
-    /// that coop's own fairness gate cannot see, which on a `MaxSessions 1`
+    /// that mule's own fairness gate cannot see, which on a `MaxSessions 1`
     /// host recreates the contention the whole tool exists to remove.
     fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output>;
 
@@ -77,7 +77,7 @@ pub trait Transport {
     /// Run a shell script on the host, holding the host's ticket lock.
     ///
     /// **This is the only way callers should reach a host.** The lock covers
-    /// every ssh coop issues except `master_alive`, because two concurrent
+    /// every ssh mule issues except `master_alive`, because two concurrent
     /// reads hit exactly the cap that motivated the tool -- but until now that
     /// was prose, enforced by six call sites each remembering to wrap
     /// `run_unlocked` in `with_lock`. A seventh that forgot would compile,
@@ -91,22 +91,22 @@ pub trait Transport {
     }
 }
 
-/// Every ssh coop runs, configured so it can never prompt.
+/// Every ssh mule runs, configured so it can never prompt.
 ///
 /// `BatchMode=yes` alone is not enough. It gags *ssh's* own prompts, but a
 /// `ProxyCommand` is a separate program with its own terminal: a site wrapper
-/// doing 2FA (`ProxyCommand x2ssh ...`) prompts regardless, so every coop call
+/// doing 2FA (`ProxyCommand x2ssh ...`) prompts regardless, so every mule call
 /// on a host with a dead master spawned a Duo passcode prompt into the user's
-/// terminal -- repeatedly, since coop is expected to be called often, and with
+/// terminal -- repeatedly, since mule is expected to be called often, and with
 /// no indication of which invocation was asking.
 ///
 /// Three settings close it:
 ///   BatchMode=yes           - ssh itself never asks
-///   ControlMaster=no        - never create a master as a side effect; coop
+///   ControlMaster=no        - never create a master as a side effect; mule
 ///                             requires one to exist and refuses otherwise
 ///   ProxyCommand=none       - do not run a site wrapper that can prompt
 ///
-/// `ProxyCommand=none` is safe precisely because coop only ever multiplexes
+/// `ProxyCommand=none` is safe precisely because mule only ever multiplexes
 /// over an EXISTING master: the socket is already connected, so no proxy is
 /// needed to reach the host. The master the user opens by hand keeps its own
 /// ProxyCommand, which is where 2FA belongs -- once per ControlPersist window,
@@ -126,7 +126,7 @@ fn base_args(host: &Host) -> Vec<String> {
 }
 
 /// Arguments for the lock-exempt master probe. Exposed for tests, which assert
-/// that no coop invocation can prompt.
+/// that no mule invocation can prompt.
 pub fn probe_args(host: &Host) -> Vec<String> {
     let mut args = base_args(host);
     args.extend(["-O".into(), "check".into()]);
@@ -188,7 +188,7 @@ impl Transport for Ssh {
 /// A recording transport for test layer 1.
 ///
 /// Deliberately **not** `#[cfg(test)]`: integration tests live in their own
-/// crate and could not see it otherwise, and layer 1 is where most of coop's
+/// crate and could not see it otherwise, and layer 1 is where most of mule's
 /// logic is actually verified.
 #[derive(Debug, Default)]
 pub struct Fake {

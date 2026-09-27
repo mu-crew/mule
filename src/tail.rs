@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 
 use crate::config::Host;
-use crate::errors::CoopError;
+use crate::errors::MuleError;
 use crate::probe::{From as ProbeFrom, State, next_interval, probe};
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
@@ -40,15 +40,15 @@ pub fn once_mode_aware(
         "if [ ! -d {dir} ]; then exit 44; \
          elif [ \"$(cat {dir}/mode 2>/dev/null)\" = tui ]; then \
            printf '\\036'; \
-           if tmux -L {socket} capture-pane -p -J -t coop-{id} 2>/dev/null; then :; \
+           if tmux -L {socket} capture-pane -p -J -t mule-{id} 2>/dev/null; then :; \
            elif [ -f {dir}/screen ]; then cat {dir}/screen; \
-           else echo 'coop: TUI pane is gone and no saved screen is available' >&2; fi; \
+           else echo 'mule: TUI pane is gone and no saved screen is available' >&2; fi; \
          else printf '\\037'; {read}; printf '\\037%s' \"$(cat {dir}/truncated 2>/dev/null)\"; fi",
         socket = host.tmux_socket,
     );
     let output = transport.run(host, &script)?;
     if output.code == 44 {
-        return Err(CoopError::MissingJob { id: id.to_string() }.into());
+        return Err(MuleError::MissingJob { id: id.to_string() }.into());
     }
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
@@ -80,7 +80,7 @@ fn write_transcript(host: &Host, bytes: &[u8], out: &mut dyn Write) -> Result<()
     out.write_all(body)?;
     if truncated {
         eprintln!(
-            "coop: log was capped at {} bytes; the job ran to completion but later output was discarded\n  the log holds stdout and stderr merged, in the order the job wrote them; redirect inside your command to separate them",
+            "mule: log was capped at {} bytes; the job ran to completion but later output was discarded\n  the log holds stdout and stderr merged, in the order the job wrote them; redirect inside your command to separate them",
             host.max_log_bytes
         );
     }
@@ -110,7 +110,7 @@ pub fn once(
     );
     let output = transport.run(host, &script)?;
     if output.code == 44 {
-        return Err(CoopError::MissingJob { id: id.to_string() }.into());
+        return Err(MuleError::MissingJob { id: id.to_string() }.into());
     }
     if output.code != 0 {
         bail!("tail failed: {}", output.stderr.trim());
@@ -177,7 +177,7 @@ fn wait_loop(
     let mut interval = Duration::from_secs(1);
     loop {
         let result = probe(transport, host, id, from)
-            .map_err(|error| error.context(CoopError::Dropped { id: id.to_string() }))?;
+            .map_err(|error| error.context(MuleError::Dropped { id: id.to_string() }))?;
         let new_bytes = !result.bytes.is_empty();
         if let Some(writer) = out.as_deref_mut() {
             writer.write_all(&result.bytes)?;
@@ -195,7 +195,7 @@ fn wait_loop(
             // final bytes are still in flight -- measured: rc present with the
             // log file not yet created. Returning on the first `Done` therefore
             // dropped the output of any job short enough to finish inside one
-            // probe interval, which is most of them: `coop run --wait ls`
+            // probe interval, which is most of them: `mule run --wait ls`
             // printed the id and nothing else.
             //
             // A single extra round trip, only on the terminal path, and only
@@ -210,15 +210,15 @@ fn wait_loop(
                 return Ok(code);
             }
             State::Orphan => {
-                return Err(CoopError::Orphan { id: id.to_string() }.into());
+                return Err(MuleError::Orphan { id: id.to_string() }.into());
             }
             State::Missing => {
-                return Err(CoopError::MissingJob { id: id.to_string() }.into());
+                return Err(MuleError::MissingJob { id: id.to_string() }.into());
             }
             State::Running => {}
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            return Err(CoopError::Timeout { id: id.to_string() }.into());
+            return Err(MuleError::Timeout { id: id.to_string() }.into());
         }
         let sleep = timeout
             .map(|limit| interval.min(limit.saturating_sub(started.elapsed())))

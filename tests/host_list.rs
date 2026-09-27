@@ -1,19 +1,19 @@
-//! `coop host list`, and the master-detection seam beneath it.
+//! `mule host list`, and the master-detection seam beneath it.
 //!
 //! Test layer 1: no network, no ssh, no tmux.
 
-use coop::config::Config;
-use coop::transport::{Fake, Transport};
+use mule::config::Config;
+use mule::transport::{Fake, Transport};
 
 #[test]
 fn host_list_json_escapes_every_free_text_field() {
     // Host names now have a filename-component grammar, so the free-text
     // target and socket fields carry the hostile JSON characters.
-    let dir = std::env::temp_dir().join(format!("coop-host-json-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mule-host-json-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("config.toml");
     std::fs::write(&config, "[hosts.safe-name]\ntarget = \"quote\\\" slash\\\\ newline\\n tab\\t control\\u0001 café\"\nsocket = \"/tmp/quote\\\"-slash\\\\-newline\\n-tab\\t-control\\u0001-café.sock\"\n").unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(&config)
         .args(["host", "list", "--json"])
@@ -59,8 +59,8 @@ fn a_down_master_is_reported_not_fatal() {
     // treats it as exit 3.
     let cfg = Config::parse("[hosts.a]\n[hosts.b]\n").unwrap();
     let fake = Fake::no_master();
-    assert!(coop::cli::host_list(&cfg, &fake, false).is_ok());
-    assert!(coop::cli::host_list(&cfg, &fake, true).is_ok());
+    assert!(mule::cli::host_list(&cfg, &fake, false).is_ok());
+    assert!(mule::cli::host_list(&cfg, &fake, true).is_ok());
 }
 
 #[test]
@@ -69,12 +69,12 @@ fn every_configured_host_is_probed() {
     impl Transport for Counting {
         fn run_unlocked(
             &self,
-            _h: &coop::config::Host,
+            _h: &mule::config::Host,
             _s: &str,
-        ) -> anyhow::Result<coop::transport::Output> {
+        ) -> anyhow::Result<mule::transport::Output> {
             panic!("host list must not run scripts");
         }
-        fn master_alive(&self, _h: &coop::config::Host) -> bool {
+        fn master_alive(&self, _h: &mule::config::Host) -> bool {
             self.0.set(self.0.get() + 1);
             true
         }
@@ -82,14 +82,14 @@ fn every_configured_host_is_probed() {
 
     let cfg = Config::parse("[hosts.a]\n[hosts.b]\n[hosts.c]\n").unwrap();
     let t = Counting(std::cell::Cell::new(0));
-    coop::cli::host_list(&cfg, &t, false).unwrap();
+    mule::cli::host_list(&cfg, &t, false).unwrap();
     assert_eq!(t.0.get(), 3);
 }
 
 #[test]
 fn fake_replays_queued_outputs_in_order() {
     // The queue is how later tasks assert multi-round-trip flows (tail, ls).
-    use coop::transport::Output;
+    use mule::transport::Output;
     let cfg = Config::parse("[hosts.dev]\n").unwrap();
     let host = cfg.host(None).unwrap();
     let fake = Fake::new();
@@ -110,7 +110,7 @@ fn stdout_survives_invalid_utf8() {
     // tarball or invalid UTF-8 must round-trip exactly. An earlier version ran
     // `String::from_utf8_lossy` here and silently substituted replacement
     // characters, corrupting the one artifact the design calls the truth.
-    use coop::transport::Output;
+    use mule::transport::Output;
 
     let raw: Vec<u8> = vec![0x00, 0xff, 0xfe, b'h', b'i', 0x80, 0x0a];
     let cfg = Config::parse("[hosts.dev]\n").unwrap();
@@ -130,7 +130,7 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
     // `BatchMode=yes` gags ssh's OWN prompts but not a `ProxyCommand`, which is
     // a separate program with its own terminal. A site wrapper that performs
     // 2FA (`ProxyCommand x2ssh ...`, as a corporate devserver typically sets)
-    // will prompt regardless -- so a coop call against a host whose master died
+    // will prompt regardless -- so a mule call against a host whose master died
     // could spawn a passcode prompt into the caller's terminal, with nothing
     // naming which invocation was asking.
     //
@@ -141,16 +141,16 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
     let host = cfg.host(None).unwrap();
 
     for args in [
-        coop::transport::probe_args(host),
-        coop::transport::run_args(host, "echo hi"),
+        mule::transport::probe_args(host),
+        mule::transport::run_args(host, "echo hi"),
     ] {
         let flat = args.join(" ");
         assert!(flat.contains("BatchMode=yes"), "{flat}");
-        // Never create a master as a side effect: coop requires one to exist
+        // Never create a master as a side effect: mule requires one to exist
         // and refuses otherwise, so creating one here would be both a surprise
         // and the thing that needs 2FA.
         assert!(flat.contains("ControlMaster=no"), "{flat}");
-        // Safe because coop only multiplexes over an EXISTING master: the
+        // Safe because mule only multiplexes over an EXISTING master: the
         // socket is already connected, so no proxy is needed to reach the host.
         // The user's hand-opened master keeps its own ProxyCommand, which is
         // where 2FA belongs -- once per ControlPersist window, deliberately.
@@ -158,7 +158,7 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
     }
 }
 
-/// Every human table coop prints has a header and aligned columns.
+/// Every human table mule prints has a header and aligned columns.
 ///
 /// `host list` had neither: it printed bare rows, so a reader had to know that
 /// the second field was master state and the fourth a socket path. And
@@ -166,11 +166,11 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
 /// disagreed about where each column began as soon as a value was wider than
 /// its title -- which is every real hostname.
 ///
-/// `coop ls` had already solved this with one width-measuring renderer. This
+/// `mule ls` had already solved this with one width-measuring renderer. This
 /// asserts the other two use it too.
 #[test]
 fn human_tables_have_a_header_with_aligned_columns() {
-    let dir = std::env::temp_dir().join(format!("coop-table-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mule-table-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("config.toml");
     // A short name beside a long one: the long row is what exposes a
@@ -192,7 +192,7 @@ fn human_tables_have_a_header_with_aligned_columns() {
     }
 
     for verb in [vec!["host", "list"], vec!["host", "info"]] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
             .arg("--config")
             .arg(&config)
             .args(&verb)
@@ -235,13 +235,13 @@ fn human_tables_have_a_header_with_aligned_columns() {
 /// rendering differs, and the hint should follow the caller.
 #[test]
 fn the_host_list_hint_matches_the_callers_surface() {
-    let dir = std::env::temp_dir().join(format!("coop-hint-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mule-hint-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("config.toml");
     std::fs::write(&config, "[hosts.dev]\ntarget = \"h\"\n").unwrap();
 
     let run = |args: &[&str]| -> String {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coop"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_mule"))
             .arg("--config")
             .arg(&config)
             .args(args)
@@ -252,13 +252,13 @@ fn the_host_list_hint_matches_the_callers_surface() {
 
     let table = run(&["host", "list"]);
     assert!(
-        table.contains("next: coop host info for"),
+        table.contains("next: mule host info for"),
         "a table reader gets the table form: {table:?}"
     );
 
     let json = run(&["host", "list", "--json"]);
     assert!(
-        json.contains("next: coop host info --json for"),
+        json.contains("next: mule host info --json for"),
         "a JSON reader gets the JSON form: {json:?}"
     );
 

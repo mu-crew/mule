@@ -1,6 +1,6 @@
-# coop design
+# mule design
 
-`coop` dispatches detached jobs through a private SSH control connection. A caller gets a six-hex-digit job ID, then polls, waits, or reads the remote artifact without holding an SSH session for the job's lifetime.
+`mule` dispatches detached jobs through a private SSH control connection. A caller gets a six-hex-digit job ID, then polls, waits, or reads the remote artifact without holding an SSH session for the job's lifetime.
 
 This document records the constraints, measurements, and rejected alternatives behind that design.
 
@@ -8,7 +8,7 @@ This document records the constraints, measurements, and rejected alternatives b
 
 A long `ssh host command` consumes a session channel until the command exits. On a host with `MaxSessions 1`, every concurrent call on that connection can fail with a misleading authentication error such as `Permission denied (keyboard-interactive)`.
 
-Polling without a completion artifact also fails poorly: callers guess sleep intervals, time out, and cannot distinguish a finished process from a lost one. `coop` instead returns immediately after detached dispatch and treats the remote `rc` file as the completion signal.
+Polling without a completion artifact also fails poorly: callers guess sleep intervals, time out, and cannot distinguish a finished process from a lost one. `mule` instead returns immediately after detached dispatch and treats the remote `rc` file as the completion signal.
 
 Five concurrent SSH calls to a capped connection produced the defining result: **1 of 5 succeeded without a gate; 5 of 5 succeeded with one.**
 
@@ -21,7 +21,7 @@ Five concurrent SSH calls to a capped connection produced the defining result: *
 | A second master is a second connection | Two masters had distinct PIDs and carried concurrent traffic. |
 | Connection isolation works | While `sleep 12` starved the default connection, the private connection answered immediately. |
 | Isolation works both ways | While the private connection was held for **14s**, three probes on the default connection succeeded. |
-| The tmux server is private | A session on `tmux -L coop` did not appear in `tmux ls`. |
+| The tmux server is private | A session on `tmux -L mule` did not appear in `tmux ls`. |
 | Dispatch is detached | Dispatch returned in **0s** while a full test suite kept running. |
 | The master needs a terminal | A background `ssh -MNf` could not prompt for a hardware token. |
 | Old artifacts misreport state | A leftover `rc` made a running job appear finished with the old code. |
@@ -36,13 +36,13 @@ Five concurrent SSH calls to a capped connection produced the defining result: *
 
 ### 1. Use a private SSH connection
 
-Each host uses `~/.ssh/coop/<host>.sock` by default. `MaxSessions` applies per connection, not per user. Other SSH traffic cannot take coop's session slot, and coop cannot take theirs.
+Each host uses `~/.ssh/mule/<host>.sock` by default. `MaxSessions` applies per connection, not per user. Other SSH traffic cannot take mule's session slot, and mule cannot take theirs.
 
-This was measured in both directions. Two masters ran under different PIDs. A `sleep 12` on the default connection did not block coop, and a **14s** hold on coop's connection did not block three default probes.
+This was measured in both directions. Two masters ran under different PIDs. A `sleep 12` on the default connection did not block mule, and a **14s** hold on mule's connection did not block three default probes.
 
 ### 2. Use a private tmux server
 
-Jobs run under `tmux -L coop`. They do not appear in the user's default `tmux ls` output.
+Jobs run under `tmux -L mule`. They do not appear in the user's default `tmux ls` output.
 
 ### 3. Never carry long work over SSH
 
@@ -52,11 +52,11 @@ An **18MB** transfer that held this channel for **30s** would recreate the origi
 
 ## Contention and fairness
 
-Only coop callers share coop's connection. Every SSH call takes the per-host ticket lock except `ssh -O check`, which measured **0s** and opens no session channel. This includes `run`, `poll`, `wait`, `tail`, `ls`, `kill`, and `rm`; two simultaneous polls can hit the same cap as two dispatches.
+Only mule callers share mule's connection. Every SSH call takes the per-host ticket lock except `ssh -O check`, which measured **0s** and opens no session channel. This includes `run`, `poll`, `wait`, `tail`, `ls`, `kill`, and `rm`; two simultaneous polls can hit the same cap as two dispatches.
 
-**The lock is applied by the transport, not by callers.** `Transport::run` takes it and is a provided method; an implementation supplies only `run_unlocked`. That distinction is the enforcement: the rule above was previously prose, honoured by six call sites each remembering to wrap the transport, and a seventh that forgot would have compiled, passed every test, and quietly reintroduced the contention coop exists to remove. Now forgetting is not expressible, and a test asserts it by observation -- four concurrent callers must never overlap inside the unlocked primitive.
+**The lock is applied by the transport, not by callers.** `Transport::run` takes it and is a provided method; an implementation supplies only `run_unlocked`. That distinction is the enforcement: the rule above was previously prose, honoured by six call sites each remembering to wrap the transport, and a seventh that forgot would have compiled, passed every test, and quietly reintroduced the contention mule exists to remove. Now forgetting is not expressible, and a test asserts it by observation -- four concurrent callers must never overlap inside the unlocked primitive.
 
-The lock lives at `~/.local/state/coop/<host>.lock`. A ticket lock gives bounded, first-come-first-served progress. A retrying mutex did not: four callers produced a worst wait of **4.14s** for **0.25s** of work. The lock records each waiter's PID and the holder PID, then skips either when that process is gone. After about **5s**, a waiter reports its ticket position and the holder PID but keeps waiting.
+The lock lives at `~/.local/state/mule/<host>.lock`. A ticket lock gives bounded, first-come-first-served progress. A retrying mutex did not: four callers produced a worst wait of **4.14s** for **0.25s** of work. The lock records each waiter's PID and the holder PID, then skips either when that process is gone. After about **5s**, a waiter reports its ticket position and the holder PID but keeps waiting.
 
 The lock poll interval is **5ms**. With four callers, five rounds each, and **50ms** of work per round, the workload has **1s** of serialized work and an ideal peak wait near **200ms**. A **20ms** poll interval had a roughly **275ms** median and **443ms** worst wait, and exceeded a **600ms** bound once in 15 runs. A **5ms** interval had a roughly **237ms** median and **261ms** worst wait across six runs.
 
@@ -64,7 +64,7 @@ The lock poll interval is **5ms**. With four callers, five rounds each, and **50
 
 `run` generates a six-character lowercase hexadecimal ID. Generated IDs avoid user-chosen tmux name collisions and stale state from reused names. Hex also avoids `:` and `.`, which tmux reserves in target syntax.
 
-Each job lives under `~/.local/state/coop/jobs/<id>/`:
+Each job lives under `~/.local/state/mule/jobs/<id>/`:
 
 ```text
 cmd     command as entered, for ls
@@ -83,12 +83,12 @@ The remote artifact is the only source of truth. There is no local job index. Th
 | `orphan` | The state directory exists, but the session is gone and `rc` does not exist. |
 | `missing` | The state directory does not exist. |
 
-A missing job is an ordinary error (exit 1), including for `poll --json`; it is not a poll result. `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that coop did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
+A missing job is an ordinary error (exit 1), including for `poll --json`; it is not a poll result. `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that mule did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
 
 A job wrapper has this shape. The log is capped at `max_log_bytes`; `-f /dev/null` stops a personal `~/.tmux.conf` from inflating dispatch:
 
 ```sh
-tmux -L coop -f /dev/null new-session -d -s coop-<id> \
+tmux -L mule -f /dev/null new-session -d -s mule-<id> \
   '{ cd ... && printf %s <b64> | base64 -d | sh; echo $? > <state>/rc; } \
    | { head -c <max> > <state>/log; cat > <state>/.overflow; ... }'
 ```
@@ -98,14 +98,14 @@ With `--max-secs` or `max_job_secs`, a second `watch-<id>` session writes **124*
 Both the command and a user-supplied working directory are base64-encoded. They cross the local argument parser, the remote shell, tmux argument parsing, and `sh`; layered quoting reopens injection and expansion bugs at each boundary. The `cmd` file is a display copy, not executable input.
 
 By default, only the final command shell receives `MU_MANAGED_AGENT=1` and
-`MU_AGENT_NAME=coop-<id>`. A non-empty local `MU_WORKSTREAM` is base64-encoded,
+`MU_AGENT_NAME=mule-<id>`. A non-empty local `MU_WORKSTREAM` is base64-encoded,
 decoded into that shell's environment, and otherwise omitted. `run --human`
 omits all three variables. The SSH dispatch shell and watchdog never receive
 this metadata.
 
 ## Shell and working directory
 
-Jobs use a non-login, non-interactive shell, so login profiles do not run. A command therefore does not inherit whatever an interactive session would have set up, which is what stops a job depending on a host's dotfiles: an irreproducible job fails as "works when I ssh in, fails under coop", and the person debugging it is rarely the person who edited the dotfile.
+Jobs use a non-login, non-interactive shell, so login profiles do not run. A command therefore does not inherit whatever an interactive session would have set up, which is what stops a job depending on a host's dotfiles: an irreproducible job fails as "works when I ssh in, fails under mule", and the person debugging it is rarely the person who edited the dotfile.
 
 **Bash is a partial exception, and it matters in practice.** Bash sources `~/.bashrc` even for a non-interactive command when its input is a network connection — the historical rshd/sshd case. So a `PATH` set in `.bashrc`, above that file's usual interactive bail-out, does reach a job. What does *not* run is `.bash_profile`, which is where an environment manager's `activate` normally lives.
 
@@ -117,15 +117,15 @@ Considered and rejected: a config key or flag to run jobs under a login or inter
 
 Measured per invocation on a real host: `sh -c` **1ms**, `bash -ic` **58ms**, `bash -lc` **83ms**, `zsh -ic` **97ms**. Against a ~125ms dispatch, a login shell is a ~65% increase on the operation this design exists to keep short — and it bought nothing on the host tested, because every tool already resolved through shims. The only observable difference was `PATH` length and shim-versus-activated paths, at identical versions.
 
-A caller who genuinely needs activation can ask for it, explicitly and visibly in `coop ls`:
+A caller who genuinely needs activation can ask for it, explicitly and visibly in `mule ls`:
 
 ```sh
-coop run 'source ~/.zshrc && npm test'
+mule run 'source ~/.zshrc && npm test'
 ```
 
 A finer-grained key — "bash plus this one manager" — is worse still: it is a small environment DSL inside a dispatcher, and the managers already answer it with shims. If a host ever proves it needs this, the honest shape is one opaque `shell` key holding the command to run, not a boolean and not a list of managers. Adding it before a host demands it would mean building, testing and maintaining a key nobody asked for.
 
-`run --cwd <dir>` sets the working directory. Otherwise coop uses the host's `default_cwd`, then the remote home directory. A failed `cd` fails the job instead of running in the wrong directory. Callers that need an environment manager must source it in the command.
+`run --cwd <dir>` sets the working directory. Otherwise mule uses the host's `default_cwd`, then the remote home directory. A failed `cd` fails the job instead of running in the wrong directory. Callers that need an environment manager must source it in the command.
 
 The directory is a **path, not a shell expression**, and those two requirements pull against each other. Encoding it keeps a space or a `$(...)` from being interpreted; encoding it also stops `~` and `$HOME` expanding, and only the remote shell knows the remote home. So a home-relative path is emitted as an unquoted `$HOME` with the remainder still encoded, which satisfies both: `~/dir with space` expands *and* cannot split.
 
@@ -139,35 +139,35 @@ path and exits non-zero, naming the file and the next step. A bare
 leaves a first-time caller nowhere; a file that already exists is something to
 edit.
 
-Every host in the template is commented out, so it configures nothing: coop
+Every host in the template is commented out, so it configures nothing: mule
 cannot know a host name, and inventing one produces confusing failures against a
 target that does not exist. An explicit `--config` is never seeded, since a
 missing path there is the caller's typo to see.
 
-The default file is `~/.config/coop/config.toml`. Host entries are user intent, so a text file is easier to edit and diff than a state database.
+The default file is `~/.config/mule/config.toml`. Host entries are user intent, so a text file is easier to edit and diff than a state database.
 
 ```toml
 [hosts.build]
 target = "build"
-socket = "~/.ssh/coop/build.sock"
-tmux_socket = "coop"
+socket = "~/.ssh/mule/build.sock"
+tmux_socket = "mule"
 max_running = 4
 default_cwd = "~/work/project"
 keep_days = 14
 max_job_secs = 0
 ```
 
-Only the section and target are required. The socket defaults to `~/.ssh/coop/<name>.sock`, the tmux socket to `coop`, `max_running` to **4**, `keep_days` to **14**, and `max_job_secs` to **0** (unbounded). There is no nonzero default because legitimate builds can run for six hours; an arbitrary cap would make coop kill correct work unexpectedly.
+Only the section and target are required. The socket defaults to `~/.ssh/mule/<name>.sock`, the tmux socket to `mule`, `max_running` to **4**, `keep_days` to **14**, and `max_job_secs` to **0** (unbounded). There is no nonzero default because legitimate builds can run for six hours; an arbitrary cap would make mule kill correct work unexpectedly.
 
 Every job verb accepts `--host`. The flag is optional when exactly one host is configured.
 
 ## SSH master
 
-Coop requires an existing control master and never opens one:
+Mule requires an existing control master and never opens one:
 
 ```text
-coop: no control master for build
-  run: ssh -MNf -S ~/.ssh/coop/build.sock -o ControlPersist=8h build
+mule: no control master for build
+  run: ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
 ```
 
 Opening a master can require a terminal for a hardware token. The explicit command costs one token tap per `ControlPersist` window; a background process cannot perform that prompt. Missing masters exit with status **3**.
@@ -189,15 +189,15 @@ One tap unblocks every job for the life of the `ControlPersist` window, so the e
 ## Commands and output
 
 ```text
-coop run [--host H] [--cwd D] [--max-secs S] [--human] [--tui | --wait [--no-tail]] <cmd>
-coop poll <id> [--host H] [--json]
-coop wait <id> [--host H] [--timeout S]
-coop tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
-coop ls [--host H] [--all] [--json] [--full]
-coop kill <id> [--host H] [--rm]
-coop rm [<id> | --all] [--host H]
-coop host list [--json]
-coop host info [--host H] [--json]
+mule run [--host H] [--cwd D] [--max-secs S] [--human] [--tui | --wait [--no-tail]] <cmd>
+mule poll <id> [--host H] [--json]
+mule wait <id> [--host H] [--timeout S]
+mule tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
+mule ls [--host H] [--all] [--json] [--full]
+mule kill <id> [--host H] [--rm]
+mule rm [<id> | --all] [--host H]
+mule host list [--json]
+mule host info [--host H] [--json]
 ```
 
 `poll` prints `running`, `orphan`, or the exit code; for a running job its stderr hint includes elapsed runtime. `poll --json` includes `runtime_secs`. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
@@ -216,7 +216,7 @@ A one-shot transcript or ordinary `tail` reads only the last **64KB** by default
 
 `poll`, `wait`, and follow mode use one probe shape that returns `rc`, session presence, log size, and requested bytes. Follow starts at a **1s** interval, doubles to at most **5s** while quiet, and resets to **1s** when output arrives. `--wait --no-tail` polls state, then reads the full log once.
 
-The stable coop-specific exit codes are:
+The stable mule-specific exit codes are:
 
 | Code | Meaning |
 | --- | --- |
@@ -225,7 +225,7 @@ The stable coop-specific exit codes are:
 | 5 | Job is orphaned. |
 | 6 | Connection dropped while waiting. |
 
-A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `coop tail <id>` as the recovery command.
+A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `mule tail <id>` as the recovery command.
 
 ## Listing, load, and cleanup
 
@@ -239,7 +239,7 @@ Its default filter is **time-based, not state-based**: everything from the last 
 
 `rm <id>` ends that job if it is still running, then removes its state directory. `rm --all` removes every finished job while ignoring `keep_days`. `--all` never stops work: a running job is spared, and so is an orphan, since an orphan has no `rc` and is the one state that cannot be reconstructed. That is what makes `--all` safe without a confirmation prompt. `kill` records **137** and keeps state; `kill --rm` ends and discards in one round trip.
 
-`run` prunes in the round trip it is already making, over two horizons. Finished jobs go after `keep_days`, default **14**. Orphans go after four times that, because an orphan is evidence — the host rebooted, or something killed the session — and since `kill` writes rc 137 it means strictly "not coop's doing". Running jobs are never pruned.
+`run` prunes in the round trip it is already making, over two horizons. Finished jobs go after `keep_days`, default **14**. Orphans go after four times that, because an orphan is evidence — the host rebooted, or something killed the session — and since `kill` writes rc 137 it means strictly "not mule's doing". Running jobs are never pruned.
 
 Orphans are kept long, but not forever. An unconditional exemption interacted badly with a full disk: the failing `rc` write leaves an orphan holding the largest log on the host, and those were precisely the directories prune refused to touch, so the residue could only be cleared by hand.
 
@@ -312,7 +312,7 @@ kill "$(cat "$tmp/sshd.pid")"
 rm -rf "$tmp"
 ```
 
-The check reports `Master running (pid=NNN)`. While `sleep 6` occupies its only session, the same socket reports `Session open refused by peer`; SSH may then open a fallback connection. The explicitly separate connection succeeds. Coop treats the refusal text as a busy channel even if SSH's fallback succeeds.
+The check reports `Master running (pid=NNN)`. While `sleep 6` occupies its only session, the same socket reports `Session open refused by peer`; SSH may then open a fallback connection. The explicitly separate connection succeeds. Mule treats the refusal text as a busy channel even if SSH's fallback succeeds.
 
 The important setup details are a free ephemeral port, mode `600` on keys and config, `StrictModes no` for a temporary directory, quoted option arrays, and cleanup through `PidFile`. A previously unquoted option string made SSH parse `-i` as part of the config filename, and the probe passed without testing the intended connection.
 
@@ -323,7 +323,7 @@ The design separates four kinds of evidence:
 | Layer | Coverage | Requirement |
 | --- | --- | --- |
 | 1 | Logic through a fake `Transport`: config, IDs, scripts, state mapping, and lock ordering | None |
-| 2 | The generated wrapper against `tmux -L coop-test-<pid> -f /dev/null` | `tmux` |
+| 2 | The generated wrapper against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
 | 3 | Channel isolation, gated concurrency, dispatch latency, and bounded wait | Local `sshd` recipe above |
 | 3b | The 2FA-specific error text and network latency | A capped host and a live master |
 
@@ -334,19 +334,19 @@ Layer 2 uses a private tmux socket and no personal config. It catches quoting, `
 Dispatch costs ~125ms against ~33ms for a bare `ssh` over an existing master, so the tool earns its overhead on **duration**, not frequency:
 
 - **Worth it:** anything holding the channel for a noticeable time — a test suite, a build, a large transfer — anything that must survive a dropped connection, and any group of long commands that would otherwise contend.
-- **Usually not worth it:** sub-second commands such as a `rev-parse`, status poll, or state collector, when failure is loud. A silent refusal changes the answer: eight concurrent bare `rev-parse` polls returned one sha and seven empty results, while coop dispatched all eight. An empty sha can be mistaken for "the commit changed", so route that poll through coop despite the overhead.
+- **Usually not worth it:** sub-second commands such as a `rev-parse`, status poll, or state collector, when failure is loud. A silent refusal changes the answer: eight concurrent bare `rev-parse` polls returned one sha and seven empty results, while mule dispatched all eight. An empty sha can be mistaken for "the commit changed", so route that poll through mule despite the overhead.
 - **Impossible:** anything needing a live terminal, and anything with an endpoint on the calling machine.
 
-The endpoint rule is about topology, not about which program runs. A transfer whose endpoints are both remote — one host directory to another, or the host to a third machine — is an ordinary job. The same command aimed back at the dispatcher is not, because a job cannot reach the machine that dispatched it: a laptop behind NAT has no inbound route, which is also why collection is always orchestrator-pull. So `rsync host:/data ~/local` is not a job at all, and `coop run 'rsync /data host2:/data'` is a perfectly good one.
+The endpoint rule is about topology, not about which program runs. A transfer whose endpoints are both remote — one host directory to another, or the host to a third machine — is an ordinary job. The same command aimed back at the dispatcher is not, because a job cannot reach the machine that dispatched it: a laptop behind NAT has no inbound route, which is also why collection is always orchestrator-pull. So `rsync host:/data ~/local` is not a job at all, and `mule run 'rsync /data host2:/data'` is a perfectly good one.
 
 **Threshold: roughly one second**, and the reasoning matters more than the number. Holding a capped channel is an externality: the cost falls on `git fetch`, a collector, a transfer — never on the caller doing the holding. Judging by whether 125ms of overhead feels worth it is therefore the wrong test and yields thresholds far too generous; an earlier draft of this section said ten seconds, which is ten times longer than anything else on the host should be made to wait. The right question is how long the rest of the host may be broken.
 
 Below a second, a direct call is cheaper when refusal is unmistakable. Route
-through coop when refusal can look like a valid result.
+through mule when refusal can look like a valid result.
 
 A separate real-host measurement proves coexistence rather than only fairness
-among coop calls: with a multi-minute job running through coop, a concurrent
-plain `ssh dev` succeeded. Long work on coop's private connection leaves the
+among mule calls: with a multi-minute job running through mule, a concurrent
+plain `ssh dev` succeeded. Long work on mule's private connection leaves the
 default connection available to ordinary tools.
 
 ## Rejected alternatives
@@ -373,11 +373,11 @@ The same applies to `tmux_socket`, which comes from configuration and is interpo
 
 ### Queue jobs or assign priorities
 
-The lock protects sub-second SSH operations, while jobs run concurrently outside it. Priorities add little to a queue of short probes. A persistent queue also needs a daemon to notice free slots; coop has no process between invocations. If host load becomes a problem, `max_running` supplies backpressure, and another private control connection supplies another channel.
+The lock protects sub-second SSH operations, while jobs run concurrently outside it. Priorities add little to a queue of short probes. A persistent queue also needs a daemon to notice free slots; mule has no process between invocations. If host load becomes a problem, `max_running` supplies backpressure, and another private control connection supplies another channel.
 
 ### Manage the SSH master
 
-A hardware-token prompt needs a terminal. Coop cannot open the master reliably from a background call, so it prints the command instead.
+A hardware-token prompt needs a terminal. Mule cannot open the master reliably from a background call, so it prints the command instead.
 
 ### Use a login shell, or add a flag for one
 
@@ -407,7 +407,7 @@ Two logs require two offsets and extra reads while losing causal interleaving. T
 
 A **200MB** transfer would monopolize the channel. The **64KB** default bounds that cost; `--all` remains explicit.
 
-### Lend coop's connection to local transfer tools
+### Lend mule's connection to local transfer tools
 
 A bulk transfer violates the rule that every use of the private channel is short. Other tools can open their own master on another `ControlPath`; two masters were measured carrying traffic concurrently.
 

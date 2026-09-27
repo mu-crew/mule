@@ -8,7 +8,7 @@ pub const EXIT_ORPHAN: i32 = 5;
 pub const EXIT_DROPPED: i32 = 6;
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum CoopError {
+pub enum MuleError {
     #[error(
         "no control master for {host}\n  \
          run: ssh -MNf -S {socket} -o ControlPersist=8h {target}\n  \
@@ -20,7 +20,7 @@ pub enum CoopError {
         target: String,
     },
     #[error(
-        "the master is down or its one slot is held\n  run ssh -O check with coop's configured ControlPath to tell which"
+        "the master is down or its one slot is held\n  run ssh -O check with mule's configured ControlPath to tell which"
     )]
     SessionChannelBusy,
     #[error(
@@ -32,7 +32,7 @@ pub enum CoopError {
     )]
     SshAgentHasNoKeys,
     #[error(
-        "keyboard-interactive authentication failed; this is either a local ssh-agent problem or a busy control-master channel\n  run ssh-add -l, then ssh -O check with coop's configured ControlPath"
+        "keyboard-interactive authentication failed; this is either a local ssh-agent problem or a busy control-master channel\n  run ssh-add -l, then ssh -O check with mule's configured ControlPath"
     )]
     KeyboardInteractiveAmbiguous,
     #[error("timed out waiting for job {id}; it is still running")]
@@ -41,7 +41,7 @@ pub enum CoopError {
     Orphan { id: String },
     #[error("job {id} not found")]
     MissingJob { id: String },
-    #[error("lost contact while waiting; the job continues\n  resume: coop tail {id}")]
+    #[error("lost contact while waiting; the job continues\n  resume: mule tail {id}")]
     Dropped { id: String },
 }
 
@@ -53,37 +53,37 @@ pub enum AgentState {
     Unknown,
 }
 
-pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<CoopError> {
+pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<MuleError> {
     let stderr = stderr.to_ascii_lowercase();
     if ["session request failed", "session open refused"]
         .iter()
         .any(|pattern| stderr.contains(pattern))
     {
-        return Some(CoopError::SessionChannelBusy);
+        return Some(MuleError::SessionChannelBusy);
     }
     if !stderr.contains("permission denied (keyboard-interactive)") {
         return None;
     }
     Some(match agent_state() {
-        AgentState::Keys => CoopError::SessionChannelBusy,
-        AgentState::NoKeys => CoopError::SshAgentHasNoKeys,
-        AgentState::Unreachable => CoopError::SshAgentUnreachable,
-        AgentState::Unknown => CoopError::KeyboardInteractiveAmbiguous,
+        AgentState::Keys => MuleError::SessionChannelBusy,
+        AgentState::NoKeys => MuleError::SshAgentHasNoKeys,
+        AgentState::Unreachable => MuleError::SshAgentUnreachable,
+        AgentState::Unknown => MuleError::KeyboardInteractiveAmbiguous,
     })
 }
 
 pub fn exit_code(error: &AnyhowError) -> i32 {
-    match error.downcast_ref::<CoopError>() {
-        Some(CoopError::NoMaster { .. }) => EXIT_NO_MASTER,
-        Some(CoopError::Timeout { .. }) => EXIT_TIMEOUT,
-        Some(CoopError::Orphan { .. }) => EXIT_ORPHAN,
-        Some(CoopError::Dropped { .. }) => EXIT_DROPPED,
+    match error.downcast_ref::<MuleError>() {
+        Some(MuleError::NoMaster { .. }) => EXIT_NO_MASTER,
+        Some(MuleError::Timeout { .. }) => EXIT_TIMEOUT,
+        Some(MuleError::Orphan { .. }) => EXIT_ORPHAN,
+        Some(MuleError::Dropped { .. }) => EXIT_DROPPED,
         Some(
-            CoopError::MissingJob { .. }
-            | CoopError::SessionChannelBusy
-            | CoopError::SshAgentUnreachable
-            | CoopError::SshAgentHasNoKeys
-            | CoopError::KeyboardInteractiveAmbiguous,
+            MuleError::MissingJob { .. }
+            | MuleError::SessionChannelBusy
+            | MuleError::SshAgentUnreachable
+            | MuleError::SshAgentHasNoKeys
+            | MuleError::KeyboardInteractiveAmbiguous,
         )
         | None => 1,
     }
@@ -95,7 +95,7 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
 /// Every job verb needs this, not just `run`: without it `poll`, `wait`,
 /// `tail`, `kill` and `rm` fell through to ssh and reported a generic failure
 /// with exit 1, instead of the documented exit 3 and the recovery command. The
-/// exception is `coop host list`, whose whole job is to *report* which hosts
+/// exception is `mule host list`, whose whole job is to *report* which hosts
 /// have a master.
 pub fn require_master(
     t: &dyn crate::transport::Transport,
@@ -112,13 +112,13 @@ pub fn require_master(
 /// ssh will not create the directory holding a control socket: it binds a
 /// temporary name inside it and fails with
 /// `unix_listener: cannot bind to path ...: No such file or directory`. Since
-/// coop defaults `socket` to `~/.ssh/coop/<host>.sock` and never created that
-/// directory, the command coop printed could not work -- and it failed *after*
+/// mule defaults `socket` to `~/.ssh/mule/<host>.sock` and never created that
+/// directory, the command mule printed could not work -- and it failed *after*
 /// the 2FA prompt, so the user paid a hardware-token tap to find out, and the
 /// error read as a broken ssh config rather than a missing `mkdir`.
 ///
 /// Done here rather than at config load so it is a consequence of asking for a
-/// master, not a side effect of `coop --help`.
+/// master, not a side effect of `mule --help`.
 pub fn no_master(host: &crate::config::Host) -> AnyhowError {
     let mut hint = None;
     if let Some(parent) = host.socket.parent() {
@@ -128,7 +128,7 @@ pub fn no_master(host: &crate::config::Host) -> AnyhowError {
             hint = Some(format!("{}: {e}", parent.display()));
         }
     }
-    let error: AnyhowError = CoopError::NoMaster {
+    let error: AnyhowError = MuleError::NoMaster {
         host: host.name.clone(),
         socket: host.socket.display().to_string(),
         target: host.target.clone(),
