@@ -1,8 +1,8 @@
 # Releasing
 
-A release publishes the prebuilt npm packages and the Rust crate from a `v*`
-tag. The repository needs `NPM_TOKEN` and `CARGO_REGISTRY_TOKEN` Actions
-secrets.
+A `v*` tag publishes the prebuilt npm packages and the Rust crate. There are
+no tokens: npm and crates.io trust this repo's `.github/workflows/release.yml`
+through OIDC (trusted publishing).
 
 1. Bump `version` in `Cargo.toml` and update `Cargo.lock`.
 2. Stamp the npm manifests:
@@ -15,10 +15,23 @@ secrets.
 4. Tag the same version and push the commit and tag:
 
    ```sh
-   git tag v0.2.0
-   git push origin main v0.2.0
+   git tag -a v0.2.2 -m "mule 0.2.2"
+   git push origin main v0.2.2
    ```
 
-The tag workflow checks that the tag, Cargo version, and all npm package
-versions agree. It publishes the three platform packages before
-`@mu-crew/mule`, then publishes `mule-cli` to crates.io.
+The workflow checks that the tag, Cargo version and all npm package versions
+agree, publishes the three platform packages, then `@mu-crew/mule`, then
+`mule-cli`.
+
+## Trust setup
+
+Each package trusts owner `mu-crew`, repository `mule`, workflow `release.yml`:
+
+- npmjs.com, per package (`@mu-crew/mule`, `@mu-crew/mule-linux-x64`,
+  `@mu-crew/mule-linux-arm64`, `@mu-crew/mule-darwin-arm64`): Settings →
+  Trusted publishing → GitHub Actions.
+- crates.io, `mule-cli`: Settings → Trusted Publishing.
+
+A new package (a new platform, say) cannot be trusted before it exists. Publish
+its first version by hand (`npm login`, then `npm publish --access public`),
+add the trusted publisher, and let CI publish from then on.
