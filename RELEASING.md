@@ -35,3 +35,7 @@ Each package trusts owner `mu-crew`, repository `mule`, workflow `release.yml`:
 A new package (a new platform, say) cannot be trusted before it exists. Publish
 its first version by hand (`npm login`, then `npm publish --access public`),
 add the trusted publisher, and let CI publish from then on.
+
+The workflow also creates the GitHub release for the tag, with the matching
+CHANGELOG section as its notes. It fails if that section is missing, so add
+the CHANGELOG entry before tagging.
