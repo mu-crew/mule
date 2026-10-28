@@ -687,3 +687,102 @@ fn rm_with_a_session_that_survives_kill_exits_one_and_names_it() {
         "a live job keeps its state dir"
     );
 }
+
+#[test]
+fn rm_with_a_failing_tmux_client_exits_one_and_keeps_the_job() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let server = TmuxServer::start();
+    let id = "00000d";
+    start_running(&server, id);
+    // A client that cannot talk to a live server (version skew, unsafe socket
+    // directory) fails every command with exit 1 -- the same status as "no
+    // such session". Reading that as absence deleted a live job's state.
+    let shim = server.root.join("shim");
+    fs::create_dir_all(&shim).unwrap();
+    let tmux = shim.join("tmux");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\necho 'protocol version mismatch (client 8, server 7)' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = rm_one(&server, id, Some(&shim));
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot verify session state"), "{stderr}");
+    assert!(stderr.contains("protocol version mismatch"), "{stderr}");
+    assert!(out.stdout.is_empty(), "no id may be reported as removed");
+    assert!(has_session(&server, &format!("mule-{id}")), "job must live");
+    assert!(server.root.join(id).join("cmd").exists(), "state kept");
+}
+
+#[test]
+fn rm_with_an_unsearchable_state_parent_exits_one_and_keeps_the_evidence() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let server = TmuxServer::start();
+    let id = "00000e";
+    server.run(id, "echo done", None);
+    let evidence = server.root.join(id).join("rc");
+    assert!(evidence.exists());
+    // With the parent at 0000, `[ -d <parent>/<id> ]` is false although the
+    // directory exists. (Root ignores modes, so this cannot bite as root.)
+    fs::set_permissions(&server.root, fs::Permissions::from_mode(0o000)).unwrap();
+    let rooted = fs::read_dir(&server.root).is_ok();
+
+    let out = rm_one(&server, id, None);
+
+    fs::set_permissions(&server.root, fs::Permissions::from_mode(0o700)).unwrap();
+    if rooted {
+        eprintln!("skipping: modes are not enforced for this user");
+        return;
+    }
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot verify state dir"), "{stderr}");
+    assert!(out.stdout.is_empty(), "no id may be reported as removed");
+    assert!(evidence.exists(), "evidence must be kept");
+}
+
+#[test]
+fn rm_proves_absence_when_the_tmux_server_is_gone() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    // Both spellings of "no server" are the normal state after the last job
+    // ends, so each must still prove absence: `no server running` (socket file
+    // left behind) and `error connecting to ... No such file or directory`
+    // (socket file gone).
+    for (id, unlink_socket) in [("00000f", false), ("000010", true)] {
+        let server = TmuxServer::start();
+        server.run(id, "echo done", None);
+        let kill = Command::new("tmux")
+            .args(["-L", &server.socket, "kill-server"])
+            .status()
+            .unwrap();
+        assert!(kill.success());
+        if unlink_socket {
+            let _ = fs::remove_file(&server.socket_path);
+        }
+
+        let out = rm_one(&server, id, None);
+
+        assert!(
+            out.status.success(),
+            "unlink_socket={unlink_socket}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), id);
+        assert!(!server.root.join(id).exists());
+    }
+}

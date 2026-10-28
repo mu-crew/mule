@@ -8,6 +8,12 @@ that neither `mule-<id>` nor `watch-<id>` exists and the state directory is
 gone; otherwise it exits 1 naming which and keeps what is left. A missing job
 still exits 0. `rm --all` is unchanged.
 
+Exit 0 needs *seen* absence, not a failed probe: a tmux that cannot be queried
+(version mismatch, unsafe socket directory) or a state path behind an
+unsearchable directory exits 1 with the tmux or `ls` error, and keeps the state.
+Only `no server running`, a missing socket, or `No such file or directory`
+count as gone.
+
 ## 0.2.1 — 2026-09-27
 
 First release on npm: `npm i -g @mu-crew/mule` installs a prebuilt binary for
