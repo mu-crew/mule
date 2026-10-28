@@ -233,6 +233,62 @@ fn a_rewritten_job_file_is_replaced_whole() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "a1b2c3\n");
 }
 
+#[test]
+fn a_stale_temp_cannot_weaken_the_job_files_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch();
+    let file = dir.join("mode.job");
+    // The old temp name was predictable: F.tmp<pid>. A file left there (or
+    // planted) with a loose mode must not lend that mode to F.
+    let tmp = dir.join(format!("mode.job.tmp{}", std::process::id()));
+    std::fs::write(&tmp, "old").unwrap();
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    write_job_file(&file, &id()).unwrap();
+
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "F must always be mode 0600");
+    assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "old", "not reused");
+}
+
+#[test]
+fn a_planted_temp_symlink_is_never_followed() {
+    let dir = scratch();
+    let file = dir.join("symlink.job");
+    let victim = dir.join("valuable");
+    std::fs::write(&victim, "valuable contents").unwrap();
+    let tmp = dir.join(format!("symlink.job.tmp{}", std::process::id()));
+    std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+    write_job_file(&file, &id()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "valuable contents",
+        "the temp must not follow a symlink"
+    );
+    let meta = std::fs::symlink_metadata(&file).unwrap();
+    assert!(
+        meta.file_type().is_file(),
+        "F is a regular file, not a link"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "a1b2c3\n");
+}
+
+#[test]
+fn every_temp_name_is_fresh_and_none_is_left_behind() {
+    let dir = scratch();
+    let file = dir.join("many.job");
+    for _ in 0..20 {
+        write_job_file(&file, &id()).unwrap();
+    }
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["many.job"], "{names:?}");
+}
+
 // -- terminal states --------------------------------------------------------------
 
 fn run_to_end(fake: &Fake, specs: &[Spec]) -> (i32, String) {
@@ -522,10 +578,84 @@ fn the_screen_is_mirrored_in_the_window_and_after_it_only_on_change() {
     let scripts = fake.scripts();
     let captures: Vec<bool> = scripts.iter().map(|s| s.contains("capture-pane")).collect();
     // starting -> running is a change of state, so the next tick carries one
-    // screen; a quiet tick after it does not; the final screen is fetched at
-    // exit with one extra probe.
+    // screen; a quiet tick after it does not; a quiet tick that sees the end
+    // leaves the final screen to the next tick's probe.
     assert_eq!(captures, [false, true, false, false, true], "{scripts:#?}");
     assert!(String::from_utf8_lossy(&out).contains("final screen"));
+}
+
+#[test]
+fn a_terminal_tick_still_makes_only_one_locked_call() {
+    // Past the window a state-only probe sees the end. The final screen is
+    // fetched by the next tick's probe, never by a second call in the same
+    // tick: SPEC § Leases, one locked call per tick, exit included.
+    let fake = Fake::new();
+    let host = host();
+    let id = id();
+    let running = "exists=1\nrc=\nalive=1\nsize=0\nbytes:\n";
+    fake.push(Output::ok(running))
+        .push(Output::ok(running))
+        .push(Output::ok(running))
+        .push(Output::ok("exists=1\nrc=7\nalive=0\nsize=0\nbytes:\n"))
+        .push(Output::ok(
+            "exists=1\nrc=7\nalive=0\nsize=0\nbytes:\nfinal screen\n",
+        ));
+    let mut pauses = 0;
+    let mut out = Vec::new();
+    let code = hold(
+        &fake,
+        &Hold {
+            host: &host,
+            id: &id,
+            specs: &[],
+            mirror_for: Duration::ZERO,
+        },
+        &mut |_| pauses += 1,
+        &mut out,
+    );
+    assert_eq!(code, 7);
+    assert_eq!(
+        fake.scripts().len(),
+        pauses + 1,
+        "one locked probe per tick, even at exit"
+    );
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("final screen"), "{out}");
+    assert!(out.contains("done 7"), "{out}");
+}
+
+#[test]
+fn the_end_seen_is_the_exit_even_if_the_final_capture_fails() {
+    // The deferred capture is cosmetic: the job was seen done with 7, so the
+    // lease exits 7 whether the next probe fails or finds the state removed.
+    for last in [
+        Output::fail(255, "Connection reset"),
+        Output::ok("exists=0\nrc=\nalive=0\nsize=0\nbytes:\n"),
+    ] {
+        let fake = Fake::new();
+        let host = host();
+        let id = id();
+        fake.push(Output::ok("exists=1\nrc=\nalive=1\nsize=0\nbytes:\n"))
+            .push(Output::ok("exists=1\nrc=\nalive=1\nsize=0\nbytes:\n"))
+            .push(Output::ok("exists=1\nrc=7\nalive=0\nsize=0\nbytes:\n"))
+            .push(last);
+        let mut out = Vec::new();
+        let code = hold(
+            &fake,
+            &Hold {
+                host: &host,
+                id: &id,
+                specs: &[],
+                mirror_for: Duration::ZERO,
+            },
+            &mut |_| {},
+            &mut out,
+        );
+        let out = String::from_utf8_lossy(&out);
+        assert_eq!(code, 7, "{out}");
+        assert!(out.contains("done 7"), "{out}");
+        assert_eq!(fake.scripts().len(), 4);
+    }
 }
 
 /// A writer whose every write fails, as a hung-up tty or a closed pipe does.

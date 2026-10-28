@@ -14,6 +14,13 @@ rm` and exit 129/130/143. The pane shows a status line (job, host, state,
 forwards, `murmur pick --all  # select mule-<id>`, the stop command) and mirrors
 the remote screen for 30s after the first forward, then on state changes.
 
+`F`'s temp file is created exclusively (`O_EXCL|O_NOFOLLOW`) under a random
+name and `fchmod`ed to 0600, so a symlink or a loose-mode file planted beside a
+`/tmp` job file can neither be written through nor weaken `F`'s mode. Every
+tick makes one locked call, the last included: a state-only probe that sees the
+job done leaves the final screen to the next tick's probe, and the code it saw
+stands even if that capture fails.
+
 The poll probe gains a screen mode that carries `capture-pane` in the same
 locked call, so mirroring costs no extra round trip.
 
