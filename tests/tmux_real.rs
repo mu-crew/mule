@@ -399,6 +399,14 @@ fn a_capped_log_truncates_without_killing_the_job() {
     );
 
     assert_eq!(read(dir.join("rc")).trim(), "4", "rc must be the job's own");
+    // `rc` lands when the job exits; the capping pipeline writes `truncated`
+    // after it drains the overflow, so the marker can trail `rc` under load.
+    // Wait for it rather than racing it, or this fails only when the machine is
+    // busy.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.join("truncated").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     let log_len = fs::metadata(dir.join("log")).unwrap().len();
     assert_eq!(log_len, 1024, "log must be capped exactly");
     assert!(
@@ -478,5 +486,204 @@ fn a_short_log_is_untouched_and_unflagged() {
     assert!(
         !dir.join("truncated").exists(),
         "an uncapped log must not be flagged"
+    );
+}
+
+/// Does the private server still have `name`?
+fn has_session(server: &TmuxServer, name: &str) -> bool {
+    Command::new("tmux")
+        .args(["-L", &server.socket, "has-session", "-t", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Run the real `rm <id>` script against this server and its state root.
+///
+/// `path` lets a test put a shim ahead of the real `tmux`.
+fn rm_one(server: &TmuxServer, id: &str, path: Option<&Path>) -> std::process::Output {
+    let host = Host {
+        name: "local".into(),
+        target: "local".into(),
+        socket: PathBuf::new(),
+        tmux_socket: server.socket.clone(),
+        max_running: 4,
+        default_cwd: None,
+        keep_days: 14,
+        max_log_bytes: 1024,
+        max_job_secs: 0,
+    };
+    let script = mule::jobs::remove_one_script(&host, &id.parse().unwrap()).replace(
+        &format!("{}/{id}", mule::wrapper::JOBS_ROOT),
+        &server.root.join(id).display().to_string(),
+    );
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &script]).stdin(Stdio::null());
+    if let Some(dir) = path {
+        let old = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{}:{old}", dir.display()));
+    }
+    cmd.output().unwrap()
+}
+
+/// Dispatch a job that stays alive, with its watchdog session.
+fn start_running(server: &TmuxServer, id: &str) {
+    let host = Host {
+        name: "local".into(),
+        target: "local".into(),
+        socket: PathBuf::new(),
+        tmux_socket: server.socket.clone(),
+        max_running: 4,
+        default_cwd: None,
+        keep_days: 14,
+        max_log_bytes: 1024,
+        max_job_secs: 120,
+    };
+    let job = Job {
+        id: id.parse().unwrap(),
+        cmd: "sleep 60".into(),
+        cwd: None,
+        max_secs: 120,
+        metadata: mule::wrapper::JobMetadata::Managed { workstream: None },
+        mode: JobMode::Pipe,
+    };
+    let script = dispatch_script(&host, &job).replace(
+        &format!("{}/{id}", mule::wrapper::JOBS_ROOT),
+        &server.root.join(id).display().to_string(),
+    );
+    let status = Command::new("sh")
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "dispatch failed: {script}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(has_session(server, &format!("mule-{id}"))
+        && has_session(server, &format!("watch-{id}")))
+    {
+        assert!(Instant::now() < deadline, "sessions for {id} never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn rm_stops_a_running_job_and_removes_its_state() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    let server = TmuxServer::start();
+    start_running(&server, "00000a");
+
+    let out = rm_one(&server, "00000a", None);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "00000a");
+    assert!(!has_session(&server, "mule-00000a"));
+    assert!(!has_session(&server, "watch-00000a"));
+    assert!(!server.root.join("00000a").exists());
+}
+
+#[test]
+fn rm_of_a_missing_job_exits_zero() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    let server = TmuxServer::start();
+
+    let out = rm_one(&server, "00000b", None);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn rm_with_an_unremovable_state_file_exits_one_and_keeps_the_evidence() {
+    if Command::new("tmux").arg("-V").output().is_err() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let server = TmuxServer::start();
+    let id = "00000c";
+    server.run(id, "echo done", None);
+    // A file inside a 0500 directory cannot be unlinked, so `rm -rf` fails
+    // partway. (Root ignores modes, so this test cannot bite as root.)
+    let locked = server.root.join(id).join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("evidence"), "x").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let rooted = fs::write(locked.join("probe"), "x").is_ok();
+
+    let out = rm_one(&server, id, None);
+
+    // Restore so TmuxServer::drop can clean up.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    if rooted {
+        eprintln!("skipping: modes are not enforced for this user");
+        return;
+    }
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("could not be removed"), "{stderr}");
+    assert!(out.stdout.is_empty(), "no id may be reported as removed");
+    assert!(locked.join("evidence").exists(), "evidence must be kept");
+}
+
+#[test]
+fn rm_with_a_session_that_survives_kill_exits_one_and_names_it() {
+    let Ok(real) = Command::new("which").arg("tmux").output() else {
+        eprintln!("skipping real tmux rm test: no `which`");
+        return;
+    };
+    if !real.status.success() {
+        eprintln!("skipping real tmux rm test: tmux is not on PATH");
+        return;
+    }
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_string();
+    let server = TmuxServer::start();
+    let id = "00000d";
+    start_running(&server, id);
+
+    // A shim that swallows kill-session for the job session only. The watchdog
+    // is killed for real, so the failure message must name exactly one.
+    let shim = server.root.join("shim");
+    fs::create_dir_all(&shim).unwrap();
+    let tmux = shim.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *kill-session*\"-t mule-{id}\"*) exit 0;; esac\nexec {real} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = rm_one(&server, id, Some(&shim));
+
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&format!("mule-{id}")), "{stderr}");
+    assert!(!stderr.contains(&format!("watch-{id}")), "{stderr}");
+    assert!(
+        has_session(&server, &format!("mule-{id}")),
+        "not killed again"
+    );
+    assert!(
+        server.root.join(id).join("cmd").exists(),
+        "a live job keeps its state dir"
     );
 }

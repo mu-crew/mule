@@ -1421,3 +1421,86 @@ fn ls_running_excludes_finished_and_orphaned_jobs() {
     let _ = sshd.mule(&config, &["kill", "--rm", &running]);
     clean_jobs(&sshd, &[done, orphan]);
 }
+
+fn job_state_dir(sshd: &Sshd, id: &str) -> PathBuf {
+    sshd.state_root.join("mule").join("jobs").join(id)
+}
+
+fn session_exists(sshd: &Sshd, tmux: &Tmux, name: &str) -> bool {
+    sshd.ssh(&["tmux", "-L", &tmux.name, "has-session", "-t", name])
+        .status
+        .success()
+}
+
+#[test]
+fn rm_id_is_a_proof_of_stop_over_the_capped_channel() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "rm-stop");
+    let config = sshd.write_config(&tmux.name);
+
+    // A capped job gets a watch-<id> session too, so both must go.
+    let id = stdout(&sshd.mule(&config, &["run", "--max-secs", "120", "sleep 60"]));
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+    assert!(session_exists(&sshd, &tmux, &format!("mule-{id}")));
+    assert!(session_exists(&sshd, &tmux, &format!("watch-{id}")));
+
+    let removed = sshd.mule(&config, &["rm", &id]);
+    assert_eq!(
+        removed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!session_exists(&sshd, &tmux, &format!("mule-{id}")));
+    assert!(!session_exists(&sshd, &tmux, &format!("watch-{id}")));
+    assert!(!job_state_dir(&sshd, &id).exists());
+
+    // Idempotent, and a never-seen id is the same.
+    for id in [id.as_str(), "abc123"] {
+        let again = sshd.mule(&config, &["rm", id]);
+        assert_eq!(again.status.code(), Some(0), "rm {id}");
+    }
+}
+
+#[test]
+fn rm_id_that_cannot_remove_the_state_dir_exits_one_and_keeps_the_evidence() {
+    require_sshd!();
+    use std::os::unix::fs::PermissionsExt;
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "rm-fail");
+    let config = sshd.write_config(&tmux.name);
+
+    let id = stdout(&sshd.mule(&config, &["run", "true"]));
+    let dir = job_state_dir(&sshd, &id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stdout(&sshd.mule(&config, &["poll", &id])) == "running" {
+        assert!(Instant::now() < deadline, "job never finished");
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("evidence"), "x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let enforced = std::fs::write(locked.join("probe"), "x").is_err();
+
+    let out = sshd.mule(&config, &["rm", &id]);
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if !enforced {
+        eprintln!("skipping: file modes are not enforced for this user");
+        clean_jobs(&sshd, &[id]);
+        return;
+    }
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("could not be removed"), "{stderr}");
+    assert!(
+        locked.join("evidence").exists(),
+        "the directory's evidence must be kept"
+    );
+    assert!(out.stdout.is_empty(), "no id reported as removed");
+    clean_jobs(&sshd, &[id]);
+}

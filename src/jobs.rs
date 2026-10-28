@@ -276,6 +276,50 @@ pub enum Target {
     AllDone,
 }
 
+/// The remote script behind `rm <id>`, exposed so layer 2 can drive it against
+/// a private tmux server.
+///
+/// Exit 0 is a **proof**: neither `mule-<id>` nor `watch-<id>` exists, and the
+/// state directory is gone. mu deletes its job handle and removes a worktree
+/// only after this exits 0, so the old unconditional `exit 0` -- which ignored
+/// a `kill-session` that did not take and an `rm -rf` that failed -- let a
+/// still-running job lose its handle.
+///
+/// The caller named this job, so ending it is the intent; the check is what
+/// makes that claim true. A missing job (no sessions, no directory) passes the
+/// same checks and exits 0, so `rm` stays idempotent.
+///
+/// Failure keeps what is left. A surviving session is not killed a second
+/// time, and the directory is not touched while it is alive: it is the live
+/// job's log and the only way to find out why it would not die. A directory
+/// that will not delete gets one `rm -rf` and no retry loop. The message names
+/// which check failed; the exit is 1.
+///
+/// `has-session` rather than parsing `list-sessions`: it is the exact question
+/// ("does this session exist?") and exits non-zero when the server itself is
+/// gone, which is the normal state after the last job ends.
+pub fn remove_one_script(host: &Host, id: &JobId) -> String {
+    let dir = state_dir(id);
+    let socket = &host.tmux_socket;
+    format!(
+        "d={dir}; \
+         tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
+         tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
+         alive=; \
+         for s in mule-{id} watch-{id}; do \
+           if tmux -L {socket} has-session -t \"$s\" 2>/dev/null; then alive=\"$alive $s\"; fi; \
+         done; \
+         if [ -n \"$alive\" ]; then \
+           echo \"session still alive after kill-session:$alive (state dir kept)\" >&2; exit 1; \
+         fi; \
+         if [ -d \"$d\" ]; then \
+           rm -rf \"$d\" 2>/dev/null; \
+           if [ -e \"$d\" ]; then echo \"state dir $d could not be removed (kept)\" >&2; exit 1; fi; \
+           echo {id}; \
+         fi; exit 0"
+    )
+}
+
 /// Remove job state. Returns the ids removed, so the caller can report them.
 ///
 /// One round trip either way: enumeration and removal share a single remote
@@ -285,17 +329,7 @@ pub fn remove(transport: &dyn Transport, host: &Host, target: &Target) -> Result
     crate::errors::require_master(transport, host)?;
 
     let script = match target {
-        // A single id still kills first: the caller named this job, so ending
-        // it is the intent. Only the bulk path is non-destructive.
-        Target::One(id) => {
-            let dir = state_dir(id);
-            format!(
-                "tmux -L {} kill-session -t mule-{id} 2>/dev/null; \
-                 tmux -L {} kill-session -t watch-{id} 2>/dev/null; \
-                 if [ -d {dir} ]; then rm -rf {dir} && echo {id}; fi; exit 0",
-                host.tmux_socket, host.tmux_socket
-            )
-        }
+        Target::One(id) => remove_one_script(host, id),
         // Presence of `rc` IS the definition of finished, the same test prune
         // uses -- so this is "prune now, ignoring the horizon".
         Target::AllDone => format!(
