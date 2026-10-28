@@ -262,8 +262,10 @@ pub struct Fake {
     mux_ops: std::sync::Mutex<Vec<MuxOp>>,
     mux_outputs: std::sync::Mutex<std::collections::VecDeque<Output>>,
     mux_hook: std::sync::Mutex<Option<MuxHook>>,
-    master: bool,
-    master_pid: u32,
+    // Atomics so a test can take the master away and bring it back under a new
+    // pid mid-run, as `ssh -O exit` and a human's `ssh -MNf` would.
+    master: std::sync::atomic::AtomicBool,
+    master_pid: std::sync::atomic::AtomicU32,
 }
 
 /// Runs on every `mux_op`, so a test can play the master: bind the LOCAL a
@@ -288,8 +290,8 @@ impl Default for Fake {
             mux_ops: Default::default(),
             mux_outputs: Default::default(),
             mux_hook: Default::default(),
-            master: false,
-            master_pid: 4242,
+            master: false.into(),
+            master_pid: 4242.into(),
         }
     }
 }
@@ -299,7 +301,7 @@ impl Fake {
     /// empty success).
     pub fn new() -> Self {
         Self {
-            master: true,
+            master: true.into(),
             ..Default::default()
         }
     }
@@ -329,9 +331,18 @@ impl Fake {
     }
 
     /// The pid `-O check` reports.
-    pub fn with_master_pid(mut self, pid: u32) -> Self {
-        self.master_pid = pid;
+    pub fn with_master_pid(self, pid: u32) -> Self {
+        self.set_master(Some(pid));
         self
+    }
+
+    /// Take the master away (`None`) or bring one up with `pid`, mid-test.
+    pub fn set_master(&self, pid: Option<u32>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some(pid) = pid {
+            self.master_pid.store(pid, SeqCst);
+        }
+        self.master.store(pid.is_some(), SeqCst);
     }
 
     /// Every script handed to `run`, in order. This is the assertion surface
@@ -361,10 +372,11 @@ impl Transport for Fake {
     fn mux_op(&self, _host: &Host, op: MuxOp) -> Result<Output> {
         self.mux_ops.lock().unwrap().push(op.clone());
         if op == MuxOp::Check {
-            return Ok(if self.master {
+            use std::sync::atomic::Ordering::SeqCst;
+            return Ok(if self.master.load(SeqCst) {
                 Output {
                     stdout: Vec::new(),
-                    stderr: format!("Master running (pid={})\r\n", self.master_pid),
+                    stderr: format!("Master running (pid={})\r\n", self.master_pid.load(SeqCst)),
                     code: 0,
                 }
             } else {

@@ -12,6 +12,7 @@ pub mod errors;
 pub mod exec;
 pub mod forward;
 pub mod jobs;
+pub mod lease;
 pub mod lock;
 pub mod probe;
 pub mod run;

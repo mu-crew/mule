@@ -2383,3 +2383,580 @@ fn exec_keeps_stderr_clean_through_a_lock_wait_longer_than_the_notice_threshold(
         "the lock-wait notice is mule talking, not the command"
     );
 }
+
+// -- mule run --lease -----------------------------------------------------------
+
+/// A running lease: the child, its job file, and where its stdout went.
+///
+/// stdout goes to a file, not a pipe: the lease mirrors the remote screen, and
+/// a pipe nobody drains would fill and block it mid-write.
+struct Lease {
+    child: std::process::Child,
+    job_file: PathBuf,
+    out: PathBuf,
+}
+
+impl Lease {
+    fn start(
+        sshd: &Sshd,
+        config: &std::path::Path,
+        tag: &str,
+        specs: &[String],
+        cmd: &[&str],
+    ) -> Self {
+        let job_file = sshd.dir.join(format!("{tag}.job"));
+        let out = sshd.dir.join(format!("{tag}.out"));
+        let mut args = vec![
+            "run",
+            "--lease",
+            "--human",
+            "--job-file",
+            job_file.to_str().unwrap(),
+        ];
+        for spec in specs {
+            args.extend(["--forward-unix", spec.as_str()]);
+        }
+        args.push("--");
+        args.extend(cmd);
+        let mut command = mule_command(sshd, config, &args, &[]);
+        command.stdout(std::fs::File::create(&out).unwrap());
+        let child = command.spawn().expect("mule failed to spawn");
+        Self {
+            child,
+            job_file,
+            out,
+        }
+    }
+
+    /// The id from the job file, once the lease has written it.
+    fn id(&self) -> String {
+        wait_until("the job file", Duration::from_secs(10), || {
+            std::fs::read_to_string(&self.job_file).is_ok_and(|id| id.ends_with('\n'))
+        });
+        std::fs::read_to_string(&self.job_file)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn output(&self) -> String {
+        std::fs::read_to_string(&self.out).unwrap_or_default()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    fn exit(mut self) -> (Option<i32>, String) {
+        let status = self.child.wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut err) = self.child.stderr.take() {
+            use std::io::Read;
+            let _ = err.read_to_string(&mut stderr);
+        }
+        (status.code(), stderr)
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn record_dir(sshd: &Sshd) -> PathBuf {
+    sshd.state_root.join("mule/forwards/live")
+}
+
+fn records(sshd: &Sshd) -> usize {
+    std::fs::read_dir(record_dir(sshd))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_none())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_lease_forwards_traffic_and_leaves_another_master_usable_while_it_holds() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let default_socket = sshd.dir.join("default.sock");
+    let _default_master = sshd.open_master(&default_socket);
+    let tmux = Tmux::new(&sshd, "lease-traffic");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+
+    let mut lease = Lease::start(
+        &sshd,
+        &config,
+        "traffic",
+        &[unix_spec(&local, &remote)],
+        &["sleep 60"],
+    );
+    let id = lease.id();
+    // Forwarded without waiting for REMOTE: LOCAL listens before anything
+    // serves the far end (connect succeeds and reads EOF).
+    wait_until("LOCAL to listen", Duration::from_secs(10), || {
+        std::os::unix::net::UnixStream::connect(&local).is_ok()
+    });
+    // On loopback "remote" is this machine, so the test plays the job's server.
+    let _serve = Serve::start(remote.clone(), "from-the-job");
+    assert_eq!(through(&local), "from-the-job");
+
+    // The lease holds nothing on another master: a session over it works,
+    // repeatedly, during the hold.
+    for attempt in 0..3 {
+        let out = sshd.ssh_via(&default_socket, &["true"]);
+        assert!(
+            out.status.success(),
+            "ssh over another master refused during the lease ({attempt}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(lease.alive());
+    let text = lease.output();
+    assert!(
+        text.contains(&format!("mule lease {id} on live: running")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("murmur pick --all  # select mule-{id}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("mule rm --host live {id}")),
+        "{text}"
+    );
+
+    signal(&lease.child, "TERM");
+    let job_file = lease.job_file.clone();
+    let (code, stderr) = lease.exit();
+    assert_eq!(code, Some(143), "{stderr}");
+    assert!(
+        job_file.exists(),
+        "the handle outlives the lease; mu removes it"
+    );
+    wait_until("the job to be stopped", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+    assert!(!local.exists(), "the forward is cancelled");
+    assert_eq!(records(&sshd), 0);
+}
+
+#[test]
+fn a_lease_exits_with_the_jobs_code_and_prints_its_final_screen() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "lease-done");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+
+    // The template mu fills: `env {env} sh -c {cmd}`, several words, so each
+    // is quoted on its own and `env` applies the assignment.
+    let lease = Lease::start(
+        &sshd,
+        &config,
+        "done",
+        &[unix_spec(&local, &remote)],
+        &[
+            "env",
+            "K=v w",
+            "sh",
+            "-c",
+            "printf 'env:%s|\\n' \"$K\"; sleep 1; exit 7",
+        ],
+    );
+    let id = lease.id();
+    let out = lease.out.clone();
+    let (code, stderr) = lease.exit();
+
+    assert_eq!(code, Some(7), "{stderr}");
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(
+        text.contains("env:v w|"),
+        "the final screen, env applied: {text}"
+    );
+    assert!(text.contains("done 7"), "{text}");
+    assert!(!local.exists(), "unforwarded on the way out");
+    assert_eq!(records(&sshd), 0);
+    clean_jobs(&sshd, &[id]);
+}
+
+#[test]
+fn a_lease_exits_three_only_at_startup_without_a_master() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "lease-nomaster");
+    let config = sshd.write_config(&tmux.name);
+
+    let lease = Lease::start(&sshd, &config, "nomaster", &[], &["sleep 60"]);
+    let job_file = lease.job_file.clone();
+    let out = lease.out.clone();
+    let (code, stderr) = lease.exit();
+
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("ssh -MNf"), "{stderr}");
+    assert!(std::fs::read_to_string(out).unwrap().is_empty());
+    // Named before the dispatch was refused; `rm` of it is a no-op.
+    let id = std::fs::read_to_string(&job_file).unwrap();
+    assert!(job_ids(&sshd).is_empty());
+    let _master = sshd.open_master(&sshd.socket);
+    assert_eq!(
+        sshd.mule(&config, &["rm", id.trim()]).status.code(),
+        Some(0)
+    );
+}
+
+#[test]
+fn removing_local_while_leased_is_re_forwarded_on_a_later_tick() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "lease-rmlocal");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "back");
+
+    let mut lease = Lease::start(
+        &sshd,
+        &config,
+        "rmlocal",
+        &[unix_spec(&local, &remote)],
+        &["sleep 60"],
+    );
+    let id = lease.id();
+    assert_eq!(through(&local), "back");
+
+    std::fs::remove_file(&local).unwrap();
+    wait_until(
+        "the lease to re-forward LOCAL",
+        Duration::from_secs(15),
+        || std::os::unix::net::UnixStream::connect(&local).is_ok(),
+    );
+    assert_eq!(through(&local), "back");
+    assert!(lease.alive());
+
+    let _ = sshd.mule(&config, &["rm", &id]);
+}
+
+#[test]
+fn a_lease_survives_a_master_restart_and_re_forwards_on_the_new_pid() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "lease-restart");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "alive");
+
+    let mut lease = Lease::start(
+        &sshd,
+        &config,
+        "restart",
+        &[unix_spec(&local, &remote)],
+        &["sleep 60"],
+    );
+    let id = lease.id();
+    assert_eq!(through(&local), "alive");
+
+    // `ssh -O exit`: the master and every forward it held are gone.
+    drop(master);
+    wait_until("the hand-back line", Duration::from_secs(15), || {
+        lease.output().contains("is gone; a human must")
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(lease.alive(), "a lost master must not end the lease");
+    assert_eq!(
+        lease.output().matches("is gone; a human must").count(),
+        1,
+        "said once"
+    );
+
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    wait_until(
+        "the forward on the new master",
+        Duration::from_secs(20),
+        || through_once(&local) == "alive",
+    );
+    assert!(lease.alive());
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+
+    let _ = sshd.mule(&config, &["rm", &id]);
+}
+
+/// One connect-and-read, no retry: `through` retries for 5s, which would hide
+/// the moment the forward comes back.
+fn through_once(local: &std::path::Path) -> String {
+    use std::io::Read;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(local) else {
+        return String::new();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut text = String::new();
+    let _ = stream.read_to_string(&mut text);
+    text
+}
+
+#[test]
+fn kill_9_of_a_lease_leaves_the_job_named_and_a_new_forward_of_local_works() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "lease-kill9");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "still");
+    let spec = unix_spec(&local, &remote);
+
+    let mut first = Lease::start(
+        &sshd,
+        &config,
+        "kill9",
+        std::slice::from_ref(&spec),
+        &["sleep 60"],
+    );
+    let id = first.id();
+    assert_eq!(through(&local), "still");
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+
+    // SIGKILL cannot be handled: the job keeps running.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+
+    // A new lease forwarding the same LOCAL replaces the stale listener.
+    let second = Lease::start(
+        &sshd,
+        &config,
+        "kill9b",
+        std::slice::from_ref(&spec),
+        &["sleep 60"],
+    );
+    let second_id = second.id();
+    wait_until(
+        "the second lease's forward",
+        Duration::from_secs(10),
+        || records(&sshd) == 1 && through_once(&local) == "still",
+    );
+    signal(&second.child, "TERM");
+    assert_eq!(second.exit().0, Some(143));
+
+    // The job file is what lets mu's stop template end the first job.
+    let named = std::fs::read_to_string(sshd.dir.join("kill9.job")).unwrap();
+    assert_eq!(named.trim(), id);
+    let out = sshd.mule(&config, &["rm", named.trim()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!job_state_dir(&sshd, &id).exists());
+    assert!(!sessions(&sshd, &tmux.name).contains(&format!("mule-{id}")));
+    wait_until(
+        "the second job to be stopped",
+        Duration::from_secs(15),
+        || !job_state_dir(&sshd, &second_id).exists(),
+    );
+}
+
+/// A private local tmux server, standing in for the pane mu runs a lease in.
+/// Never the developer's server or config; torn down (socket file included)
+/// on drop.
+struct Pane {
+    name: String,
+    /// Asked for while the server lives: killing the only pane ends the server,
+    /// and a dead server cannot say where its socket file is.
+    socket: Option<PathBuf>,
+}
+
+impl Pane {
+    fn new(tag: &str) -> Self {
+        Self {
+            name: format!("mule-l3p-{}-{tag}", std::process::id()),
+            socket: None,
+        }
+    }
+
+    fn remember_socket(&mut self) {
+        let out = self.tmux(&["display-message", "-p", "#{socket_path}"]);
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        self.socket = (!path.is_empty()).then(|| PathBuf::from(path));
+    }
+
+    fn tmux(&self, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("tmux")
+            .args(["-L", &self.name, "-f", "/dev/null"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        let _ = self.tmux(&["kill-server"]);
+        if let Some(path) = &self.socket {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Run a lease in a tmux pane, kill the pane when `ready` says so, and check
+/// what a pane death must leave behind: exit 129 (no panic), the job's session
+/// and state gone, the forward cancelled, LOCAL gone.
+fn kill_pane_ends_the_lease_and_its_job(
+    tag: &str,
+    slow_probe: bool,
+    ready: &dyn Fn(&Sshd, &std::path::Path) -> bool,
+) {
+    require_sshd!();
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping: tmux is not on PATH");
+        return;
+    }
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, tag);
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "pane");
+    let job_file = sshd.dir.join("pane.job");
+    let flag = sshd.dir.join("probe-in-flight");
+    let mut path = sshd.path_env();
+    if slow_probe {
+        path = format!("{}:{path}", slow_probe_ssh(&sshd, &flag).display());
+    }
+    let status = sshd.dir.join("status");
+    let stderr = sshd.dir.join("stderr");
+
+    // Two shells, as measured on macOS: the pane's own process (the session
+    // leader) dies of the hangup, which is what makes the kernel hang up the
+    // foreground group, lease included. The inner shell traps HUP only to
+    // outlive the pane and record the lease's exit status. A trapping session
+    // leader would survive, and nothing would hang up the lease at all. The
+    // trailing `; :` stops `sh -c` from exec'ing into the inner shell, which
+    // would make it the leader again.
+    let wrap = sshd.dir.join("wrap.sh");
+    std::fs::write(
+        &wrap,
+        format!(
+            "trap 'h=1' HUP\n\
+             export PATH='{path}' XDG_STATE_HOME='{state}'\n\
+             '{mule}' --config '{config}' run --lease --human --job-file '{job}' \
+               --forward-unix '{spec}' -- \
+               'i=0; while :; do i=$((i+1)); echo line $i; sleep 0.2; done' 2>'{stderr}'\n\
+             echo $? > '{status}'\n",
+            state = sshd.state_root.display(),
+            mule = env!("CARGO_BIN_EXE_mule"),
+            config = config.display(),
+            job = job_file.display(),
+            spec = unix_spec(&local, &remote),
+            stderr = stderr.display(),
+            status = status.display(),
+        ),
+    )
+    .unwrap();
+    let mut pane = Pane::new(tag);
+    let started = pane.tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "lease",
+        "-x",
+        "120",
+        "-y",
+        "40",
+        &format!("sh -c \"sh '{}'; :\"", wrap.display()),
+    ]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    pane.remember_socket();
+
+    wait_until("the job file", Duration::from_secs(10), || {
+        std::fs::read_to_string(&job_file).is_ok_and(|id| id.ends_with('\n'))
+    });
+    let id = std::fs::read_to_string(&job_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    wait_until("the forward", Duration::from_secs(10), || {
+        records(&sshd) == 1
+    });
+    wait_until(
+        "the moment to kill the pane",
+        Duration::from_secs(20),
+        || ready(&sshd, &flag),
+    );
+
+    let killed = pane.tmux(&["kill-pane", "-t", "lease"]);
+    assert!(
+        killed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+
+    wait_until("the lease's exit status", Duration::from_secs(10), || {
+        std::fs::read_to_string(&status).is_ok_and(|s| s.ends_with('\n'))
+    });
+    let err = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert_eq!(
+        std::fs::read_to_string(&status).unwrap().trim(),
+        "129",
+        "a panic on the dead tty would be 101: {err}"
+    );
+    assert!(!err.contains("panicked"), "{err}");
+    // `rm` removes the state dir, so no rc 137 is left to read: absence is
+    // the proof the stop ran.
+    wait_until(
+        "the job's session and state to be gone",
+        Duration::from_secs(20),
+        || {
+            !job_state_dir(&sshd, &id).exists()
+                && !sessions(&sshd, &tmux.name).contains(&format!("mule-{id}"))
+        },
+    );
+    assert!(!local.exists(), "LOCAL is gone");
+    assert_eq!(records(&sshd), 0, "the forward was cancelled and forgotten");
+    // And the master's table is not left holding it: a fresh forward of the
+    // same LOCAL to another REMOTE is not a wedge.
+    let other = sshd.dir.join("r2.sock");
+    let _serve2 = Serve::start(other.clone(), "fresh");
+    let out = sshd.mule(&config, &["forward", "--unix", &unix_spec(&local, &other)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(through(&local), "fresh");
+}
+
+#[test]
+fn kill_pane_mid_print_stops_the_job_and_cancels_the_forward_without_a_panic() {
+    // The job prints every 200ms and the lease mirrors it every tick, so the
+    // pane dies while the lease is writing to it.
+    kill_pane_ends_the_lease_and_its_job("lease-kpprint", false, &|_, _| {
+        std::thread::sleep(Duration::from_millis(2500));
+        true
+    });
+}
+
+#[test]
+fn kill_pane_mid_probe_abandons_the_probe_and_still_stops_the_job() {
+    kill_pane_ends_the_lease_and_its_job("lease-kpprobe", true, &|_, flag| {
+        std::fs::read_to_string(flag).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+}
