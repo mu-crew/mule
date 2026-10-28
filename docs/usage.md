@@ -153,6 +153,36 @@ that recorded forward too: leaving it in the master's table would let the next
 Concurrent `forward`/`unforward` of the same LOCAL take turns on a local lock;
 different LOCALs never wait on each other.
 
+## Running a command and waiting: `exec`
+
+```sh
+mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>
+```
+
+`ssh host cmd` semantics over mule's private connection, for a caller that needs
+the answer now and must not hold the default master. The command is a normal
+detached job, polled every 100ms (settling at 1s); when it ends, its stdout goes
+to your stdout and its stderr to your stderr, and the job is removed. Exit code
+is the command's own.
+
+- **Streams are separate**, unlike `run`. Parse stdout; read the reason from
+  stderr's first line.
+- **No id and no hints.** stderr is the command's plus mule's *fatal* errors:
+  the lock-wait notice, the `max_running` warning and the dispatch-pattern
+  warnings are all suppressed.
+- **Exit 7** means the output hit `max_log_bytes` and is partial. Never parse it
+  as complete. exec is for control-sized output: the whole log comes back in one
+  locked read, so use `run` and `tail` for anything big.
+- **SIGINT/SIGTERM stop the job** (exit 130/143), through a detached `mule rm`
+  that queues like any caller. Give it a moment before you tear the machine
+  down. `run --wait` is the opposite: its job continues.
+- **Exit 3** is still "no master: stop and ask a human".
+
+```sh
+mule exec --cwd ~/repo -- git rev-parse HEAD
+mule exec -- env K=v sh -c 'echo "$K"'      # several words: quoted for you
+```
+
 ## Hosts
 
 Every job verb accepts `--host`; with one configured host you can omit it.
@@ -168,6 +198,7 @@ only). `mule host info` probes OS, cores, RAM, and GPU and takes the lock.
 | 4 | Timed out waiting (`wait --timeout`); the job keeps running |
 | 5 | Orphaned job: no exit code will arrive |
 | 6 | Connection dropped while waiting; wait again |
-| *n* | `wait` and `run --wait` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
+| 7 | `exec` only: output hit `max_log_bytes`, so what was printed is partial |
+| *n* | `wait`, `run --wait` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
 
 `mule --help` carries the same table.

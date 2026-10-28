@@ -14,6 +14,24 @@ unsearchable directory exits 1 with the tmux or `ls` error, and keeps the state.
 Only `no server running`, a missing socket, or `No such file or directory`
 count as gone.
 
+**`mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>`** is `ssh host cmd`
+over mule's private connection, for a caller that needs a synchronous answer and
+must not hold the default master. It runs a detached job, polls at 100ms
+settling at 1s, prints the command's stdout to stdout and its stderr to stderr
+(its own wrapper mode, unlike `run`'s merged log), exits with the command's
+code and removes the job. No id line, no hints, and no mule warnings on stderr:
+only the command's stderr and fatal errors. SIGHUP/SIGINT/SIGTERM stop the job
+through a detached `mule rm` and exit 129/130/143.
+
+**New exit code 7** (`exec` only): the output hit `max_log_bytes`, so what was
+printed is partial.
+
+The detached cleanup (`cleanup.rs`) runs `current_exe()` with the effective
+`--config`, so a private config is never swapped for the default one, and
+detaches with `setsid()` through `libc` (macOS has no `setsid` executable). The
+signal handler only sets a flag and writes a self-pipe (`signal-hook`).
+`main` no longer panics when stderr is a dead tty.
+
 **`mule forward` / `mule unforward`** carry a unix control socket over mule's
 master with `--unix LOCAL:REMOTE`. A forward is a channel, not a session, so it
 works while the one `MaxSessions` slot is held. `forward` verifies with

@@ -224,6 +224,7 @@ mule tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
 mule ls [--host H] [--all] [--json] [--full]
 mule kill <id> [--host H] [--rm]
 mule rm [<id> | --all] [--host H]
+mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>
 mule host list [--json]
 mule host info [--host H] [--json]
 ```
@@ -252,8 +253,36 @@ The stable mule-specific exit codes are:
 | 4 | Wait timed out. |
 | 5 | Job is orphaned. |
 | 6 | Connection dropped while waiting. |
+| 7 | `exec` only: the output hit `max_log_bytes`, so what was printed is partial. |
 
 A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `mule tail <id>` as the recovery command.
+
+## `exec`
+
+`mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>` gives `ssh host cmd` semantics over mule's private connection, for a caller that needs a synchronous command and must not hold the default master. mu's `--exec` template is the motivating caller: a remote `git worktree add` is budgeted at 120s, which would be 120s of refused sessions on a capped host.
+
+It is an ordinary detached job with a foreground waiter, so invariant 3 holds: no ssh call lasts more than a round trip. It differs from `run --wait` in five ways:
+
+- **Separate streams.** exec uses its own wrapper mode, which writes stdout to `$d/log` and stderr to `$d/err`. The `cd` is inside the stderr redirect, so a bad `--cwd` leaves its reason on stderr's first line, as `ssh host cmd` would. After the job ends, exec prints the log to stdout and then the err file to stderr, in one locked read. [Split stdout and stderr](#split-stdout-and-stderr) rejects two logs *for the job artifact*; exec is a synchronous ssh stand-in, not an artifact reader, so the amendment applies to exec only.
+- **Quiet stderr.** No id line and no hints. mule's non-fatal diagnostics (the lock-wait notice, `max_running`, dispatch-pattern warnings) are suppressed, so stderr is the command's plus mule's fatal errors. A caller reads "why" from stderr's first line.
+- **Fast poll.** The interval starts at **100ms** and doubles to a **1s** cap, not the 5s a detached job settles at, because the caller is blocked on it. A 30s command costs about 30 probes.
+- **Exit status.** exec exits with the command's code and removes the job in the same round trip that reads it. If the log reached `max_log_bytes` (or the err file did, which has no wrapper-side cap and is bounded on read), it exits **7**: partial output delivered, never mistaken for complete. exec is for control-sized output. No master is exit 3, unchanged.
+- **Signals.** On SIGHUP, SIGINT or SIGTERM exec stops the job through [detached cleanup](#detached-cleanup) and exits 129, 130 or 143. This is the difference from `run --wait`, where the job continues.
+
+The final read waits (bounded, 5s) for `mule-<id>`'s session to end before reading: `rc` is written by the left end of the log pipeline and the log by the right end, so `rc` can land while the last bytes and the `truncated` marker are still in flight.
+
+Cost: about 125ms to dispatch plus at least 100ms of polling, against 33ms for a bare ssh. A profile has one `exec` template, so the sub-second calls become jobs too, and a refused `git rev-parse` reading as an empty answer is exactly what [What belongs in a job](#what-belongs-in-a-job) warns about.
+
+### Detached cleanup
+
+A foreground waiter cannot stop its own job from a signal path: `rm` queues on the ticket lock, and a holder whose ssh fell back to a direct connect can keep the ticket for a TCP timeout. So the waiter spawns a detached child and exits at once:
+
+- **Executable:** `std::env::current_exe()`, never `mule` from PATH. A worker or a test runs a freshly built binary, and PATH may hold another or none.
+- **Arguments:** the effective `--config` path when one was given (made absolute), then `--quiet`, `rm`, `--host H`, the id. The child must never fall back to, or seed, the default config.
+- **Detach:** `pre_exec` with `setsid()` via `libc`, stdio on `/dev/null`. macOS ships no `setsid` executable. A pane that dies sends SIGHUP to its process group, and the stop must survive it.
+- **Queueing:** the child takes a ticket like any caller. A dead waiter's ticket is skipped by `wait_for_turn`, so an abandoned in-flight probe never wedges the queue.
+
+The signal handler only sets a flag and writes to a self-pipe (`signal-hook`), so a sleep is interruptible; a thread acts on it. The first act is `dup2` of `/dev/null` onto fds 1 and 2, because after SIGHUP the pane's tty is gone and `print!`/`eprint!` panic on EIO. If the signal lands while the dispatch ssh is in flight, the child waits up to 3s for it first: an `rm` that overtook the dispatch would be a no-op and leak the job. This lives in `cleanup.rs`, reusable by the lease.
 
 ## Listing, load, and cleanup
 
@@ -289,6 +318,7 @@ Truncation is recorded in a marker file and reported on stderr by `tail`, becaus
 - An orphan exits **5** because no `rc` can arrive.
 - A missing job exits **1** with `job <id> not found`.
 - A dropped connection during `wait` exits **6** while the remote job continues.
+- `exec` output past `max_log_bytes` exits **7** in place of the command's code, so a stdout parser never mistakes a prefix for the whole answer.
 - A refused channel reports a busy or down master rather than raw SSH authentication text.
 - An unreachable configured host remains visible in `ls` diagnostics.
 
@@ -351,8 +381,8 @@ The design separates four kinds of evidence:
 | Layer | Coverage | Requirement |
 | --- | --- | --- |
 | 1 | Logic through a fake `Transport`: config, IDs, scripts, state mapping, and lock ordering | None |
-| 2 | The generated wrapper against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
-| 3 | Channel isolation, gated concurrency, dispatch latency, and bounded wait | Local `sshd` recipe above |
+| 2 | The generated wrapper (including `exec`'s split-stream mode) against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
+| 3 | Channel isolation, gated concurrency, dispatch latency, bounded wait, and `exec`'s signal cleanup (private config, no `mule` on PATH, queued behind a held ticket) | Local `sshd` recipe above |
 | 3b | The 2FA-specific error text and network latency | A capped host and a live master |
 
 Layer 2 uses a private tmux socket and no personal config. It catches quoting, `rc` writes, kill status **137**, and shell exit-code propagation that a fake transport cannot test. Layer 3 reproduces the channel cap without privileged setup. Layer 3b is the only layer that needs a token tap.
@@ -432,6 +462,8 @@ A forward record is not a job index. It exists only because OpenSSH cannot list 
 ### Split stdout and stderr
 
 Two logs require two offsets and extra reads while losing causal interleaving. The submitted command can redirect either stream when separation matters.
+
+This is rejected for the job artifact only. `mule exec` is the exception: it is a synchronous stand-in for `ssh host cmd`, whose callers parse stdout and read the reason from stderr, and it reads both files once after the job ends, so there are no offsets to keep and no interleaving to lose to a streaming reader. See [`exec`](#exec).
 
 ### Read every complete log by default
 

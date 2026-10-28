@@ -4,10 +4,12 @@
 //! binary does, including the `Fake` transport that makes test layer 1 possible
 //! without a network or an ssh master.
 
+pub mod cleanup;
 pub mod cli;
 pub mod config;
 mod dispatch_warn;
 pub mod errors;
+pub mod exec;
 pub mod forward;
 pub mod jobs;
 pub mod lock;

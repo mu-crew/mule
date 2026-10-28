@@ -39,6 +39,32 @@ pub fn dispatch_with_warnings(
     mode: JobMode,
     warnings: &mut dyn Write,
 ) -> Result<JobId> {
+    // Generated, so it parses by construction; the parse is what keeps a
+    // CLI-supplied id from reaching the remote shell unvalidated.
+    let id = new_id().parse::<JobId>().expect("generated ids are valid");
+    dispatch_with_id(
+        transport, host, id, cmd, cwd, max_secs, metadata, mode, warnings,
+    )
+}
+
+/// Dispatch under an id the caller already holds.
+///
+/// `mule exec` needs the id before the ssh call returns: a signal that lands
+/// mid-dispatch must still be able to name the job it may have started, and
+/// `rm` of an id that never dispatched is a no-op.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // Same seam as `dispatch_with_warnings`, plus the id.
+pub fn dispatch_with_id(
+    transport: &dyn Transport,
+    host: &Host,
+    id: JobId,
+    cmd: &str,
+    cwd: Option<&str>,
+    max_secs: Option<u64>,
+    metadata: JobMetadata,
+    mode: JobMode,
+    warnings: &mut dyn Write,
+) -> Result<JobId> {
     // `ssh -O check` measured at 0s and opens no session channel, so it is the
     // one transport call deliberately outside the lock.
     if !transport.master_alive(host) {
@@ -46,9 +72,7 @@ pub fn dispatch_with_warnings(
     }
 
     let job = Job {
-        // Generated, so it parses by construction; the parse is what keeps a
-        // CLI-supplied id from reaching the remote shell unvalidated.
-        id: new_id().parse::<JobId>().expect("generated ids are valid"),
+        id,
         cmd: cmd.to_owned(),
         cwd: cwd.map(str::to_owned),
         max_secs: max_secs.unwrap_or(host.max_job_secs),

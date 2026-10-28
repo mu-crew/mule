@@ -29,6 +29,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// exists to remove.
 const WARN_AFTER: Duration = Duration::from_secs(5);
 
+/// Suppresses the "waiting for lock ticket" notice, process-wide.
+///
+/// `mule exec` stands in for `ssh host cmd`, whose caller parses stderr and
+/// reads the command's own first line as the reason (SPEC § exec). A lock-wait
+/// notice is mule talking, not the command, so exec turns it off. A process
+/// flag rather than an argument because the notice is printed deep inside
+/// `Transport::run`, which every verb reaches through the same provided method.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `~/.local/state/mule` (or under `$XDG_STATE_HOME`): mule's local state root.
 ///
 /// Holds the ticket locks and the forward records; never a job index.
@@ -47,11 +60,20 @@ pub fn lock_path(host: &str) -> PathBuf {
 
 /// Run `f` while holding the fair lock for `host`.
 pub fn with_lock<T>(host: &str, f: impl FnOnce() -> T) -> Result<T> {
-    let path = lock_path(host);
-    fs::create_dir_all(&path)
+    with_lock_at(&lock_path(host), f)
+}
+
+/// [`with_lock`] on an explicit lock directory.
+///
+/// Exposed so a test can hold or queue on the ticket of a mule process it
+/// spawned: that process's `$XDG_STATE_HOME` is not this one's, and mutating
+/// the environment of a multi-threaded test binary is a race.
+#[doc(hidden)]
+pub fn with_lock_at<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T> {
+    fs::create_dir_all(path)
         .with_context(|| format!("cannot create lock directory {}", path.display()))?;
 
-    let ticket = with_counter_lock(&path, || {
+    let ticket = with_counter_lock(path, || {
         let next = read_counter(&path.join("next"))?;
         write_counter(&path.join("next"), next + 1)?;
         if !path.join("serving").exists() {
@@ -62,16 +84,15 @@ pub fn with_lock<T>(host: &str, f: impl FnOnce() -> T) -> Result<T> {
         // detect: `serving` reaches its number, no `holder` was ever written,
         // and every later caller queues behind a ticket that will never be
         // claimed. Reproduced -- it wedged the host indefinitely.
-        fs::write(
-            waiter_file(&path, next),
-            format!("{}\n", std::process::id()),
-        )
-        .context("cannot record lock waiter")?;
+        fs::write(waiter_file(path, next), format!("{}\n", std::process::id()))
+            .context("cannot record lock waiter")?;
         Ok(next)
     })?;
 
-    wait_for_turn(&path, ticket)?;
-    let guard = HeldLock { path };
+    wait_for_turn(path, ticket)?;
+    let guard = HeldLock {
+        path: path.to_path_buf(),
+    };
     let result = f();
     drop(guard);
     Ok(result)
@@ -130,7 +151,10 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
             return Ok(());
         }
 
-        if !warned && started.elapsed() >= WARN_AFTER {
+        if !warned
+            && started.elapsed() >= WARN_AFTER
+            && !QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let serving = read_counter(&path.join("serving")).unwrap_or(ticket);
             let holder = read_pid(&path.join("holder")).ok().flatten();
             eprintln!(
