@@ -52,7 +52,7 @@ const SESSION_END_WAIT: Duration = Duration::from_secs(5);
 ///
 /// Dispatch is sub-second by invariant, but a holder whose ssh fell back to a
 /// direct connect can sit for a TCP timeout, and the signal path must not.
-const DISPATCH_GRACE: Duration = Duration::from_secs(3);
+pub(crate) const DISPATCH_GRACE: Duration = Duration::from_secs(3);
 
 /// The collect script's exit status when the read worked but removing the job
 /// did not. Distinct from ssh's own 255 and from a read failure, so the caller

@@ -174,8 +174,30 @@ pub enum Commands {
         /// prints pasteable screen, murmur jump, mu attach, and cleanup commands.
         #[arg(long, conflicts_with_all = ["wait", "no_tail"])]
         tui: bool,
+        /// Hold the job for its life: name it in --job-file, forward sockets, exit with it
+        ///
+        /// For a local pane whose life must be the job's (a mu remote worker).
+        /// Implies --tui. The id is written to --job-file (one line, 0600,
+        /// atomic) BEFORE dispatch, so the job can always be stopped with
+        /// `mule rm <id>`. Each --forward-unix is forwarded over mule's master
+        /// and re-armed when it drifts. The lease mirrors the remote screen for
+        /// 30s after the first forward, then prints it on state changes.
+        ///
+        /// Exits with the job's code when it ends; 1 if the job is missing; 5
+        /// if orphaned; 3 only at startup (no master). A master that goes away
+        /// later does NOT end the lease: it prints the command a human must run
+        /// and keeps holding. SIGHUP/SIGINT/SIGTERM stop the job through a
+        /// detached `mule rm` and exit 129/130/143.
+        #[arg(long, requires = "job_file", conflicts_with_all = ["wait", "no_tail"])]
+        lease: bool,
+        /// With --lease: file the job id is written to before dispatch
+        #[arg(long, value_name = "F", requires = "lease")]
+        job_file: Option<std::path::PathBuf>,
+        /// With --lease: LOCAL:REMOTE unix sockets to forward; repeatable
+        #[arg(long, value_name = "LOCAL:REMOTE", requires = "lease")]
+        forward_unix: Vec<String>,
         /// Block locally until the job finishes; unlike --max-secs, this does not kill it
-        #[arg(long, conflicts_with = "tui")]
+        #[arg(long, conflicts_with_all = ["tui", "lease"])]
         wait: bool,
         /// With --wait: print the log once at the end instead of streaming
         #[arg(long, requires = "wait", conflicts_with = "tui")]
@@ -770,11 +792,41 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             max_secs,
             human,
             tui,
+            lease,
+            job_file,
+            forward_unix,
             wait,
             no_tail,
             cmd,
         } => {
             let host = cfg.host(host.host.as_deref())?;
+            if lease {
+                let specs = crate::forward::Spec::parse_all(&forward_unix)?;
+                let command = command_from_args(&cmd);
+                let workstream = (!human)
+                    .then(|| std::env::var("MU_WORKSTREAM").ok())
+                    .flatten()
+                    .filter(|value| !value.is_empty());
+                let metadata = if human {
+                    crate::wrapper::JobMetadata::Human
+                } else {
+                    crate::wrapper::JobMetadata::Managed { workstream }
+                };
+                return crate::lease::run_cli(
+                    host,
+                    cli.config.clone(),
+                    job_file
+                        .as_deref()
+                        .expect("clap requires --job-file with --lease"),
+                    specs,
+                    &crate::lease::Request {
+                        cmd: &command,
+                        cwd: cwd.as_deref(),
+                        max_secs,
+                        metadata,
+                    },
+                );
+            }
             // `--` is the caller saying "everything after this is the
             // command", so an explicit separator silences the warning. clap
             // strips it, so look at the raw arguments.
@@ -1372,6 +1424,78 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["mule", "run", "--tui", "--wait", "true"]).is_err());
         assert!(Cli::try_parse_from(["mule", "run", "--tui", "--no-tail", "true"]).is_err());
+    }
+
+    #[test]
+    fn lease_requires_a_job_file_implies_tui_and_rejects_local_wait_modes() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        assert!(ok(&[
+            "mule",
+            "run",
+            "--lease",
+            "--job-file",
+            "/f",
+            "--",
+            "pi"
+        ]));
+        assert!(ok(&[
+            "mule",
+            "run",
+            "--lease",
+            "--job-file",
+            "/f",
+            "--forward-unix",
+            "/l:/r",
+            "--forward-unix",
+            "/l2:/r2",
+            "--human",
+            "--cwd",
+            "/w",
+            "--max-secs",
+            "9",
+            "--",
+            "pi",
+        ]));
+        // --tui is implied, so saying it too is harmless.
+        assert!(ok(&[
+            "mule",
+            "run",
+            "--lease",
+            "--tui",
+            "--job-file",
+            "/f",
+            "pi"
+        ]));
+        assert!(
+            !ok(&["mule", "run", "--lease", "pi"]),
+            "--job-file is required"
+        );
+        assert!(!ok(&[
+            "mule",
+            "run",
+            "--lease",
+            "--job-file",
+            "/f",
+            "--wait",
+            "pi"
+        ]));
+        assert!(!ok(&[
+            "mule",
+            "run",
+            "--lease",
+            "--job-file",
+            "/f",
+            "--no-tail",
+            "pi"
+        ]));
+        assert!(
+            !ok(&["mule", "run", "--job-file", "/f", "pi"]),
+            "only with --lease"
+        );
+        assert!(
+            !ok(&["mule", "run", "--forward-unix", "/l:/r", "pi"]),
+            "only with --lease"
+        );
     }
 
     #[test]
