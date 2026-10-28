@@ -227,9 +227,16 @@ impl Sshd {
 
     /// Open a control master on `socket` and wait for it to answer.
     pub fn open_master(&self, socket: &Path) -> Master {
+        self.open_master_with(socket, &[])
+    }
+
+    /// [`Sshd::open_master`] with extra ssh options, e.g. the
+    /// `StreamLocalBindUnlink=yes` that `mule`'s printed master command sets.
+    pub fn open_master_with(&self, socket: &Path, extra: &[&str]) -> Master {
         run(Command::new(self.dir.join("ssh"))
             .args(["-M", "-N", "-f", "-S"])
             .arg(socket)
+            .args(extra)
             .arg("127.0.0.1"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !self.master_alive(socket) {

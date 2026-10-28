@@ -29,13 +29,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// exists to remove.
 const WARN_AFTER: Duration = Duration::from_secs(5);
 
-/// The state directory for one host's ticket lock.
-pub fn lock_path(host: &str) -> PathBuf {
+/// `~/.local/state/mule` (or under `$XDG_STATE_HOME`): mule's local state root.
+///
+/// Holds the ticket locks and the forward records; never a job index.
+pub fn state_dir() -> PathBuf {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".local/state")))
         .unwrap_or_else(|| PathBuf::from(".local/state"));
-    state.join("mule").join(format!("{host}.lock"))
+    state.join("mule")
+}
+
+/// The state directory for one host's ticket lock.
+pub fn lock_path(host: &str) -> PathBuf {
+    state_dir().join(format!("{host}.lock"))
 }
 
 /// Run `f` while holding the fair lock for `host`.

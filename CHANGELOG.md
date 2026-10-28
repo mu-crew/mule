@@ -14,6 +14,21 @@ unsearchable directory exits 1 with the tmux or `ls` error, and keeps the state.
 Only `no server running`, a missing socket, or `No such file or directory`
 count as gone.
 
+**`mule forward` / `mule unforward`** carry a unix control socket over mule's
+master with `--unix LOCAL:REMOTE`. A forward is a channel, not a session, so it
+works while the one `MaxSessions` slot is held. `forward` verifies with
+`connect(LOCAL)` instead of trusting `ssh -O forward`'s exit code, remembers
+each forward so changing one LOCAL's REMOTE cannot wedge the master's forward
+table, and exits **3** with `ssh -O exit` and the master command if the table is
+wedged anyway. Unix sockets only; TCP stays out.
+
+`Transport::mux_op` is the new lock-free path (`-O check`, `-O forward`,
+`-O cancel` for local unix forwards), as a closed enum so the exemption cannot
+widen by accident. `master_alive` is now `mux_op(Check)`.
+
+The printed master command now includes `-o StreamLocalBindUnlink=yes`, so a
+master reopened from it rebinds over a stale socket file.
+
 ## 0.2.1 — 2026-09-27
 
 First release on npm: `npm i -g @mu-crew/mule` installs a prebuilt binary for

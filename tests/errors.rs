@@ -110,7 +110,7 @@ fn no_master_names_the_exact_recovery_command() {
     assert_eq!(
         text,
         "no control master for dev\n  \
-         run: ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h build.example\n  \
+         run: ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h -o StreamLocalBindUnlink=yes build.example\n  \
          a human may need to tap a hardware key; ask rather than retrying"
     );
     // The last line is for automated callers, which are the primary users: this

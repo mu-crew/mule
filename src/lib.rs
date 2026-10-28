@@ -8,6 +8,7 @@ pub mod cli;
 pub mod config;
 mod dispatch_warn;
 pub mod errors;
+pub mod forward;
 pub mod jobs;
 pub mod lock;
 pub mod probe;

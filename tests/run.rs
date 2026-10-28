@@ -72,7 +72,7 @@ fn no_master_error_prints_the_exact_command_to_open_one() {
     let message = error.to_string();
 
     assert!(message.contains("no control master for dev"));
-    assert!(message.contains("ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h build.example"));
+    assert!(message.contains("ssh -MNf -S /tmp/mule-dev.sock -o ControlPersist=8h -o StreamLocalBindUnlink=yes build.example"));
 }
 
 #[test]
