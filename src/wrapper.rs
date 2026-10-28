@@ -20,6 +20,9 @@ pub struct Job {
 pub enum JobMode {
     Pipe,
     Tui,
+    /// `mule exec`: like `Pipe`, but the command's stderr goes to its own
+    /// `$d/err` file instead of the pane's tty (SPEC § Split stdout and stderr).
+    Exec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,12 +47,13 @@ pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
     match job.mode {
-        JobMode::Pipe => pipe_dispatch_script(host, job),
+        JobMode::Pipe => pipe_dispatch_script(host, job, false),
+        JobMode::Exec => pipe_dispatch_script(host, job, true),
         JobMode::Tui => tui_dispatch_script(host, job),
     }
 }
 
-fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
+fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     let dir = state_dir(&job.id);
     let command = encode_command(job.cmd.as_bytes());
     let cwd = job
@@ -106,13 +110,27 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
         }
     };
 
+    // exec appends the command's stderr to `err` and nothing else's: the group
+    // covers `cd` too, so a bad `--cwd` leaves its reason on the first line of
+    // stderr, as `ssh host cmd` would. The watchdog and tmux calls sit outside
+    // the group, so their diagnostics never reach a caller that parses stderr.
+    // Appending (`>>`) keeps a re-run of one id from clobbering evidence, though
+    // ids are never reused while their state dir exists.
+    let body = |cd: &str, shell: &str| {
+        if split_err {
+            format!("{{ {cd} && {shell} < {dir}/cmd; }} 2>> {dir}/err")
+        } else {
+            format!("{cd} && {shell} < {dir}/cmd")
+        }
+    };
+
     // The job reads its script from the `cmd` file written before tmux starts,
     // never from the tmux command string: tmux rejects a `new-session` command
     // over ~16KB with "command too long", so inlining the payload capped every
     // job at about 12KB of script. Redirecting the file keeps the old stdin
     // semantics exactly -- `sh` still reads its script from standard input.
     let run = if job.max_secs == 0 {
-        format!("{cd} && {shell} < {dir}/cmd; echo $? > {dir}/rc")
+        format!("{}; echo $? > {dir}/rc", body(&cd, &shell))
     } else {
         // POSIX sh has no portable process-group primitive, so the inner tmux
         // session supplies one: `kill-session` terminates the command and all
@@ -133,12 +151,13 @@ fn pipe_dispatch_script(host: &Host, job: &Job) -> String {
         format!(
             "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
              \"printf %s {watchdog} | base64 -d | sh\"; \
-             {cd} && {shell} < {dir}/cmd; rc=$?; \
+             {body}; rc=$?; \
              tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
              if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
             socket = host.tmux_socket,
             id = job.id,
             watchdog = encode_command(watchdog.as_bytes()),
+            body = body(&cd, &shell),
         )
     };
 

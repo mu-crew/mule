@@ -53,3 +53,12 @@ thiserror = "2.0"
 
 # `~` expansion for socket paths, and the XDG state/config dirs.
 directories = "6.0"
+
+# Signals for foreground waiters (`exec`, later the lease): a flag-only handler
+# plus a self-pipe, so a sleep is interruptible and nothing but an atomic store
+# runs in signal context.
+signal-hook = "0.3"
+
+# `setsid()` for the detached cleanup child (macOS has no `setsid` executable),
+# `dup2` onto /dev/null after a hangup, and `poll` on the signal pipe.
+libc = "0.2"

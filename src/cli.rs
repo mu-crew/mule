@@ -121,7 +121,8 @@ Exit status:
   4   timed out waiting
   5   orphaned job
   6   connection dropped while waiting
-  <n> wait/--wait return the job's own exit code"
+  7   exec only: output exceeded max_log_bytes, so what was printed is partial
+  <n> wait/--wait return the job's own exit code; exec returns the command's"
 )]
 pub struct Cli {
     /// Config file (default: ~/.config/mule/config.toml)
@@ -304,6 +305,34 @@ pub enum Commands {
         all: bool,
         #[command(flatten)]
         host: HostArg,
+    },
+    /// Run a command and wait: `ssh host cmd` over mule's private connection
+    ///
+    /// For a caller that needs a synchronous answer and must not hold the
+    /// default master. The command is a normal detached job, polled every
+    /// 100ms-1s; its stdout goes to stdout and its stderr to stderr, after it
+    /// ends, and the job is removed. No id is printed and mule stays quiet on
+    /// stderr, so stderr is the command's plus mule's fatal errors.
+    ///
+    /// Exits with the command's own code. Exit 7 means the output hit
+    /// max_log_bytes and is partial -- never parse it as complete. Exit 3 means
+    /// no master: stop and ask a human. SIGINT/SIGTERM stop the remote job
+    /// through a detached `mule rm`, unlike `run --wait`, where it continues.
+    ///
+    /// For control-sized output: the whole log comes back in one locked read.
+    /// Flags go before the command, or after `--`.
+    Exec {
+        #[command(flatten)]
+        host: HostArg,
+        /// Directory to run in (default: the host's default_cwd, else $HOME)
+        #[arg(long, value_name = "D")]
+        cwd: Option<String>,
+        /// Kill the remote command after S seconds (0 means unbounded); exits 124
+        #[arg(long, value_name = "S")]
+        max_secs: Option<u64>,
+        /// The command: one shell string, or an argv (quoted for you)
+        #[arg(trailing_var_arg = true, required = true)]
+        cmd: Vec<String>,
     },
     /// Forward a local unix socket to a remote one over mule's master
     ///
@@ -834,6 +863,24 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 Err(error) => Err(error),
             }
         }
+        Commands::Exec {
+            host,
+            cwd,
+            max_secs,
+            cmd,
+        } => {
+            let host = cfg.host(host.host.as_deref())?;
+            let command = command_from_args(&cmd);
+            crate::exec::run_cli(
+                host,
+                cli.config.clone(),
+                &crate::exec::Request {
+                    cmd: &command,
+                    cwd: cwd.as_deref(),
+                    max_secs,
+                },
+            )
+        }
         Commands::Forward { host, unix } => {
             let host = cfg.host(host.host.as_deref())?;
             let specs = crate::forward::Spec::parse_all(&unix)?;
@@ -1183,7 +1230,7 @@ fn print_jobs(
 /// multiple arguments are an argv-style command whose boundaries must survive
 /// the remote shell. The local shell has already removed the caller's quoting,
 /// so joining with spaces cannot distinguish `"a b"` from `a b`.
-fn command_from_args(args: &[String]) -> String {
+pub fn command_from_args(args: &[String]) -> String {
     match args {
         [command] => command.clone(),
         _ => args

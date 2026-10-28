@@ -192,6 +192,7 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         "4   timed out waiting",
         "5   orphaned job",
         "6   connection dropped while waiting",
+        "7   exec only: output exceeded max_log_bytes",
         "<n> wait/--wait return the job's own exit code",
     ] {
         assert!(help.contains(text), "help missing {text:?}:\n{help}");

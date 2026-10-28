@@ -1801,3 +1801,408 @@ fn unforward_exits_one_naming_a_real_unlink_failure_and_keeps_the_record() {
     );
     assert!(!local.exists());
 }
+
+// -- mule exec ----------------------------------------------------------------
+
+/// The mule binary under test, as a spawnable (not yet run) child, so a test
+/// can signal it. `extra_env` lets a test point HOME and XDG_CONFIG_HOME
+/// somewhere private.
+fn spawn_mule(
+    sshd: &Sshd,
+    config: &std::path::Path,
+    args: &[&str],
+    extra_env: &[(&str, &std::path::Path)],
+) -> std::process::Child {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mule"));
+    command
+        .arg("--config")
+        .arg(config)
+        .args(args)
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command.spawn().expect("mule failed to spawn")
+}
+
+fn signal(child: &std::process::Child, name: &str) {
+    let status = std::process::Command::new("kill")
+        .args([&format!("-{name}"), &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Job ids currently on the "remote" (this machine, under the daemon's state).
+fn job_ids(sshd: &Sshd) -> Vec<String> {
+    std::fs::read_dir(sshd.state_root.join("mule/jobs"))
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn wait_until(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + limit;
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn sessions(sshd: &Sshd, tmux: &str) -> String {
+    // One quoted script: ssh joins its arguments and the remote shell re-parses
+    // them, so a bare `#{session_name}` would start a comment.
+    let out = sshd.ssh(&[&format!(
+        "tmux -L {tmux} list-sessions -F '#{{session_name}}' 2>/dev/null; true"
+    )]);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn exec_splits_the_real_streams_and_prints_no_id_or_hint() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-split");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.mule(
+        &config,
+        &[
+            "exec",
+            "--",
+            "sh",
+            "-c",
+            "echo to-out; echo to-err >&2; exit 5",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(5), "exec exits with the job's code");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "to-out\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "to-err\n",
+        "stderr is the command's alone: no id, no `next:` hints"
+    );
+    assert!(job_ids(&sshd).is_empty(), "exec removes its job");
+}
+
+#[test]
+fn exec_applies_env_for_a_multi_word_command_and_runs_in_cwd() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-env");
+    let config = sshd.write_config(&tmux.name);
+    let cwd = sshd.dir.join("a dir");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let out = sshd.mule(
+        &config,
+        &[
+            "exec",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--",
+            "env",
+            "K=v w",
+            "sh",
+            "-c",
+            "printf '%s|' \"$K\"; pwd",
+        ],
+    );
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("v w|"), "{text}");
+    assert!(text.trim_end().ends_with("/a dir"), "{text}");
+}
+
+#[test]
+fn exec_exits_seven_when_the_log_is_capped() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-cap");
+    let config = sshd.write_config(&tmux.name);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("max_log_bytes = 1024\n");
+    std::fs::write(&config, text).unwrap();
+
+    let out = sshd.mule(
+        &config,
+        &["exec", "i=0; while [ $i -lt 500 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done"],
+    );
+
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(out.stdout.len(), 1024);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("max_log_bytes"));
+}
+
+#[test]
+fn a_long_exec_leaves_the_default_master_usable_and_a_signal_leaves_no_job() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-held");
+    let config = sshd.write_config(&tmux.name);
+
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 30"], &[]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        sessions(&sshd, &tmux.name).contains("mule-")
+    });
+
+    // The point of exec: it holds nothing on the default connection, so an
+    // ordinary `ssh host cmd` works for the whole 30s -- here, three times,
+    // during it. (A held `ssh host 'sleep 30'` would have refused every one.)
+    for attempt in 0..3 {
+        let out = sshd.ssh(&["echo", "ok"]);
+        assert!(
+            out.status.success(),
+            "default-connection ssh {attempt} refused during exec: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // And mule's own channel is not held either: a poll-shaped call is quick.
+    let started = Instant::now();
+    let listed = sshd.mule(&config, &["ls", "--quiet"]);
+    assert!(listed.status.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // SIGTERM mid-exec: no job left.
+    signal(&exec, "TERM");
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(143));
+    wait_until("the job to be removed", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+#[test]
+fn sigint_mid_exec_leaves_no_job_and_exits_130() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-int");
+    let config = sshd.write_config(&tmux.name);
+
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &[]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+    signal(&exec, "INT");
+
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(130));
+    wait_until("the job to be removed", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+#[test]
+fn the_detached_cleanup_uses_the_private_config_and_never_the_default_one() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-cfg");
+    let config = sshd.write_config(&tmux.name);
+    // A home with no mule config. A cleanup child that dropped --config would
+    // fall back to <xdg>/mule/config.toml, seed a template there, exit 1, and
+    // leave the job running.
+    let home = sshd.dir.join("empty-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let xdg = home.join("config");
+    let env = [("HOME", home.as_path()), ("XDG_CONFIG_HOME", xdg.as_path())];
+
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &env);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+    signal(&exec, "TERM");
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(143));
+
+    wait_until("the job to be removed", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+    assert!(
+        !xdg.join("mule/config.toml").exists() && !home.join(".config/mule").exists(),
+        "the cleanup child must not read or seed the default config"
+    );
+}
+
+#[test]
+fn a_queued_cleanup_runs_after_the_ticket_frees_and_exec_exits_without_waiting() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-queue");
+    let config = sshd.write_config(&tmux.name);
+
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &[]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+
+    // Hold the host's ticket, as a caller whose ssh hangs would. exec's next
+    // probe now queues behind it: that is the in-flight probe the signal must
+    // abandon, and the cleanup `rm` must queue the same way.
+    let lock = sshd.state_root.join("mule/live.lock");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&lock, || {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let started = Instant::now();
+    signal(&exec, "TERM");
+    let out = exec.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(143));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "exec must not block its exit on the ticket lock"
+    );
+
+    // The stop is queued, not done: the job is still there while the ticket is.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !job_ids(&sshd).is_empty(),
+        "cleanup must queue behind the ticket"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    wait_until("the queued cleanup to run", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+
+    // The dead exec's abandoned probe ticket did not wedge the queue.
+    let started = Instant::now();
+    let listed = sshd.mule(&config, &["ls", "--quiet"]);
+    assert!(listed.status.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn a_signal_with_stdout_and_stderr_closed_does_not_panic() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-hup");
+    let config = sshd.write_config(&tmux.name);
+
+    let mut exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &[]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+    // The reader goes away, as a pane's tty does on hangup: every later write
+    // is EPIPE.
+    drop(exec.stdout.take());
+    drop(exec.stderr.take());
+    signal(&exec, "HUP");
+
+    let status = exec.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(129),
+        "a panic on a dead stdout would exit 101"
+    );
+    wait_until("the job to be removed", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+#[test]
+fn exec_exits_three_without_a_master_and_says_what_to_run() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "exec-nomaster");
+    let config = sshd.write_config(&tmux.name);
+
+    let out = sshd.mule(&config, &["exec", "true"]);
+
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ssh -MNf"));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn the_cleanup_child_works_with_no_mule_on_path() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-path");
+    let config = sshd.write_config(&tmux.name);
+    // ssh shim plus the system dirs only. The child must come from
+    // `current_exe()`: a lookup of `mule` here finds nothing.
+    let path = std::path::PathBuf::from(format!("{}:/usr/bin:/bin", sshd.dir.display()));
+    let found = std::process::Command::new("sh")
+        .args(["-c", "command -v mule"])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        !found.status.success(),
+        "a mule on this PATH voids the test"
+    );
+
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &[("PATH", &path)]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+    signal(&exec, "TERM");
+    assert_eq!(exec.wait_with_output().unwrap().status.code(), Some(143));
+
+    wait_until("the job to be removed", Duration::from_secs(15), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+#[test]
+fn exec_keeps_stderr_clean_through_a_lock_wait_longer_than_the_notice_threshold() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-quiet");
+    let config = sshd.write_config(&tmux.name);
+
+    let lock = sshd.state_root.join("mule/live.lock");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&lock, || {
+            held_tx.send(()).unwrap();
+            // Past the 5s after which any other verb prints "waiting for lock".
+            std::thread::sleep(Duration::from_secs(6));
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+
+    let out = sshd.mule(&config, &["exec", "echo done"]);
+    holder.join().unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "the lock-wait notice is mule talking, not the command"
+    );
+}
