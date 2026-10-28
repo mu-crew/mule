@@ -375,11 +375,13 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
 fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
     // A probe that takes real time must eat into the bound: with a no-op pause
     // the only time passing is the probes' own, and the bound still ends the
-    // wait instead of running on for the number of pauses it would take.
+    // wait. Each probe costs 3x SETTLE_INTERVAL, so a bound that counted only
+    // requested pauses would need 500ms / 100ms = 5 probes (1.5s) where the
+    // wall-clock bound needs 2 (600ms).
     struct Slow(Fake);
     impl mule::transport::Transport for Slow {
         fn run_unlocked(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(300));
             self.0.run_unlocked(host, script)
         }
         fn mux_op(&self, host: &Host, op: mule::transport::MuxOp) -> anyhow::Result<Output> {
@@ -393,8 +395,8 @@ fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
     let slow = Slow(fake);
     let started = Instant::now();
 
-    // Pauses are no-ops; each probe costs 100ms. 500ms of bound means about
-    // five probes, not the fifty a pause-counting bound would need.
+    // Pauses are no-ops; each probe costs 300ms. 500ms of bound is two probes
+    // by the clock, five by a count of requested 100ms pauses.
     let _ = finish_within(
         &slow,
         &host(),
@@ -407,10 +409,11 @@ fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
 
     let waited = started.elapsed();
     assert!(
-        waited < Duration::from_millis(1500),
+        waited < Duration::from_millis(1200),
         "bound ignored probe time: {waited:?}"
     );
-    assert!(slow.0.scripts().len() < 15, "{}", slow.0.scripts().len());
+    let probes = slow.0.scripts().len();
+    assert!(probes <= 3, "bound ignored probe time: {probes} probes");
 }
 
 #[test]
