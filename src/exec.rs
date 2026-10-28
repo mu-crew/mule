@@ -38,11 +38,23 @@ use crate::wrapper::{JobId, JobMetadata, JobMode, new_id, state_dir};
 const FIRST_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Spacing of the probes that wait for a finished job's session to end.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long a job with an `rc` may keep its session before exec gives up on the
+/// rest of its output. A drain takes milliseconds; a session that outlives this
+/// is held open by a process the command left behind holding its stdout (`sleep
+/// 30 &`), and waiting longer would only be waiting for that process.
+const SESSION_END_WAIT: Duration = Duration::from_secs(5);
+
 /// How long a signal waits for an in-flight dispatch before cleaning up anyway.
 ///
 /// Dispatch is sub-second by invariant, but a holder whose ssh fell back to a
 /// direct connect can sit for a TCP timeout, and the signal path must not.
 const DISPATCH_GRACE: Duration = Duration::from_secs(3);
+
+/// How long a failure waits to learn whether a signal caused it.
+const SIGNAL_GRACE: Duration = Duration::from_millis(250);
 
 /// What to run.
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +100,9 @@ pub fn finish(
     err: &mut dyn Write,
 ) -> Result<i32> {
     let mut interval = FIRST_INTERVAL;
+    // Poll time spent waiting for a finished job's session to end, counted in
+    // requested pauses so a test's injected `pause` sees the same deadline.
+    let mut settled = Duration::ZERO;
     let code = loop {
         pause(interval);
         // State only: the output comes back once, in the final read, so a
@@ -99,7 +114,20 @@ pub fn finish(
             )
         })?;
         match result.state {
-            State::Done(code) => break code,
+            // `rc` is written by the left end of the log pipeline and the log
+            // by the right end, so `rc` can land while the last bytes -- and
+            // the `truncated` marker -- are still in flight. The session ends
+            // only when the whole pipeline has, so wait for that here, one
+            // short probe at a time, rather than inside the one locked read
+            // (a 5s wait there held the ticket and starved every other caller).
+            State::Done(code) if !result.alive || settled >= SESSION_END_WAIT => break code,
+            State::Done(_) => {
+                // A drain is milliseconds; the probe's own round trip is the
+                // real spacing, so a short fixed pause is enough.
+                interval = SETTLE_INTERVAL;
+                settled += interval;
+                continue;
+            }
             State::Orphan => return Err(MuleError::Orphan { id: id.to_string() }.into()),
             State::Missing => return Err(MuleError::MissingJob { id: id.to_string() }.into()),
             State::Running => {}
@@ -111,12 +139,14 @@ pub fn finish(
 
 /// The final read and the removal, in one round trip.
 ///
-/// Waits for the job's tmux session to be gone first: `rc` is written by the
-/// left end of the log pipeline and the log by the right end, so `rc` can land
-/// while the last bytes -- and the `truncated` marker -- are still in flight
-/// (the same race `tail::wait_loop` re-reads for). The session ends only when
-/// the whole pipeline has. The wait is bounded at 5s; past that the read goes
-/// ahead and the kills below stop whatever is left.
+/// No waiting in here: this runs under the ticket lock, so a sleep is a channel
+/// outage for every other caller (a 5s wait was measured holding it ~14s with a
+/// background child). [`finish`] has already waited for the session to end; the
+/// script only *reports* whether it still lives (`live=`), read before the log
+/// so that `live=0` proves the log was complete when it was read. A session
+/// still alive means a process the command left behind holds its stdout: the
+/// output cannot be known complete, so exec returns exit 7 rather than the
+/// job's code beside a possibly-empty log, and still removes the job.
 fn collect(
     transport: &dyn Transport,
     host: &Host,
@@ -132,14 +162,13 @@ fn collect(
     // stderr has no wrapper-side cap, so it is bounded here on the way out; a
     // command whose error stream outgrows the cap is treated as truncated too.
     let script = format!(
-        "d={dir}; i=0; \
-         while [ $i -lt 500 ] && tmux -L {socket} has-session -t mule-{id} 2>/dev/null; do \
-           sleep 0.01; i=$((i+1)); done; \
+        "d={dir}; \
+         live=0; tmux -L {socket} has-session -t mule-{id} 2>/dev/null && live=1; \
          t=0; [ -f $d/truncated ] && t=1; \
          ls=$(( $(wc -c < $d/log 2>/dev/null || echo 0) )); \
          es=$(( $(wc -c < $d/err 2>/dev/null || echo 0) )); \
          if [ $es -gt {max} ]; then es={max}; t=1; fi; \
-         printf 'trunc=%s\\nlog=%s\\nerr=%s\\nbytes:\\n' $t $ls $es; \
+         printf 'trunc=%s\\nlive=%s\\nlog=%s\\nerr=%s\\nbytes:\\n' $t $live $ls $es; \
          head -c $ls $d/log 2>/dev/null; head -c $es $d/err 2>/dev/null; \
          tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
          tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
@@ -159,16 +188,19 @@ fn collect(
         .windows(MARKER.len())
         .position(|window| window == MARKER)
         .context("invalid exec reply: missing bytes marker")?;
-    let (mut truncated, mut log_len, mut err_len) = (false, 0usize, 0usize);
+    let (mut truncated, mut live, mut log_len, mut err_len) = (false, None, 0usize, 0usize);
     for line in String::from_utf8_lossy(&output.stdout[..marker]).lines() {
         if let Some(value) = line.strip_prefix("trunc=") {
             truncated = value == "1";
+        } else if let Some(value) = line.strip_prefix("live=") {
+            live = Some(value == "1");
         } else if let Some(value) = line.strip_prefix("log=") {
             log_len = value.parse().context("invalid log size in exec reply")?;
         } else if let Some(value) = line.strip_prefix("err=") {
             err_len = value.parse().context("invalid err size in exec reply")?;
         }
     }
+    let live = live.context("invalid exec reply: missing live")?;
     let bytes = &output.stdout[marker + MARKER.len()..];
     if bytes.len() < log_len + err_len {
         bail!("exec reply is shorter than its header says");
@@ -181,15 +213,46 @@ fn collect(
     if output.stderr.contains("could not remove") {
         write!(err, "{}", output.stderr)?;
     }
+    if live {
+        writeln!(
+            err,
+            "mule: output incomplete: a process still holds the command's stdout on {}; \
+             what was printed is partial",
+            host.name
+        )?;
+    }
     if truncated {
         writeln!(
             err,
             "mule: output exceeded max_log_bytes ({max}) on {}; what was printed is partial",
             host.name
         )?;
+    }
+    if truncated || live {
         return Ok(EXIT_TRUNCATED);
     }
     Ok(code)
+}
+
+/// Block this thread until the signal thread ends the process.
+fn park() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Called when a step failed: if a stop signal is (or is about to be) pending,
+/// the failure is its fallout and the signal thread owns the exit.
+///
+/// A group hangup or Ctrl-C reaches the in-flight `ssh` as well as mule, and
+/// the ssh dies with 255 -- a probe error the main thread would turn into exit
+/// 1 and a second, wrong cleanup, racing the 129/130 the signal thread is
+/// about to give. The grace covers the gap between ssh's death being seen and
+/// mule's own handler having run; it is paid only on an already-failed path.
+fn park_if_signalled(signals: &Signals) {
+    if signals.wait(Some(SIGNAL_GRACE)).is_some() {
+        park();
+    }
 }
 
 /// `mule exec` as the binary runs it: real ssh, real signals.
@@ -227,6 +290,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     let started = start(&Ssh, host, id.clone(), request);
     dispatching.store(false, Ordering::SeqCst);
     if let Err(error) = started {
+        park_if_signalled(&signals);
         if matches!(
             error.downcast_ref::<MuleError>(),
             Some(MuleError::NoMaster { .. })
@@ -248,13 +312,14 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
                 // The signal thread is cleaning up and about to exit the
                 // process. Returning would spin probes -- locked ssh calls --
                 // for nothing in the meantime.
-                std::thread::sleep(Duration::from_secs(60));
+                park();
             }
         },
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
     );
     if result.is_err() {
+        park_if_signalled(&signals);
         // No id was ever printed, so nobody else can remove this job.
         let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id);
     }

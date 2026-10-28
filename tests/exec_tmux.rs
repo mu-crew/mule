@@ -8,8 +8,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mule::config::Host;
 use mule::exec::{Request, finish, start};
@@ -23,15 +24,21 @@ fn tmux_available() -> bool {
 /// Runs every script locally, with the job root pointed at `state`.
 struct Local {
     state: PathBuf,
+    /// The longest any one script ran. `Transport::run` holds the ticket for
+    /// exactly this long, so it is the channel outage a caller can cause.
+    longest: Mutex<Duration>,
 }
 
 impl Transport for Local {
     fn run_unlocked(&self, _: &Host, script: &str) -> anyhow::Result<Output> {
+        let started = Instant::now();
         let out = Command::new("sh")
             .args(["-c", script])
             .env("XDG_STATE_HOME", &self.state)
             .stdin(Stdio::null())
             .output()?;
+        let mut longest = self.longest.lock().unwrap();
+        *longest = (*longest).max(started.elapsed());
         Ok(Output {
             stdout: out.stdout,
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -81,6 +88,7 @@ impl Server {
             host,
             transport: Local {
                 state: root.clone(),
+                longest: Mutex::new(Duration::ZERO),
             },
             root,
         }
@@ -301,4 +309,48 @@ fn a_binary_log_survives_the_round_trip() {
     .unwrap();
 
     assert_eq!(out, b"\x00\xffa\n");
+}
+
+#[test]
+fn a_background_child_holding_stdout_is_exit_seven_and_no_locked_call_runs_long() {
+    if !tmux_available() {
+        return;
+    }
+    let server = Server::start(1 << 20);
+
+    // The reviewer's repro: rc lands at once, but `sleep 30 &` keeps the log
+    // pipeline -- and so the session -- open. This used to hold the ticket for
+    // ~14s in the collect and then return rc 0 with an empty stdout.
+    let started = Instant::now();
+    let (code, out, err) = server.exec("e20008", "sleep 30 & echo hi", None);
+
+    assert_eq!(code, 7, "stdout may be incomplete, so not the job's rc 0");
+    assert!(err.contains("output incomplete"), "{err:?}");
+    assert!(
+        out.is_empty() || out == "hi\n",
+        "a prefix of the output, never garbage: {out:?}"
+    );
+    let longest = *server.transport.longest.lock().unwrap();
+    assert!(
+        longest < Duration::from_secs(1),
+        "a locked call ran {longest:?}; the ticket is held for all of it"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+    // Removed deliberately, background child included.
+    assert!(!server.job_dir("e20008").exists());
+    assert!(!server.has_session("mule-e20008"));
+}
+
+#[test]
+fn an_ordinary_exec_holds_no_locked_call_past_a_second() {
+    if !tmux_available() {
+        return;
+    }
+    let server = Server::start(1 << 20);
+
+    let (code, out, _) = server.exec("e20009", "sleep 1; echo late", None);
+
+    assert_eq!((code, out.as_str()), (0, "late\n"));
+    let longest = *server.transport.longest.lock().unwrap();
+    assert!(longest < Duration::from_secs(1), "{longest:?}");
 }
