@@ -295,9 +295,18 @@ pub enum Target {
 /// that will not delete gets one `rm -rf` and no retry loop. The message names
 /// which check failed; the exit is 1.
 ///
-/// `has-session` rather than parsing `list-sessions`: it is the exact question
-/// ("does this session exist?") and exits non-zero when the server itself is
-/// gone, which is the normal state after the last job ends.
+/// Absence has to be *seen*, not inferred from a failed command. `has-session`
+/// exits 1 for "no such session", "no server" and also for a client/server
+/// protocol mismatch or an unsafe socket directory -- the last two leave the
+/// job running, so reading every non-zero as "gone" deleted a live job's
+/// state (reproduced with a real session). So the check is `list-sessions`:
+/// a successful list is authoritative for both names, and a failure counts as
+/// absence only when tmux says there is no server (`no server running`, or a
+/// missing or dead socket: `error connecting to ... (No such file or directory)`). Anything else exits 1.
+///
+/// The state directory gets the same treatment: `[ -d ]` is false for a
+/// directory behind an unsearchable parent, so it cannot tell "missing" from
+/// "cannot look". `ls -d` can, by its error (`LC_ALL=C` pins the text).
 pub fn remove_one_script(host: &Host, id: &JobId) -> String {
     let dir = state_dir(id);
     let socket = &host.tmux_socket;
@@ -305,16 +314,31 @@ pub fn remove_one_script(host: &Host, id: &JobId) -> String {
         "d={dir}; \
          tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
          tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
+         out=$(tmux -L {socket} list-sessions -F '#{{session_name}}' 2>&1); rc=$?; \
          alive=; \
-         for s in mule-{id} watch-{id}; do \
-           if tmux -L {socket} has-session -t \"$s\" 2>/dev/null; then alive=\"$alive $s\"; fi; \
-         done; \
+         if [ \"$rc\" -eq 0 ]; then \
+           for s in mule-{id} watch-{id}; do \
+             if printf '%s\\n' \"$out\" | grep -Fxq \"$s\"; then alive=\"$alive $s\"; fi; \
+           done; \
+         else \
+           case \"$out\" in \
+             *'no server running'*|*'error connecting to'*'No such file or directory'*) ;; \
+             *) echo \"cannot verify session state: $out (state dir kept)\" >&2; exit 1;; \
+           esac; \
+         fi; \
          if [ -n \"$alive\" ]; then \
            echo \"session still alive after kill-session:$alive (state dir kept)\" >&2; exit 1; \
          fi; \
-         if [ -d \"$d\" ]; then \
+         probe() {{ \
+           e=$(LC_ALL=C ls -d \"$d\" 2>&1) && return 0; \
+           case \"$e\" in \
+             *'No such file or directory'*) return 1;; \
+           esac; \
+           echo \"cannot verify state dir $d: $e (kept)\" >&2; exit 1; \
+         }}; \
+         if probe; then \
            rm -rf \"$d\" 2>/dev/null; \
-           if [ -e \"$d\" ]; then echo \"state dir $d could not be removed (kept)\" >&2; exit 1; fi; \
+           if probe; then echo \"state dir $d could not be removed (kept)\" >&2; exit 1; fi; \
            echo {id}; \
          fi; exit 0"
     )

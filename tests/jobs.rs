@@ -379,18 +379,56 @@ fn rm_one_script_kills_both_sessions_then_verifies_before_claiming_success() {
 
     // Exit 0 is a proof, so the script must ask tmux again rather than trust
     // `kill-session`'s status, and must look at the directory after `rm -rf`.
-    let verify = script.find("has-session").expect("must verify sessions");
+    let verify = script.find("list-sessions").expect("must verify sessions");
     let last_kill = script.rfind("kill-session -t").unwrap();
     assert!(verify > last_kill, "verify after killing: {script}");
-    assert!(script.contains("-t \"$s\""), "{script}");
+    assert!(script.contains("grep -Fxq \"$s\""), "{script}");
     assert!(script.contains("mule-abc123 watch-abc123"), "{script}");
     let rm = script.find("rm -rf").expect("must remove the dir");
-    let check = script.find("[ -e \"$d\" ]").expect("must re-check the dir");
+    let check = script.rfind("if probe;").expect("must re-check the dir");
     assert!(check > rm, "check the dir after removing it: {script}");
 
     // The old script ended in an unconditional `exit 0` that masked both.
     assert!(!script.contains("rm -rf $d && echo"), "{script}");
     assert!(script.contains("exit 1"), "{script}");
+}
+
+#[test]
+fn rm_one_script_exits_one_when_tmux_cannot_be_queried() {
+    let script = remove_one_script(&host(), &job_id());
+
+    // `has-session` exits 1 for a protocol mismatch as it does for "no such
+    // session", so it cannot certify a stop. A failed list is absence only
+    // when tmux says there is no server; every other failure is unverifiable.
+    assert!(!script.contains("has-session"), "{script}");
+    assert!(script.contains("2>&1"), "stderr is the evidence: {script}");
+    assert!(script.contains("'no server running'"), "{script}");
+    let unknown = script
+        .find("cannot verify session state: $out")
+        .expect("unverifiable tmux must be reported");
+    let absent = script.find("'no server running'").unwrap();
+    assert!(absent < unknown, "known absence is matched first: {script}");
+    assert!(script[unknown..].contains("exit 1"), "{script}");
+}
+
+#[test]
+fn rm_one_script_exits_one_when_the_state_dir_cannot_be_looked_up() {
+    let script = remove_one_script(&host(), &job_id());
+
+    // `[ -d ]` is false for a directory behind an unsearchable parent, so it
+    // would read "cannot look" as "missing". Only a "No such file" error is
+    // absence.
+    assert!(!script.contains("[ -d \"$d\" ]"), "{script}");
+    assert!(!script.contains("[ -e \"$d\" ]"), "{script}");
+    assert!(script.contains("ls -d \"$d\""), "{script}");
+    assert!(
+        script.contains("*'No such file or directory'*) return 1"),
+        "{script}"
+    );
+    let unverifiable = script
+        .find("cannot verify state dir $d")
+        .expect("unverifiable path must be reported");
+    assert!(script[unverifiable..].contains("exit 1"), "{script}");
 }
 
 #[test]
