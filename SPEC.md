@@ -52,13 +52,39 @@ An **18MB** transfer that held this channel for **30s** would recreate the origi
 
 ## Contention and fairness
 
-Only mule callers share mule's connection. Every SSH call takes the per-host ticket lock except `ssh -O check`, which measured **0s** and opens no session channel. This includes `run`, `poll`, `wait`, `tail`, `ls`, `kill`, and `rm`; two simultaneous polls can hit the same cap as two dispatches.
+Only mule callers share mule's connection. Every SSH call takes the per-host ticket lock except the mux ops `-O check`, `-O forward` and `-O cancel` for **local unix** forwards. Each is handled in the master's mux loop and opens no session channel: `check` measured **0s**, and forward and cancel succeeded during a held session. `-R` is excluded, because a remote forward needs a server round trip. This includes `run`, `poll`, `wait`, `tail`, `ls`, `kill`, and `rm`; two simultaneous polls can hit the same cap as two dispatches.
 
 **The lock is applied by the transport, not by callers.** `Transport::run` takes it and is a provided method; an implementation supplies only `run_unlocked`. That distinction is the enforcement: the rule above was previously prose, honoured by six call sites each remembering to wrap the transport, and a seventh that forgot would have compiled, passed every test, and quietly reintroduced the contention mule exists to remove. Now forgetting is not expressible, and a test asserts it by observation -- four concurrent callers must never overlap inside the unlocked primitive.
+
+The exemption is structural too. `Transport::mux_op(host, MuxOp)` is the one lock-free path, and `MuxOp` is a closed enum (`Check`, `ForwardUnix(L, R)`, `CancelUnix(L, R)`) with no free-form arguments and no `-R`. Widening the exemption means editing the enum in review. A test asserts by observation that mux ops run while a `run` holds the ticket, and that four concurrent `run` callers still never overlap.
 
 The lock lives at `~/.local/state/mule/<host>.lock`. A ticket lock gives bounded, first-come-first-served progress. A retrying mutex did not: four callers produced a worst wait of **4.14s** for **0.25s** of work. The lock records each waiter's PID and the holder PID, then skips either when that process is gone. After about **5s**, a waiter reports its ticket position and the holder PID but keeps waiting.
 
 The lock poll interval is **5ms**. With four callers, five rounds each, and **50ms** of work per round, the workload has **1s** of serialized work and an ideal peak wait near **200ms**. A **20ms** poll interval had a roughly **275ms** median and **443ms** worst wait, and exceeded a **600ms** bound once in 15 runs. A **5ms** interval had a roughly **237ms** median and **261ms** worst wait across six runs.
+
+## Leases
+
+A lease is a per-job foreground waiter, like `run --wait`. It holds a forward listener, which is not a session. It re-arms forwards after drift. It never re-dispatches, retries, queues or places a job, and every ssh call it makes is sub-second. The carve-out from [Add a local scheduler or supervisor](#add-a-local-scheduler-or-supervisor) covers idempotent forward repair only.
+
+### Forwards
+
+`mule forward --unix LOCAL:REMOTE` and `mule unforward` carry control-sized unix sockets over mule's master. OpenSSH's answers cannot be trusted, so each was measured on a loopback `MaxSessions 1` sshd (OpenSSH_10.3p1):
+
+| Action | Result |
+| --- | --- |
+| `-O cancel` of a forward that is gone | prints `port not found`, exits **0** |
+| `-O cancel` of a live forward | closes the listener and **leaves the file** |
+| `rm LOCAL`, then `-O forward` | exits **0**, binds nothing: the master still lists the forward |
+| client-side `-o StreamLocalBindUnlink=yes` on `-O forward` | ignored; the master's own setting governs, so `master_command` sets it |
+| `-O forward` while the only session is held | succeeds, as do `-O cancel` and three concurrent forwarded connections |
+| `-O forward` of a REMOTE that does not exist yet | succeeds, and `connect(LOCAL)` succeeds; REMOTE is resolved per connection |
+| **Wedge:** `L:R`, then `L:R2`, then cancel one | both listeners close, the table still lists one; later `cancel` says `port not found` and `forward` exits 0 and binds nothing. Only a master restart recovers |
+
+So an exit code proves nothing, file existence proves nothing, `connect(LOCAL)` succeeding proves a live listener, and one LOCAL must never go to two REMOTEs. `forward` does, for each spec: cancel a recorded different-REMOTE spec on the same master pid; cancel; unlink LOCAL if it is a socket (exit 1 if it is anything else); `-O forward`; **verify** by `connect(LOCAL)`; write the record.
+
+The record, `~/.local/state/mule/forwards/<host>/<hash of LOCAL>`, holds LOCAL, REMOTE, the master pid from `-O check` and LOCAL's dev+inode after binding. It is what makes the wedge avoidable, since OpenSSH has no `-O list`. It is forward state for the master mule owns, not a job index.
+
+A failed verify after the sequence means the table is wedged. That exits **3**, the hand-back code, naming `ssh -O exit` and the master command: it needs the same human act as a missing master. Any other failure cancels what this call added and exits 1. `unforward` cancels, unlinks and deletes the record, and is idempotent.
 
 ## Job identity and remote state
 
@@ -395,6 +421,8 @@ Duplicate tmux session names can report success from an outer wrapper even when 
 
 A local index would duplicate remote identity and become stale after disconnects or use from another client. The remote directory remains the sole record; removing a host from config makes its jobs unreachable until the host is configured again.
 
+A forward record is not a job index. It exists only because OpenSSH cannot list a master's forwards, and it names no job.
+
 ### Store jobs in `/tmp`
 
 `/tmp` is shared and cleared unpredictably. It is also where the stale-`rc` failure was reproduced. A user-owned state directory gives cleanup and listing one stable root.
@@ -411,9 +439,11 @@ A **200MB** transfer would monopolize the channel. The **64KB** default bounds t
 
 A bulk transfer violates the rule that every use of the private channel is short. Other tools can open their own master on another `ControlPath`; two masters were measured carrying traffic concurrently.
 
+Unix control-socket forwards (`mule forward`) are the one exemption, because they carry control-sized traffic over a channel that is not a session. TCP and bulk forwards stay rejected: they would share the connection's channel windows with every probe.
+
 ### Add a local scheduler or supervisor
 
-Detached tmux and durable artifacts provide survival and completion without a daemon. Reconnect logic, retries, and placement policy would turn a dispatcher into an orchestrator.
+Detached tmux and durable artifacts provide survival and completion without a daemon. Reconnect logic, retries, and placement policy would turn a dispatcher into an orchestrator. The one carve-out is idempotent forward repair (see [Leases](#leases)).
 
 ## Deferred choices
 

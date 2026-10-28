@@ -268,8 +268,12 @@ impl Transport for HostsFake {
         )))
     }
 
-    fn master_alive(&self, host: &Host) -> bool {
-        host.name != "down"
+    fn mux_op(&self, host: &Host, _op: mule::transport::MuxOp) -> anyhow::Result<Output> {
+        Ok(if host.name == "down" {
+            Output::fail(255, "no master")
+        } else {
+            Output::ok("")
+        })
     }
 }
 

@@ -305,6 +305,33 @@ pub enum Commands {
         #[command(flatten)]
         host: HostArg,
     },
+    /// Forward a local unix socket to a remote one over mule's master
+    ///
+    /// For control-sized traffic only (a ctl socket, RPC). A forward is a
+    /// channel on mule's connection, not a session, so it never takes the
+    /// one MaxSessions slot. Unix sockets only: TCP and bulk forwards would
+    /// share the connection with every poll, which mule rejects.
+    ///
+    /// Verified by connect(LOCAL), not by ssh's exit code, which proves
+    /// nothing. Exit 3 means the master's forward table is wedged and a human
+    /// must restart the master; stop and ask, do not retry.
+    Forward {
+        #[command(flatten)]
+        host: HostArg,
+        /// LOCAL:REMOTE socket paths; repeatable. Neither path may contain ':'
+        #[arg(long = "unix", value_name = "LOCAL:REMOTE", required = true)]
+        unix: Vec<String>,
+    },
+    /// Undo `mule forward`: cancel, unlink LOCAL, forget the record
+    ///
+    /// Idempotent, and works with no master.
+    Unforward {
+        #[command(flatten)]
+        host: HostArg,
+        /// LOCAL:REMOTE socket paths; repeatable
+        #[arg(long = "unix", value_name = "LOCAL:REMOTE", required = true)]
+        unix: Vec<String>,
+    },
     /// Inspect configured hosts
     #[command(subcommand)]
     Host(HostCmd),
@@ -806,6 +833,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 }
                 Err(error) => Err(error),
             }
+        }
+        Commands::Forward { host, unix } => {
+            let host = cfg.host(host.host.as_deref())?;
+            let specs = crate::forward::Spec::parse_all(&unix)?;
+            crate::forward::forward(&Ssh, host, &specs)?;
+            Ok(0)
+        }
+        Commands::Unforward { host, unix } => {
+            let host = cfg.host(host.host.as_deref())?;
+            let specs = crate::forward::Spec::parse_all(&unix)?;
+            crate::forward::unforward(&Ssh, host, &specs);
+            Ok(0)
         }
         Commands::Host(HostCmd::List { json }) => {
             host_list(&cfg, &Ssh, json)?;

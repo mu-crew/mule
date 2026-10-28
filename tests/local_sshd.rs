@@ -1504,3 +1504,252 @@ fn rm_id_that_cannot_remove_the_state_dir_exits_one_and_keeps_the_evidence() {
     assert!(out.stdout.is_empty(), "no id reported as removed");
     clean_jobs(&sshd, &[id]);
 }
+
+// -- mule forward / unforward -------------------------------------------------
+
+/// What mule's printed master command sets (errors::master_command).
+const MASTER_OPTS: [&str; 2] = ["-o", "StreamLocalBindUnlink=yes"];
+
+/// A unix-socket server that answers every connection with `reply`, standing in
+/// for the socket a remote job serves. On loopback "remote" is this machine, so
+/// REMOTE is a local path and the sshd's channel connects to it.
+struct Serve {
+    path: PathBuf,
+}
+
+impl Serve {
+    fn start(path: PathBuf, reply: &'static str) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                use std::io::Write;
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        Self { path }
+    }
+}
+
+impl Drop for Serve {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Connect to `local` and read until EOF. Retries briefly: the forward is bound
+/// before `mule forward` returns, but the remote hop races the first read.
+fn through(local: &std::path::Path) -> String {
+    use std::io::Read;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(local) {
+            let mut text = String::new();
+            let _ = stream.read_to_string(&mut text);
+            if !text.is_empty() || Instant::now() > deadline {
+                return text;
+            }
+        } else if Instant::now() > deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn unix_spec(local: &std::path::Path, remote: &std::path::Path) -> String {
+    format!("{}:{}", local.display(), remote.display())
+}
+
+fn holding_the_only_session(sshd: &Sshd, secs: &str) -> std::process::Child {
+    let holder = std::process::Command::new(sshd.dir.join("ssh"))
+        .arg("-S")
+        .arg(&sshd.socket)
+        .args(["-o", "BatchMode=yes", "127.0.0.1", "sleep", secs])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    holder
+}
+
+#[test]
+fn a_forward_carries_traffic_while_the_only_session_is_held() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "fwdheld");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "hello");
+
+    let mut holder = holding_the_only_session(&sshd, "8");
+    let started = Instant::now();
+    let out = sshd.mule(&config, &["forward", "--unix", &unix_spec(&local, &remote)]);
+    assert!(
+        out.status.success(),
+        "forward during a held session: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a forward is not a session and must not queue behind one"
+    );
+    assert_eq!(through(&local), "hello");
+    // Three concurrent forwarded connections also succeed (measured).
+    let all: Vec<_> = (0..3)
+        .map(|_| {
+            let local = local.clone();
+            std::thread::spawn(move || through(&local))
+        })
+        .collect();
+    for connection in all {
+        assert_eq!(connection.join().unwrap(), "hello");
+    }
+
+    let out = sshd.mule(
+        &config,
+        &["unforward", "--unix", &unix_spec(&local, &remote)],
+    );
+    assert!(out.status.success());
+    assert!(!local.exists(), "unforward removes LOCAL");
+    let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+#[test]
+fn removing_local_then_forwarding_again_rebinds() {
+    // Measured: after `rm L`, a bare `-O forward` exits 0 and binds nothing,
+    // because the master still lists the forward. mule cancels first.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "fwdrm");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "again");
+    let spec = unix_spec(&local, &remote);
+
+    assert!(
+        sshd.mule(&config, &["forward", "--unix", &spec])
+            .status
+            .success()
+    );
+    std::fs::remove_file(&local).unwrap();
+    let out = sshd.mule(&config, &["forward", "--unix", &spec]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(through(&local), "again");
+}
+
+#[test]
+fn a_hand_opened_master_without_bind_unlink_still_forwards_over_a_stale_file() {
+    // Step 3 (unlink) is what makes the master command's option a convenience
+    // rather than a requirement.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "fwdstale");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "ok");
+    drop(std::os::unix::net::UnixListener::bind(&local).unwrap());
+
+    let out = sshd.mule(&config, &["forward", "--unix", &unix_spec(&local, &remote)]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(through(&local), "ok");
+}
+
+#[test]
+fn changing_remote_for_one_local_is_avoided_through_the_record() {
+    // The wedge: L:R, then L:R2, then cancel one. A naive cancel -> unlink ->
+    // forward reproduces it. The record makes mule cancel the OLD spec first.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "fwdwedge");
+    let config = sshd.write_config(&tmux.name);
+    let local = sshd.dir.join("l.sock");
+    let (r1, r2) = (sshd.dir.join("r1.sock"), sshd.dir.join("r2.sock"));
+    let _s1 = Serve::start(r1.clone(), "one");
+    let _s2 = Serve::start(r2.clone(), "two");
+
+    let forward = |remote: &std::path::Path| {
+        sshd.mule(&config, &["forward", "--unix", &unix_spec(&local, remote)])
+    };
+    assert!(forward(&r1).status.success());
+    assert_eq!(through(&local), "one");
+    assert!(forward(&r2).status.success());
+    assert_eq!(through(&local), "two");
+    let out = sshd.mule(&config, &["unforward", "--unix", &unix_spec(&local, &r2)]);
+    assert!(out.status.success());
+    // The step that was unrecoverable without the record.
+    let out = forward(&r1);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(through(&local), "one");
+}
+
+#[test]
+fn a_forced_wedge_is_detected_as_exit_three() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "fwdforced");
+    let config = sshd.write_config(&tmux.name);
+    let local = sshd.dir.join("l.sock");
+    let (r1, r2) = (sshd.dir.join("r1.sock"), sshd.dir.join("r2.sock"));
+    let _s1 = Serve::start(r1.clone(), "one");
+
+    // By hand, behind mule's back, so there is no record to avoid it.
+    let by_hand = |op: &str, remote: &std::path::Path| {
+        sshd.ssh_via(&sshd.socket, &["-O", op, "-L", &unix_spec(&local, remote)])
+    };
+    assert!(by_hand("forward", &r1).status.success());
+    let _ = by_hand("forward", &r2);
+    // Cancelling the LATER spec is what wedges (measured: cancelling the
+    // earlier one leaves a working table). Both listeners close, and the table
+    // keeps listing one.
+    let _ = by_hand("cancel", &r2);
+    let _ = std::fs::remove_file(&local);
+
+    let out = sshd.mule(&config, &["forward", "--unix", &unix_spec(&local, &r1)]);
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a table that lists a forward nothing listens on is a hand-back: {text}"
+    );
+    assert!(text.contains("wedged"), "{text}");
+    assert!(text.contains("-O exit"), "{text}");
+    assert!(text.contains("ssh -MNf"), "{text}");
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn forward_exits_three_without_a_master_and_unforward_does_not_need_one() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "fwdnomaster");
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let spec = unix_spec(&local, &remote);
+
+    let out = sshd.mule(&config, &["forward", "--unix", &spec]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ssh -MNf"));
+
+    let out = sshd.mule(&config, &["unforward", "--unix", &spec]);
+    assert_eq!(out.status.code(), Some(0), "idempotent, master or not");
+}

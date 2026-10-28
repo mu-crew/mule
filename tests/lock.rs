@@ -252,8 +252,12 @@ fn the_transport_locks_without_the_caller_asking() {
             self.inside.fetch_sub(1, Ordering::SeqCst);
             Ok(Output::ok(""))
         }
-        fn master_alive(&self, _host: &mule::config::Host) -> bool {
-            true
+        fn mux_op(
+            &self,
+            _host: &mule::config::Host,
+            _op: mule::transport::MuxOp,
+        ) -> anyhow::Result<Output> {
+            Ok(Output::ok(""))
         }
     }
 
@@ -289,4 +293,86 @@ fn the_transport_locks_without_the_caller_asking() {
 
     let dir = mule::lock::lock_path(&host.name);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn mux_ops_never_take_the_lock_while_run_callers_still_never_overlap() {
+    isolate_state();
+    let _lane = timing_lane();
+    // The other half of the observation above: `mux_op` is the lone lock-free
+    // path, so it must get through while a `run` holds the ticket. If it
+    // queued, a lease's drift check would wait behind every probe.
+    use mule::transport::{MuxOp, Output, Transport};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Probe {
+        inside: AtomicUsize,
+        peak: AtomicUsize,
+        mux_during_run: AtomicUsize,
+    }
+    impl Transport for Probe {
+        fn run_unlocked(
+            &self,
+            _host: &mule::config::Host,
+            _script: &str,
+        ) -> anyhow::Result<Output> {
+            let n = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(40));
+            self.inside.fetch_sub(1, Ordering::SeqCst);
+            Ok(Output::ok(""))
+        }
+        fn mux_op(&self, _host: &mule::config::Host, _op: MuxOp) -> anyhow::Result<Output> {
+            if self.inside.load(Ordering::SeqCst) > 0 {
+                self.mux_during_run.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Output::ok(""))
+        }
+    }
+
+    let cfg = mule::config::Config::parse(&format!(
+        "[hosts.locktest-mux-{}]\ntarget = \"h\"\n",
+        std::process::id()
+    ))
+    .unwrap();
+    let host = cfg.host(None).unwrap();
+    let transport = Arc::new(Probe {
+        inside: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        mux_during_run: AtomicUsize::new(0),
+    });
+
+    let mut handles = vec![];
+    for _ in 0..4 {
+        let (t, h) = (Arc::clone(&transport), host.clone());
+        handles.push(std::thread::spawn(move || {
+            t.run(&h, "echo hi").unwrap();
+        }));
+    }
+    // Poll the ops while the four runs queue and execute: 160ms of work.
+    let started = Instant::now();
+    let mut ops = 0;
+    while started.elapsed() < Duration::from_millis(120) {
+        transport.mux_op(host, MuxOp::Check).unwrap();
+        transport
+            .mux_op(host, MuxOp::CancelUnix("/l".into(), "/r".into()))
+            .unwrap();
+        ops += 2;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert_eq!(transport.peak.load(Ordering::SeqCst), 1, "runs overlapped");
+    assert!(
+        transport.mux_during_run.load(Ordering::SeqCst) > 0,
+        "{ops} mux ops ran and none overlapped a run: they are queueing"
+    );
+    assert!(
+        transport.master_alive(host),
+        "master_alive is Check through mux_op, so it is lock-free too"
+    );
+
+    std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
 }

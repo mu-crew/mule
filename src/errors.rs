@@ -11,7 +11,7 @@ pub const EXIT_DROPPED: i32 = 6;
 pub enum MuleError {
     #[error(
         "no control master for {host}\n  \
-         run: ssh -MNf -S {socket} -o ControlPersist=8h {target}\n  \
+         run: ssh -MNf -S {socket} -o ControlPersist=8h -o StreamLocalBindUnlink=yes {target}\n  \
          a human may need to tap a hardware key; ask rather than retrying"
     )]
     NoMaster {
@@ -35,6 +35,23 @@ pub enum MuleError {
         "keyboard-interactive authentication failed; this is either a local ssh-agent problem or a busy control-master channel\n  run ssh-add -l, then ssh -O check with mule's configured ControlPath"
     )]
     KeyboardInteractiveAmbiguous,
+    /// A `-O forward` exited 0 and left nothing listening: the master's forward
+    /// table disagrees with reality, and only a master restart recovers (SPEC §
+    /// Leases). Exit 3 because it needs the same human act as a missing master,
+    /// and a caller must treat it the same way: stop and ask.
+    #[error(
+        "forward table for {host} is wedged ({local} is not listening after a forward); \
+         a human must restart the master\n  \
+         run: {exit}\n  \
+         then: {open}\n  \
+         a human may need to tap a hardware key; ask rather than retrying"
+    )]
+    ForwardWedged {
+        host: String,
+        local: String,
+        exit: String,
+        open: String,
+    },
     #[error("timed out waiting for job {id}; it is still running")]
     Timeout { id: String },
     #[error("job {id} is orphaned; no rc will ever arrive")]
@@ -74,7 +91,7 @@ pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Optio
 
 pub fn exit_code(error: &AnyhowError) -> i32 {
     match error.downcast_ref::<MuleError>() {
-        Some(MuleError::NoMaster { .. }) => EXIT_NO_MASTER,
+        Some(MuleError::NoMaster { .. } | MuleError::ForwardWedged { .. }) => EXIT_NO_MASTER,
         Some(MuleError::Timeout { .. }) => EXIT_TIMEOUT,
         Some(MuleError::Orphan { .. }) => EXIT_ORPHAN,
         Some(MuleError::Dropped { .. }) => EXIT_DROPPED,
@@ -147,15 +164,26 @@ pub fn no_master(host: &crate::config::Host) -> AnyhowError {
 /// drift between them. Preparing the socket directory is part of producing the
 /// command: printing one that cannot work is worse than printing nothing, and
 /// the failure arrives only after a 2FA prompt.
+///
+/// `StreamLocalBindUnlink=yes` is set on the master because the master's own
+/// setting governs forwards, and the client-side option is ignored (measured):
+/// over a stale socket file a master without it fails `-O forward` with 255,
+/// and one with it rebinds.
 pub fn master_command(host: &crate::config::Host) -> String {
     if let Some(parent) = host.socket.parent() {
         let _ = create_private_dir(parent);
     }
     format!(
-        "run: ssh -MNf -S {} -o ControlPersist=8h {}",
+        "run: ssh -MNf -S {} -o ControlPersist=8h -o StreamLocalBindUnlink=yes {}",
         host.socket.display(),
         host.target
     )
+}
+
+/// The `ssh -O exit` line that stops this host's master, for the wedge
+/// hand-back: a wedged forward table survives everything but a restart.
+pub fn master_exit_command(host: &crate::config::Host) -> String {
+    format!("ssh -S {} -O exit {}", host.socket.display(), host.target)
 }
 
 fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {

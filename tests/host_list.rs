@@ -74,9 +74,13 @@ fn every_configured_host_is_probed() {
         ) -> anyhow::Result<mule::transport::Output> {
             panic!("host list must not run scripts");
         }
-        fn master_alive(&self, _h: &mule::config::Host) -> bool {
+        fn mux_op(
+            &self,
+            _h: &mule::config::Host,
+            _op: mule::transport::MuxOp,
+        ) -> anyhow::Result<mule::transport::Output> {
             self.0.set(self.0.get() + 1);
-            true
+            Ok(mule::transport::Output::ok(""))
         }
     }
 

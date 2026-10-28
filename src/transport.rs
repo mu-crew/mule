@@ -6,11 +6,19 @@
 //! wrapper construction and state mapping are tested as pure functions.
 //!
 //! One rule shapes the whole file: **`run` takes mule's ticket lock, and
-//! `master_alive` does not.** `ssh -O check` talks only to the mux socket, opens
-//! no session channel, and measured at 0s — so exempting it is safe, and having
-//! it be a *different method* makes the exemption structural instead of a rule
-//! someone has to remember.
+//! `mux_op` does not.** `ssh -O check`, and `-O forward`/`-O cancel` of a local
+//! unix forward, talk only to the mux socket and are handled in the master's
+//! own loop. None opens a session channel -- measured during a held session,
+//! and `check` at 0s -- so exempting them is safe, and having them be a
+//! *different method* makes the exemption structural instead of a rule someone
+//! has to remember.
+//!
+//! The exemption is exactly as wide as [`MuxOp`], a closed enum. It has no
+//! free-form arguments and no remote (`-R`) forward, because a remote forward
+//! needs a server round trip and so belongs inside the lock. Widening the
+//! exemption means editing the enum, in review, not passing a different string.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -59,6 +67,23 @@ impl Output {
     }
 }
 
+/// The mux operations that bypass the ticket lock.
+///
+/// Closed on purpose: see the module header. Each is answered by the master
+/// itself without opening a session channel, so it cannot contend with a job
+/// verb for the `MaxSessions` slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuxOp {
+    /// `-O check`: is there a master, and which pid owns it.
+    Check,
+    /// `-O forward -L LOCAL:REMOTE` for unix sockets. LOCAL is bound by the
+    /// master, so it must be absolute: a relative path would resolve against
+    /// the master's working directory, not the caller's.
+    ForwardUnix(PathBuf, String),
+    /// `-O cancel -L LOCAL:REMOTE`.
+    CancelUnix(PathBuf, String),
+}
+
 pub trait Transport {
     /// Run a shell script on the host, WITHOUT taking the ticket lock.
     ///
@@ -69,15 +94,25 @@ pub trait Transport {
     /// host recreates the contention the whole tool exists to remove.
     fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output>;
 
-    /// Is there a usable multiplexing socket? `ssh -O check` only — it takes no
-    /// session channel, so this probe never competes with anything, and it is
-    /// the one call deliberately exempt from the lock.
-    fn master_alive(&self, host: &Host) -> bool;
+    /// Run one mux operation over the master, WITHOUT the ticket lock.
+    ///
+    /// This is the only lock-free path to the host, and [`MuxOp`] is what keeps
+    /// it honest: every variant is handled in the master's mux loop and opens
+    /// no session channel (measured during a held session). The exit code of a
+    /// forward or cancel proves nothing -- callers verify by effect.
+    fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output>;
+
+    /// Is there a usable multiplexing socket? `-O check` only, so this probe
+    /// never competes with anything.
+    fn master_alive(&self, host: &Host) -> bool {
+        self.mux_op(host, MuxOp::Check)
+            .is_ok_and(|output| output.code == 0)
+    }
 
     /// Run a shell script on the host, holding the host's ticket lock.
     ///
     /// **This is the only way callers should reach a host.** The lock covers
-    /// every ssh mule issues except `master_alive`, because two concurrent
+    /// every ssh mule issues except the [`MuxOp`]s, because two concurrent
     /// reads hit exactly the cap that motivated the tool -- but until now that
     /// was prose, enforced by six call sites each remembering to wrap
     /// `run_unlocked` in `with_lock`. A seventh that forgot would compile,
@@ -125,12 +160,35 @@ fn base_args(host: &Host) -> Vec<String> {
     ]
 }
 
-/// Arguments for the lock-exempt master probe. Exposed for tests, which assert
-/// that no mule invocation can prompt.
-pub fn probe_args(host: &Host) -> Vec<String> {
+/// Arguments for a lock-exempt mux op. Exposed for tests, which assert that no
+/// mule invocation can prompt and that paths reach ssh as argv.
+///
+/// Paths are single argv elements: `-O` runs no remote shell, so nothing here
+/// is ever re-parsed. (`:` in a path is rejected earlier, where the spec is
+/// parsed, because ssh itself splits `-L` on it.)
+pub fn mux_args(host: &Host, op: &MuxOp) -> Vec<String> {
     let mut args = base_args(host);
-    args.extend(["-O".into(), "check".into()]);
+    match op {
+        MuxOp::Check => args.extend(["-O".into(), "check".into()]),
+        MuxOp::ForwardUnix(local, remote) => args.extend([
+            "-O".into(),
+            "forward".into(),
+            "-L".into(),
+            format!("{}:{remote}", local.display()),
+        ]),
+        MuxOp::CancelUnix(local, remote) => args.extend([
+            "-O".into(),
+            "cancel".into(),
+            "-L".into(),
+            format!("{}:{remote}", local.display()),
+        ]),
+    }
     args
+}
+
+/// Arguments for the lock-exempt master probe.
+pub fn probe_args(host: &Host) -> Vec<String> {
+    mux_args(host, &MuxOp::Check)
 }
 
 /// Arguments for running a script over the master.
@@ -176,12 +234,20 @@ impl Transport for Ssh {
         })
     }
 
-    fn master_alive(&self, host: &Host) -> bool {
-        base_command(host)
-            .args(["-O", "check"])
+    fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output> {
+        let mut cmd = Command::new("ssh");
+        cmd.args(mux_args(host, &op));
+        let out = cmd
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .with_context(|| format!("spawning ssh for host {}", host.name))?;
+        Ok(Output {
+            stdout: out.stdout,
+            // Not classified: a mux op opens no session, so the refused-channel
+            // messages `classify` hunts for cannot come from it. ssh prints
+            // `-O check`'s `Master running (pid=N)` here, and callers read it.
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            code: out.status.code().unwrap_or(-1),
+        })
     }
 }
 
@@ -190,11 +256,42 @@ impl Transport for Ssh {
 /// Deliberately **not** `#[cfg(test)]`: integration tests live in their own
 /// crate and could not see it otherwise, and layer 1 is where most of mule's
 /// logic is actually verified.
-#[derive(Debug, Default)]
 pub struct Fake {
     scripts: std::sync::Mutex<Vec<String>>,
     outputs: std::sync::Mutex<std::collections::VecDeque<Output>>,
+    mux_ops: std::sync::Mutex<Vec<MuxOp>>,
+    mux_outputs: std::sync::Mutex<std::collections::VecDeque<Output>>,
+    mux_hook: std::sync::Mutex<Option<MuxHook>>,
     master: bool,
+    master_pid: u32,
+}
+
+/// Runs on every `mux_op`, so a test can play the master: bind the LOCAL a
+/// forward names, or refuse to.
+type MuxHook = Box<dyn Fn(&MuxOp) + Send + Sync>;
+
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fake")
+            .field("scripts", &self.scripts)
+            .field("mux_ops", &self.mux_ops)
+            .field("master", &self.master)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Fake {
+    fn default() -> Self {
+        Self {
+            scripts: Default::default(),
+            outputs: Default::default(),
+            mux_ops: Default::default(),
+            mux_outputs: Default::default(),
+            mux_hook: Default::default(),
+            master: false,
+            master_pid: 4242,
+        }
+    }
 }
 
 impl Fake {
@@ -218,10 +315,35 @@ impl Fake {
         self
     }
 
+    /// Queue one reply for a non-`Check` mux op. Consumed in order; once the
+    /// queue is empty every op succeeds.
+    pub fn push_mux(&self, out: Output) -> &Self {
+        self.mux_outputs.lock().unwrap().push_back(out);
+        self
+    }
+
+    /// Install the master's side effects for forward/cancel.
+    pub fn on_mux(&self, hook: impl Fn(&MuxOp) + Send + Sync + 'static) -> &Self {
+        *self.mux_hook.lock().unwrap() = Some(Box::new(hook));
+        self
+    }
+
+    /// The pid `-O check` reports.
+    pub fn with_master_pid(mut self, pid: u32) -> Self {
+        self.master_pid = pid;
+        self
+    }
+
     /// Every script handed to `run`, in order. This is the assertion surface
     /// for wrapper construction.
     pub fn scripts(&self) -> Vec<String> {
         self.scripts.lock().unwrap().clone()
+    }
+
+    /// Every mux op, in order, `Check` included. The assertion surface for
+    /// forward sequencing.
+    pub fn mux_ops(&self) -> Vec<MuxOp> {
+        self.mux_ops.lock().unwrap().clone()
     }
 }
 
@@ -236,7 +358,27 @@ impl Transport for Fake {
             .unwrap_or_else(|| Output::ok("")))
     }
 
-    fn master_alive(&self, _host: &Host) -> bool {
-        self.master
+    fn mux_op(&self, _host: &Host, op: MuxOp) -> Result<Output> {
+        self.mux_ops.lock().unwrap().push(op.clone());
+        if op == MuxOp::Check {
+            return Ok(if self.master {
+                Output {
+                    stdout: Vec::new(),
+                    stderr: format!("Master running (pid={})\r\n", self.master_pid),
+                    code: 0,
+                }
+            } else {
+                Output::fail(255, "Control socket connect: No such file or directory")
+            });
+        }
+        if let Some(hook) = self.mux_hook.lock().unwrap().as_ref() {
+            hook(&op);
+        }
+        Ok(self
+            .mux_outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Output::ok("")))
     }
 }

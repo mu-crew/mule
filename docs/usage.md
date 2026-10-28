@@ -119,6 +119,34 @@ running jobs and orphans alone. Prefer `mule kill` when you want the exit code
 recorded as **137** without dropping state; use `kill --rm` to end and discard
 in one trip.
 
+## Forwarding a unix socket
+
+```sh
+mule forward   [--host H] --unix LOCAL:REMOTE ...
+mule unforward [--host H] --unix LOCAL:REMOTE ...
+```
+
+For control-sized traffic only: a ctl socket, an RPC endpoint. A forward is a
+channel on mule's connection, not a session, so it works while a job verb holds
+the one `MaxSessions` slot and takes no ticket lock. There is no TCP: a
+dev-server or bulk forward would share the connection with every poll.
+
+`forward` checks that LOCAL is listening with `connect()`, not by ssh's exit
+code, which proves nothing. REMOTE need not exist yet; it is resolved per
+connection. It replaces a stale LOCAL socket, but refuses (exit 1) a LOCAL that
+is any other kind of file. Paths are passed to ssh as arguments, never through a
+shell, and neither may contain `:`.
+
+Forwarding one LOCAL to a second REMOTE is safe through `mule forward`, which
+remembers what it forwarded (`~/.local/state/mule/forwards/`). Doing it by hand
+with `ssh -O forward` can wedge the master's forward table, and **exit 3** from
+`forward` means exactly that: stop, and ask a human to run the printed
+`ssh -O exit` and `ssh -MNf` commands. The master command now includes
+`-o StreamLocalBindUnlink=yes`, so a reopened master rebinds over a stale file.
+
+`unforward` cancels, removes LOCAL and forgets the record. It is idempotent and
+needs no master.
+
 ## Hosts
 
 Every job verb accepts `--host`; with one configured host you can omit it.
