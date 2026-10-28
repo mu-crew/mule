@@ -147,6 +147,9 @@ with `ssh -O forward` can wedge the master's forward table, and **exit 3** from
 `unforward` cancels, removes LOCAL and forgets the record. It is idempotent and
 needs no master, but exits 1 naming the path if it cannot remove LOCAL or the
 record (a read-only directory, say), keeping the record so a retry can finish.
+If the record names a different REMOTE than the one you gave, `unforward` cancels
+that recorded forward too: leaving it in the master's table would let the next
+`forward` of the LOCAL put a second REMOTE on it, which wedges the table.
 Concurrent `forward`/`unforward` of the same LOCAL take turns on a local lock;
 different LOCALs never wait on each other.
 

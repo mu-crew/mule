@@ -26,7 +26,9 @@ Changes to one LOCAL are serialised by an exclusive per-(host, LOCAL) file lock,
 so two concurrent `forward`s of it to different REMOTEs can no longer wedge the
 master. `unforward` exits 1, naming the path and keeping the record, when it
 cannot remove LOCAL or the record; a missing socket, record or master is still
-success.
+success. `unforward LOCAL:R2` while the record names R1 now also cancels R1, so
+the forward is not orphaned in the master's table for the next `forward` to
+wedge.
 
 `Transport::mux_op` is the new lock-free path (`-O check`, `-O forward`,
 `-O cancel` for local unix forwards), as a closed enum so the exemption cannot

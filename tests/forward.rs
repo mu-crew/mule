@@ -53,18 +53,26 @@ type Listeners = Arc<Mutex<HashMap<PathBuf, UnixListener>>>;
 /// A master that binds on forward and drops the listener (not the file) on
 /// cancel.
 fn master(fake: &Fake) -> Listeners {
+    master_and(fake, |_| {})
+}
+
+/// [`master`], plus a side channel that sees every op first.
+fn master_and(fake: &Fake, also: impl Fn(&MuxOp) + Send + Sync + 'static) -> Listeners {
     let listeners: Listeners = Arc::default();
     let held = Arc::clone(&listeners);
-    fake.on_mux(move |op| match op {
-        MuxOp::ForwardUnix(local, _) => {
-            if let Ok(listener) = UnixListener::bind(local) {
-                held.lock().unwrap().insert(local.clone(), listener);
+    fake.on_mux(move |op| {
+        also(op);
+        match op {
+            MuxOp::ForwardUnix(local, _) => {
+                if let Ok(listener) = UnixListener::bind(local) {
+                    held.lock().unwrap().insert(local.clone(), listener);
+                }
             }
+            MuxOp::CancelUnix(local, _) => {
+                held.lock().unwrap().remove(local);
+            }
+            MuxOp::Check => {}
         }
-        MuxOp::CancelUnix(local, _) => {
-            held.lock().unwrap().remove(local);
-        }
-        MuxOp::Check => {}
     });
     listeners
 }
@@ -458,6 +466,102 @@ fn unforward_fails_with_exit_one_on_a_real_unlink_error_and_keeps_the_record() {
 
     // And once the cause is fixed, the same call finishes the job.
     unforward(&fake, &host(), &[spec(&local, "/r/x")]).unwrap();
+    assert!(!local.exists());
+    assert!(read_record(&host(), &local).is_none());
+}
+
+/// Overwrite the record for `local` by hand, as a transaction that finished
+/// while we held the lock would have: the point is that it is a *different*
+/// record from the one on disk when the caller under test started.
+fn rewrite_record(local: &Path, remote: &str) {
+    let path = mule::forward::record_path(&host(), local);
+    let text = format!(
+        "local={}\nremote={remote}\npid=4242\ndev=1\nino=1\n",
+        local.display()
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+/// The lock must precede the record read, not merely the writes.
+///
+/// While we hold LOCAL's lock, the record is swapped from R1 to R3 -- what a
+/// concurrent holder's transaction does. `op` starts (with the master's
+/// `Check` as the signal that it is under way), is given time to read the
+/// record if it is going to, and then the lock is released. Locked first, it
+/// reads R3 and cancels R3. Locked late, it already read R1 and cancels a
+/// forward that is no longer there, leaving R3 in the table: the wedge.
+///
+/// The correct code passes whatever the timing; a late lock fails because the
+/// 300ms is ample for a thread that is not blocked to reach its read.
+fn assert_record_read_waits_for_the_lock(
+    name: &str,
+    op: impl FnOnce(&Fake, &Path) + Send + 'static,
+) {
+    use std::time::Duration;
+    isolate_state();
+    let dir = scratch();
+    let local = dir.join("rd.sock");
+    let setup = Fake::new();
+    master(&setup);
+    forward(&setup, &host(), &[spec(&local, "/r/1")]).unwrap();
+
+    let lock = lock_local(&host(), &local).unwrap();
+    let (started, signal) = std::sync::mpsc::channel::<()>();
+    let started = Mutex::new(started);
+    let fake = Arc::new(Fake::new());
+    master_and(&fake, move |op| {
+        if matches!(op, MuxOp::Check) {
+            let _ = started.lock().unwrap().send(());
+        }
+    });
+    let (thread_fake, target) = (Arc::clone(&fake), local.clone());
+    let handle = std::thread::spawn(move || op(&thread_fake, &target));
+    // `unforward` makes no Check, so it cannot signal; give both a moment.
+    let _ = signal.recv_timeout(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(300));
+    rewrite_record(&local, "/r/3");
+    drop(lock);
+    handle.join().unwrap();
+
+    let ops = kinds(&fake.mux_ops());
+    assert!(
+        ops.contains(&"cancel /r/3".to_string()),
+        "{name} read the record before taking the lock: {ops:?}"
+    );
+    assert!(
+        !ops.contains(&"cancel /r/1".to_string()),
+        "{name} acted on a stale record: {ops:?}"
+    );
+}
+
+#[test]
+fn forward_takes_the_lock_before_it_reads_the_record() {
+    assert_record_read_waits_for_the_lock("forward", |fake, local| {
+        forward(fake, &host(), &[spec(local, "/r/2")]).unwrap();
+    });
+}
+
+#[test]
+fn unforward_takes_the_lock_before_it_reads_the_record() {
+    assert_record_read_waits_for_the_lock("unforward", |fake, local| {
+        unforward(fake, &host(), &[spec(local, "/r/2")]).unwrap();
+    });
+}
+
+#[test]
+fn unforward_of_a_different_remote_also_cancels_the_recorded_spec() {
+    isolate_state();
+    let dir = scratch();
+    let local = dir.join("u.sock");
+    let fake = Fake::new();
+    master(&fake);
+    forward(&fake, &host(), &[spec(&local, "/r/1")]).unwrap();
+    let before = fake.mux_ops().len();
+
+    unforward(&fake, &host(), &[spec(&local, "/r/2")]).unwrap();
+
+    let ops = kinds(&fake.mux_ops()[before..]);
+    assert_eq!(ops, ["cancel /r/1", "cancel /r/2"]);
     assert!(!local.exists());
     assert!(read_record(&host(), &local).is_none());
 }
