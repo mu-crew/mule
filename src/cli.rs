@@ -119,11 +119,13 @@ Exit status:
   0   mule operation or job succeeded
   3   no ssh control master
   4   timed out waiting
-  5   orphaned job
+  5   orphaned job (run --lease too)
   6   connection dropped while waiting
   7   exec only: output incomplete -- truncated at max_log_bytes, or a process
       still holds the job's stdout; what was printed is partial
-  <n> wait/--wait return the job's own exit code; exec returns the command's"
+  129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
+  <n> wait/--wait/--lease return the job's own exit code; exec returns the
+      command's; run --lease exits 3 only at startup"
 )]
 pub struct Cli {
     /// Config file (default: ~/.config/mule/config.toml)
