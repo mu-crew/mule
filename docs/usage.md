@@ -109,8 +109,11 @@ and adds `runtime_secs`.
 Exit 0 means it is stopped and gone: neither tmux session exists and the state
 directory is removed. A job that is already missing also exits 0, so it is safe
 to repeat. If a session survives the kill or the directory cannot be removed it
-exits 1, names which, and keeps what is left, so a script can treat exit 0 as
-proof before deleting its own handle.
+exits 1, names which, and keeps what is left. It also exits 1, keeping state,
+when absence cannot be verified: a tmux that cannot be queried (version mismatch,
+unsafe socket directory) or a state path behind an unsearchable directory. Only
+`no server running`, a missing socket, or `No such file or directory` count as
+gone. So a script can treat exit 0 as proof before deleting its own handle.
 `mule rm --all` removes every **finished** job, ignoring `keep_days`, and leaves
 running jobs and orphans alone. Prefer `mule kill` when you want the exit code
 recorded as **137** without dropping state; use `kill --rm` to end and discard
