@@ -843,7 +843,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Unforward { host, unix } => {
             let host = cfg.host(host.host.as_deref())?;
             let specs = crate::forward::Spec::parse_all(&unix)?;
-            crate::forward::unforward(&Ssh, host, &specs);
+            crate::forward::unforward(&Ssh, host, &specs)?;
             Ok(0)
         }
         Commands::Host(HostCmd::List { json }) => {

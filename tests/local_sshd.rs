@@ -1753,3 +1753,51 @@ fn forward_exits_three_without_a_master_and_unforward_does_not_need_one() {
     let out = sshd.mule(&config, &["unforward", "--unix", &spec]);
     assert_eq!(out.status.code(), Some(0), "idempotent, master or not");
 }
+
+#[test]
+fn unforward_exits_one_naming_a_real_unlink_failure_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "fwdrofail");
+    let config = sshd.write_config(&tmux.name);
+    // A private directory, so it can be made unwritable without touching the
+    // fixture's own.
+    let dir = sshd.dir.join("readonly");
+    std::fs::create_dir(&dir).unwrap();
+    let (local, remote) = (dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let spec = unix_spec(&local, &remote);
+    assert!(
+        sshd.mule(&config, &["forward", "--unix", &spec])
+            .status
+            .success()
+    );
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let out = sshd.mule(&config, &["unforward", "--unix", &spec]);
+    let remains = local.exists();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    if !remains {
+        eprintln!("skipping: permissions are not enforced here (root?)");
+        return;
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "LOCAL is still there: not success"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("l.sock"), "the failure names LOCAL: {err}");
+
+    // The record survived, so the retry finishes the job.
+    let out = sshd.mule(&config, &["unforward", "--unix", &spec]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!local.exists());
+}

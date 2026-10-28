@@ -84,7 +84,9 @@ So an exit code proves nothing, file existence proves nothing, `connect(LOCAL)` 
 
 The record, `~/.local/state/mule/forwards/<host>/<hash of LOCAL>`, holds LOCAL, REMOTE, the master pid from `-O check` and LOCAL's dev+inode after binding. It is what makes the wedge avoidable, since OpenSSH has no `-O list`. It is forward state for the master mule owns, not a job index.
 
-A failed verify after the sequence means the table is wedged. That exits **3**, the hand-back code, naming `ssh -O exit` and the master command: it needs the same human act as a missing master. Any other failure cancels what this call added and exits 1. `unforward` cancels, unlinks and deletes the record, and is idempotent.
+A failed verify after the sequence means the table is wedged. That exits **3**, the hand-back code, naming `ssh -O exit` and the master command: it needs the same human act as a missing master. Any other failure cancels what this call added and exits 1. Every `forward` and `unforward` of one LOCAL runs under an exclusive local `flock` keyed by (host, hash of LOCAL), `forwards/<host>/<hash>.lock`, held from the record read to the record write. Without it two callers sending one LOCAL to different REMOTEs both passed the pre-cancel before either wrote a record and wedged the master (reproduced: 5 of 40 racing pairs both exited 0, all 40 left the table wedged). It is not the session ticket lock: mux ops stay outside it, so a held session never queues a forward. The kernel drops it when its holder dies, and different LOCALs never wait on each other.
+
+`unforward` cancels, unlinks and deletes the record, and is idempotent: an already-missing socket or record and a missing master are success. A real local I/O failure (the unlink or the record delete failing for any reason but not-found) exits **1** naming the path, and keeps the record. Every spec is still attempted. Best-effort cleanup, such as rolling back a failed `forward`, ignores errors.
 
 ## Job identity and remote state
 
