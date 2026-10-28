@@ -175,8 +175,40 @@ pub fn record_path(host: &Host, local: &Path) -> PathBuf {
 }
 
 pub fn read_record(host: &Host, local: &Path) -> Option<Record> {
+    READ_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(host, local);
+        }
+    });
     let text = std::fs::read_to_string(record_path(host, local)).ok()?;
     Record::parse(&text).filter(|record| record.local == local)
+}
+
+type ReadHook = Box<dyn Fn(&Host, &Path)>;
+
+thread_local! {
+    static READ_HOOK: std::cell::RefCell<Option<ReadHook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: run `hook` on every [`read_record`] made by *this thread*, until
+/// the returned guard drops. It lets a layer-1 test ask "is the LOCAL's lock
+/// held right now?" at the instant of the read (via [`try_lock_local`]), which
+/// is the one thing a lock-before-read test must observe and which no sleep can
+/// observe deterministically. Per thread, so parallel tests cannot see each
+/// other's reads. Deliberately not `#[cfg(test)]`: integration tests are a
+/// separate crate (same reason as `Fake`).
+pub fn on_record_read(hook: impl Fn(&Host, &Path) + 'static) -> ReadHookGuard {
+    READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    ReadHookGuard(())
+}
+
+/// Removes the [`on_record_read`] hook on drop.
+pub struct ReadHookGuard(());
+
+impl Drop for ReadHookGuard {
+    fn drop(&mut self) {
+        READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 fn write_record(host: &Host, record: &Record) -> Result<()> {
@@ -223,13 +255,24 @@ pub struct LocalLock {
 /// inside a few sub-second mux ops, and giving up would just run the race.
 /// Different LOCALs hash to different files and never wait on one another.
 pub fn lock_local(host: &Host, local: &Path) -> Result<LocalLock> {
+    flock_local(host, local, true).map(|lock| lock.expect("a blocking lock is always taken"))
+}
+
+/// [`lock_local`] without waiting: `None` if someone else holds the lock. Used
+/// by tests to observe whether a lock is held; production code never polls.
+pub fn try_lock_local(host: &Host, local: &Path) -> Result<Option<LocalLock>> {
+    flock_local(host, local, false)
+}
+
+fn flock_local(host: &Host, local: &Path, wait: bool) -> Result<Option<LocalLock>> {
     use std::os::fd::AsRawFd;
 
     unsafe extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
     }
-    // LOCK_EX; the same value on Linux and macOS, as in `lock.rs`.
+    // LOCK_EX and LOCK_NB; the same values on Linux and macOS, as in `lock.rs`.
     const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
 
     let path = record_path(host, local).with_extension("lock");
     let dir = path.parent().expect("lock paths have a parent");
@@ -242,17 +285,22 @@ pub fn lock_local(host: &Host, local: &Path) -> Result<LocalLock> {
         .truncate(false)
         .open(&path)
         .with_context(|| format!("cannot open forward lock {}", path.display()))?;
+    let operation = if wait { LOCK_EX } else { LOCK_EX | LOCK_NB };
     // The lock is per open file description, so two threads of one process
     // exclude each other too, which the layer-1 tests rely on.
     loop {
         // SAFETY: `file` owns a valid fd for the duration of the call.
-        if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
-            return Ok(LocalLock { _file: file });
+        if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(Some(LocalLock { _file: file }));
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() != ErrorKind::Interrupted {
-            return Err(error)
-                .with_context(|| format!("cannot lock forward state {}", path.display()));
+        match error.kind() {
+            ErrorKind::Interrupted => {}
+            ErrorKind::WouldBlock if !wait => return Ok(None),
+            _ => {
+                return Err(error)
+                    .with_context(|| format!("cannot lock forward state {}", path.display()));
+            }
         }
     }
 }
