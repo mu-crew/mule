@@ -23,8 +23,15 @@ code and removes the job. No id line, no hints, and no mule warnings on stderr:
 only the command's stderr and fatal errors. SIGHUP/SIGINT/SIGTERM stop the job
 through a detached `mule rm` and exit 129/130/143.
 
-**New exit code 7** (`exec` only): the output hit `max_log_bytes`, so what was
-printed is partial.
+**New exit code 7** (`exec` only): the output is partial -- it hit
+`max_log_bytes`, or a process the command left behind (`sleep 30 &`) still holds
+its stdout, so the log cannot be known complete. exec no longer returns the
+job's code beside a possibly-empty log in that case.
+
+No locked call in `exec` waits: the wait for the job's session to end moved out
+of the collect round trip (which held the ticket ~14s) into the unlocked poll
+loop. A stop signal that arrives with a probe in flight now always gives exit
+129/130/143, never exit 1 from the probe the signal killed.
 
 The detached cleanup (`cleanup.rs`) runs `current_exe()` with the effective
 `--config`, so a private config is never swapped for the default one, and

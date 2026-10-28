@@ -253,7 +253,7 @@ The stable mule-specific exit codes are:
 | 4 | Wait timed out. |
 | 5 | Job is orphaned. |
 | 6 | Connection dropped while waiting. |
-| 7 | `exec` only: the output hit `max_log_bytes`, so what was printed is partial. |
+| 7 | `exec` only: the output is partial -- it hit `max_log_bytes`, or a process the command left behind still holds its stdout. |
 
 A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `mule tail <id>` as the recovery command.
 
@@ -266,10 +266,10 @@ It is an ordinary detached job with a foreground waiter, so invariant 3 holds: n
 - **Separate streams.** exec uses its own wrapper mode, which writes stdout to `$d/log` and stderr to `$d/err`. The `cd` is inside the stderr redirect, so a bad `--cwd` leaves its reason on stderr's first line, as `ssh host cmd` would. After the job ends, exec prints the log to stdout and then the err file to stderr, in one locked read. [Split stdout and stderr](#split-stdout-and-stderr) rejects two logs *for the job artifact*; exec is a synchronous ssh stand-in, not an artifact reader, so the amendment applies to exec only.
 - **Quiet stderr.** No id line and no hints. mule's non-fatal diagnostics (the lock-wait notice, `max_running`, dispatch-pattern warnings) are suppressed, so stderr is the command's plus mule's fatal errors. A caller reads "why" from stderr's first line.
 - **Fast poll.** The interval starts at **100ms** and doubles to a **1s** cap, not the 5s a detached job settles at, because the caller is blocked on it. A 30s command costs about 30 probes.
-- **Exit status.** exec exits with the command's code and removes the job in the same round trip that reads it. If the log reached `max_log_bytes` (or the err file did, which has no wrapper-side cap and is bounded on read), it exits **7**: partial output delivered, never mistaken for complete. exec is for control-sized output. No master is exit 3, unchanged.
-- **Signals.** On SIGHUP, SIGINT or SIGTERM exec stops the job through [detached cleanup](#detached-cleanup) and exits 129, 130 or 143. This is the difference from `run --wait`, where the job continues.
+- **Exit status.** exec exits with the command's code and removes the job in the same round trip that reads it. If the log reached `max_log_bytes` (or the err file did, which has no wrapper-side cap and is bounded on read), it exits **7**: partial output delivered, never mistaken for complete. So does a command that leaves a process holding its stdout (`sleep 30 &`): the log pipeline, and so the job's session, never ends, the log cannot be known complete, and exec prints `output incomplete: a process still holds the command's stdout` instead of returning the job's code beside a possibly-empty log. The job is still removed. exec is for control-sized output. No master is exit 3, unchanged.
+- **Signals.** On SIGHUP, SIGINT or SIGTERM exec stops the job through [detached cleanup](#detached-cleanup) and exits 129, 130 or 143. This is the difference from `run --wait`, where the job continues. Once a signal is pending the main thread never turns a failure into its own exit: a group signal kills the in-flight `ssh` too, and that probe error is the signal's fallout, so the main thread parks and the signal thread gives the exit.
 
-The final read waits (bounded, 5s) for `mule-<id>`'s session to end before reading: `rc` is written by the left end of the log pipeline and the log by the right end, so `rc` can land while the last bytes and the `truncated` marker are still in flight.
+No locked call waits. `rc` is written by the left end of the log pipeline and the log by the right end, so `rc` can land while the last bytes and the `truncated` marker are still in flight; the session ends only when the whole pipeline has. exec waits for that in the *unlocked* poll loop -- each probe reports whether `mule-<id>` is alive, spaced 100ms, bounded at 5s -- and only then makes the one collect round trip, which reports `live=` (read before the log) and never sleeps. A 5s sleep inside the collect held the ticket about 14s when a background child kept the session open, starving every other caller. No exec call, locked or not, exceeds about a second.
 
 Cost: about 125ms to dispatch plus at least 100ms of polling, against 33ms for a bare ssh. A profile has one `exec` template, so the sub-second calls become jobs too, and a refused `git rev-parse` reading as an empty answer is exactly what [What belongs in a job](#what-belongs-in-a-job) warns about.
 
@@ -279,7 +279,7 @@ A foreground waiter cannot stop its own job from a signal path: `rm` queues on t
 
 - **Executable:** `std::env::current_exe()`, never `mule` from PATH. A worker or a test runs a freshly built binary, and PATH may hold another or none.
 - **Arguments:** the effective `--config` path when one was given (made absolute), then `--quiet`, `rm`, `--host H`, the id. The child must never fall back to, or seed, the default config.
-- **Detach:** `pre_exec` with `setsid()` via `libc`, stdio on `/dev/null`. macOS ships no `setsid` executable. A pane that dies sends SIGHUP to its process group, and the stop must survive it.
+- **Detach:** `pre_exec` with `setsid()` via `libc`, stdio on `/dev/null`. macOS ships no `setsid` executable. A pane that dies sends SIGHUP to its process group, and the stop must survive it; a layer-3 test signals the group repeatedly while the stop is queued, and fails without `setsid()`.
 - **Queueing:** the child takes a ticket like any caller. A dead waiter's ticket is skipped by `wait_for_turn`, so an abandoned in-flight probe never wedges the queue.
 
 The signal handler only sets a flag and writes to a self-pipe (`signal-hook`), so a sleep is interruptible; a thread acts on it. The first act is `dup2` of `/dev/null` onto fds 1 and 2, because after SIGHUP the pane's tty is gone and `print!`/`eprint!` panic on EIO. If the signal lands while the dispatch ssh is in flight, the child waits up to 3s for it first: an `rm` that overtook the dispatch would be a no-op and leak the job. This lives in `cleanup.rs`, reusable by the lease.

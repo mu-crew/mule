@@ -213,12 +213,14 @@ fn concurrent_dispatches_all_succeed_through_the_gate() {
             let bin = PathBuf::from(env!("CARGO_BIN_EXE_mule"));
             let config = config.clone();
             let path = sshd.path_env();
+            let state = sshd.state_root.clone();
             std::thread::spawn(move || {
                 std::process::Command::new(bin)
                     .arg("--config")
                     .arg(&config)
                     .args(["run", "echo concurrent"])
                     .env("PATH", path)
+                    .env("XDG_STATE_HOME", &state)
                     .stdin(std::process::Stdio::null())
                     .output()
                     .expect("mule failed to spawn")
@@ -825,6 +827,7 @@ fn dispatch_returns_before_the_job_finishes() {
         .arg(&config)
         .args(["run", &command])
         .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1813,6 +1816,17 @@ fn spawn_mule(
     args: &[&str],
     extra_env: &[(&str, &std::path::Path)],
 ) -> std::process::Child {
+    mule_command(sshd, config, args, extra_env)
+        .spawn()
+        .expect("mule failed to spawn")
+}
+
+fn mule_command(
+    sshd: &Sshd,
+    config: &std::path::Path,
+    args: &[&str],
+    extra_env: &[(&str, &std::path::Path)],
+) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_mule"));
     command
         .arg("--config")
@@ -1826,7 +1840,29 @@ fn spawn_mule(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    command.spawn().expect("mule failed to spawn")
+    command
+}
+
+/// Spawn mule as the leader of its own process group, as a pane's foreground
+/// job is: the group holds mule and every child it starts, so a signal to the
+/// group reaches all of them at once, the way a Ctrl-C or a pane hangup does.
+fn spawn_mule_in_group(
+    sshd: &Sshd,
+    config: &std::path::Path,
+    args: &[&str],
+    extra_env: &[(&str, &std::path::Path)],
+) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    mule_command(sshd, config, args, extra_env)
+        .process_group(0)
+        .spawn()
+        .expect("mule failed to spawn")
+}
+
+/// Signal the whole process group led by `leader`. A missing group (everyone
+/// already gone) is not an error: repeated signals race the group's death.
+fn signal_group(leader: u32, signal: i32) {
+    unsafe { libc::kill(-(leader as i32), signal) };
 }
 
 fn signal(child: &std::process::Child, name: &str) {
@@ -1951,10 +1987,16 @@ fn exec_exits_seven_when_the_log_is_capped() {
 }
 
 #[test]
-fn a_long_exec_leaves_the_default_master_usable_and_a_signal_leaves_no_job() {
+fn a_long_exec_leaves_a_default_master_usable_and_a_signal_leaves_no_job() {
     require_sshd!();
     let sshd = Sshd::start();
     let _master = sshd.open_master(&sshd.socket);
+    // A second, separate control master standing in for the user's default
+    // one. The cap is per connection, so only a call multiplexed over a master
+    // can be refused by it: a bare `ssh host cmd` opens a fresh connection that
+    // no `MaxSessions` can see, and passes whatever exec does.
+    let default_socket = sshd.dir.join("default.sock");
+    let _default_master = sshd.open_master(&default_socket);
     let tmux = Tmux::new(&sshd, "exec-held");
     let config = sshd.write_config(&tmux.name);
 
@@ -1964,13 +2006,14 @@ fn a_long_exec_leaves_the_default_master_usable_and_a_signal_leaves_no_job() {
     });
 
     // The point of exec: it holds nothing on the default connection, so an
-    // ordinary `ssh host cmd` works for the whole 30s -- here, three times,
-    // during it. (A held `ssh host 'sleep 30'` would have refused every one.)
+    // ordinary `ssh host cmd` over it works for the whole 30s -- here, three
+    // times, during it. (A held `ssh host 'sleep 30'` would have refused every
+    // one.)
     for attempt in 0..3 {
-        let out = sshd.ssh(&["echo", "ok"]);
+        let out = sshd.ssh_via(&default_socket, &["echo", "ok"]);
         assert!(
             out.status.success(),
-            "default-connection ssh {attempt} refused during exec: {}",
+            "default-master ssh {attempt} refused during exec: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -2009,6 +2052,140 @@ fn sigint_mid_exec_leaves_no_job_and_exits_130() {
     wait_until("the job to be removed", Duration::from_secs(15), || {
         job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
     });
+}
+
+/// A directory holding an `ssh` that pauses inside every *probe* and drops a
+/// flag file when it does, then runs the real shim. It makes "a probe is in
+/// flight right now" an observable fact instead of a race: a group signal
+/// delivered after the flag kills that ssh along with mule, which is what a
+/// pane hangup or Ctrl-C does.
+fn slow_probe_ssh(sshd: &Sshd, flag: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = sshd.dir.join("slow-probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("ssh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *exists=*) echo $$ > '{}'; sleep 5;; esac\nexec '{}' \"$@\"\n",
+            flag.display(),
+            sshd.dir.join("ssh").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// A signal to exec's whole process group lands while a probe's ssh is in
+/// flight, so the ssh dies with it and the probe fails. That failure is the
+/// signal's fallout: the exit must still be 128+signal, with the job removed,
+/// not 1 from a probe error.
+///
+/// The kernel delivers a group signal to its members in no fixed order, and
+/// whichever of "ssh died" and "mule's handler ran" comes second decides the
+/// exit -- left to chance, the unfixed code passed this about as often as it
+/// failed. So the order is pinned to the bad one: the ssh is killed first, and
+/// the group signal follows 50ms later, after the probe error has already
+/// reached the main thread.
+fn group_signal_mid_probe_exits_with_the_signal(tag: &str, signal: i32, expected: i32) {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, tag);
+    let config = sshd.write_config(&tmux.name);
+    let flag = sshd.dir.join("probe-in-flight");
+    let slow = slow_probe_ssh(&sshd, &flag);
+    let path = PathBuf::from(format!("{}:{}", slow.display(), sshd.path_env()));
+
+    let mut exec = spawn_mule_in_group(
+        &sshd,
+        &config,
+        &["exec", "sleep 60"],
+        &[("PATH", path.as_path())],
+    );
+    wait_until("a probe to be in flight", Duration::from_secs(15), || {
+        std::fs::read_to_string(&flag).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+    let ssh_pid = std::fs::read_to_string(&flag).unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", ssh_pid.trim()])
+        .status();
+    std::thread::sleep(Duration::from_millis(50));
+    signal_group(exec.id(), signal);
+
+    let status = exec.wait().unwrap();
+    assert_eq!(
+        status.code(),
+        Some(expected),
+        "a probe killed by the signal must not turn into exit 1"
+    );
+    wait_until("the job to be removed", Duration::from_secs(20), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+#[test]
+fn a_group_sigint_mid_probe_exits_130_and_removes_the_job() {
+    group_signal_mid_probe_exits_with_the_signal("exec-gint", libc::SIGINT, 130);
+}
+
+#[test]
+fn a_group_sighup_mid_probe_exits_129_and_removes_the_job() {
+    group_signal_mid_probe_exits_with_the_signal("exec-ghup", libc::SIGHUP, 129);
+}
+
+#[test]
+fn the_detached_cleanup_survives_repeated_group_hangups_and_interrupts() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-setsid");
+    let config = sshd.write_config(&tmux.name);
+
+    let mut exec = spawn_mule_in_group(&sshd, &config, &["exec", "sleep 60"], &[]);
+    wait_until("the job to start", Duration::from_secs(10), || {
+        !job_ids(&sshd).is_empty()
+    });
+
+    // Hold the ticket so the cleanup `rm` is alive and queued -- not finished --
+    // for the whole barrage. Without `setsid()` it sits in exec's process group,
+    // and the first of these kills it: the job then runs for its full 60s.
+    let lock = sshd.state_root.join("mule/live.lock");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&lock, || {
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    signal_group(exec.id(), libc::SIGINT);
+    assert_eq!(exec.wait().unwrap().code(), Some(130));
+    // A pane's hangup is not one signal: the tty driver and the shell each send
+    // theirs. Keep them coming for as long as the cleanup is queued.
+    let barrage = Instant::now();
+    while barrage.elapsed() < Duration::from_millis(1500) {
+        signal_group(exec.id(), libc::SIGHUP);
+        signal_group(exec.id(), libc::SIGINT);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !job_ids(&sshd).is_empty(),
+        "the stop is still queued behind the ticket"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    wait_until(
+        "the queued cleanup to survive the barrage and run",
+        Duration::from_secs(15),
+        || job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-"),
+    );
 }
 
 #[test]

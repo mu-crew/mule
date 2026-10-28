@@ -44,7 +44,7 @@ fn state(state: &str) -> Output {
 /// The collect round trip's reply: header, then log bytes, then err bytes.
 fn collected(truncated: bool, log: &str, err: &str) -> Output {
     Output::ok(format!(
-        "trunc={}\nlog={}\nerr={}\nbytes:\n{log}{err}",
+        "trunc={}\nlive=0\nlog={}\nerr={}\nbytes:\n{log}{err}",
         u8::from(truncated),
         log.len(),
         err.len()
@@ -290,4 +290,71 @@ fn argv_commands_keep_their_boundaries_for_env_prefixed_shells() {
         .unwrap();
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "v it's here\n");
+}
+
+/// The collect reply when the job's session was still alive at read time.
+fn collected_live(log: &str) -> Output {
+    Output::ok(format!(
+        "trunc=0\nlive=1\nlog={}\nerr=0\nbytes:\n{log}",
+        log.len()
+    ))
+}
+
+#[test]
+fn a_session_that_outlives_rc_is_waited_for_in_probes_not_inside_the_collect() {
+    let fake = Fake::new();
+    // rc landed, but the log pipeline has not drained: two probes see it.
+    fake.push(state("rc=0\nalive=1"));
+    fake.push(state("rc=0\nalive=1"));
+    fake.push(state("rc=0\nalive=0"));
+    fake.push(collected(false, "all\n", ""));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+
+    let code = finish(&fake, &host(), &id(), &no_pause(), &mut out, &mut err).unwrap();
+
+    assert_eq!((code, String::from_utf8(out).unwrap()), (0, "all\n".into()));
+    let scripts = fake.scripts();
+    assert_eq!(scripts.len(), 4, "three short probes, then one collect");
+    // A sleep inside the locked collect held the ticket ~14s in the field.
+    let collect = scripts.last().unwrap();
+    assert!(!collect.contains("sleep"), "{collect}");
+    assert!(!collect.contains("while"), "{collect}");
+}
+
+#[test]
+fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_partial_log() {
+    let fake = Fake::new();
+    // A background child holds stdout: the session never ends. The first probe
+    // sees rc, then 50 more of 100ms make the 5s bound; the next call is the
+    // collect.
+    for _ in 0..51 {
+        fake.push(state("rc=0\nalive=1"));
+    }
+    fake.push(collected_live(""));
+    let pauses = RefCell::new(Duration::ZERO);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+
+    let code = finish(
+        &fake,
+        &host(),
+        &id(),
+        &|interval| *pauses.borrow_mut() += interval,
+        &mut out,
+        &mut err,
+    )
+    .unwrap();
+
+    assert_eq!(code, 7, "never rc 0 with a possibly-empty log");
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("output incomplete"), "{err}");
+    assert!(err.contains("stdout"), "{err}");
+    let waited = pauses.into_inner();
+    assert!(
+        waited >= Duration::from_secs(5) && waited < Duration::from_secs(8),
+        "waits a bounded ~5s for the session, in probes: {waited:?}"
+    );
+    assert!(
+        fake.scripts().last().unwrap().contains("rm -rf $d"),
+        "the job is still removed"
+    );
 }

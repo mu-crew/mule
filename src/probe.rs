@@ -18,6 +18,10 @@ pub enum State {
 pub struct Probe {
     pub state: State,
     pub runtime_secs: Option<u64>,
+    /// Whether the job's tmux session still exists. Independent of `state`: a
+    /// job with `rc` is `Done` while its session lives on until the whole log
+    /// pipeline has drained, and `exec` waits on exactly that gap.
+    pub alive: bool,
     pub log_size: u64,
     pub bytes: Vec<u8>,
 }
@@ -112,6 +116,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         }
     }
 
+    let alive_now = alive.unwrap_or(false);
     let state = match (exists.context("invalid probe reply: missing exists")?, rc) {
         (false, _) => State::Missing,
         (true, Some(code)) => State::Done(code),
@@ -121,6 +126,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     Ok(Probe {
         state,
         runtime_secs,
+        alive: alive_now,
         log_size: log_size.context("invalid probe reply: missing size")?,
         bytes,
     })
