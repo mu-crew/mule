@@ -121,7 +121,8 @@ Exit status:
   4   timed out waiting
   5   orphaned job
   6   connection dropped while waiting
-  7   exec only: output exceeded max_log_bytes, so what was printed is partial
+  7   exec only: output incomplete -- truncated at max_log_bytes, or a process
+      still holds the job's stdout; what was printed is partial
   <n> wait/--wait return the job's own exit code; exec returns the command's"
 )]
 pub struct Cli {
@@ -314,8 +315,10 @@ pub enum Commands {
     /// ends, and the job is removed. No id is printed and mule stays quiet on
     /// stderr, so stderr is the command's plus mule's fatal errors.
     ///
-    /// Exits with the command's own code. Exit 7 means the output hit
-    /// max_log_bytes and is partial -- never parse it as complete. Exit 3 means
+    /// Exits with the command's own code. Exit 7 means the output is
+    /// incomplete -- truncated at max_log_bytes, or a process the command left
+    /// behind still holds the job's stdout -- so never parse it as complete.
+    /// Exit 1 names a job that could not be removed (never the command's code). Exit 3 means
     /// no master: stop and ask a human. SIGINT/SIGTERM stop the remote job
     /// through a detached `mule rm`, unlike `run --wait`, where it continues.
     ///

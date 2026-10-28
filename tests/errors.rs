@@ -192,7 +192,8 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         "4   timed out waiting",
         "5   orphaned job",
         "6   connection dropped while waiting",
-        "7   exec only: output exceeded max_log_bytes",
+        "7   exec only: output incomplete -- truncated at max_log_bytes, or a process",
+        "still holds the job's stdout",
         "<n> wait/--wait return the job's own exit code",
     ] {
         assert!(help.contains(text), "help missing {text:?}:\n{help}");
@@ -351,5 +352,26 @@ fn run_help_warns_that_piping_the_command_destroys_the_exit_code() {
         "not portable POSIX",
     ] {
         assert!(help.contains(text), "run help missing {text:?}:\n{help}");
+    }
+}
+
+#[test]
+fn exit_seven_help_names_both_causes_at_the_top_level_and_on_exec() {
+    isolate_state();
+    let top = Cli::command().render_long_help().to_string();
+    let exec = Cli::command()
+        .find_subcommand_mut("exec")
+        .expect("exec exists")
+        .render_long_help()
+        .to_string();
+
+    for (what, help) in [("mule --help", &top), ("mule exec --help", &exec)] {
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("max_log_bytes"), "{what}:\n{help}");
+        assert!(
+            flat.contains("process") && flat.contains("stdout"),
+            "{what} must say a leftover process holding stdout also gives exit 7:\n{help}"
+        );
+        assert!(flat.contains("incomplete"), "{what}:\n{help}");
     }
 }

@@ -170,10 +170,13 @@ is the command's own.
 - **No id and no hints.** stderr is the command's plus mule's *fatal* errors:
   the lock-wait notice, the `max_running` warning and the dispatch-pattern
   warnings are all suppressed.
-- **Exit 7** means the output is partial: it hit `max_log_bytes`, or the command
-  left a process (`sleep 30 &`) holding its stdout, so the log cannot be known
-  complete. Never parse it as complete. exec is for control-sized output: the whole log comes back in one
-  locked read, so use `run` and `tail` for anything big.
+- **Exit 7** means the output is incomplete: truncated at `max_log_bytes`, or
+  the command left a process (`sleep 30 &`) holding the job's stdout, so the log
+  cannot be known complete (mule waits at most 5s of wall clock to find out).
+  Never parse it as complete. exec is for control-sized output: the whole log
+  comes back in one locked read, so use `run` and `tail` for anything big.
+- **Exit 1** also covers a job mule could not remove (a session or state left
+  on the host): the command's own code is never returned beside a leftover job.
 - **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143), through a detached `mule rm`
   that queues like any caller. Give it a moment before you tear the machine
   down. `run --wait` is the opposite: its job continues.
@@ -199,7 +202,7 @@ only). `mule host info` probes OS, cores, RAM, and GPU and takes the lock.
 | 4 | Timed out waiting (`wait --timeout`); the job keeps running |
 | 5 | Orphaned job: no exit code will arrive |
 | 6 | Connection dropped while waiting; wait again |
-| 7 | `exec` only: output is partial (hit `max_log_bytes`, or a leftover process still holds stdout) |
+| 7 | `exec` only: output incomplete (truncated at `max_log_bytes`, or a leftover process still holds the job's stdout) |
 | *n* | `wait`, `run --wait` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
 
 `mule --help` carries the same table.

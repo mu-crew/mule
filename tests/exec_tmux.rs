@@ -108,7 +108,8 @@ impl Server {
             &self.transport,
             &self.host,
             &id,
-            &|_| std::thread::sleep(Duration::from_millis(20)),
+            // The real pause: the settle bound is wall-clock.
+            &std::thread::sleep,
             &mut out,
             &mut err,
         )
@@ -302,7 +303,7 @@ fn a_binary_log_survives_the_round_trip() {
         &server.transport,
         &server.host,
         &id,
-        &|_| std::thread::sleep(Duration::from_millis(20)),
+        &std::thread::sleep,
         &mut out,
         &mut Vec::new(),
     )
@@ -335,10 +336,69 @@ fn a_background_child_holding_stdout_is_exit_seven_and_no_locked_call_runs_long(
         longest < Duration::from_secs(1),
         "a locked call ran {longest:?}; the ticket is held for all of it"
     );
-    assert!(started.elapsed() < Duration::from_secs(20));
+    // The settle bound is 5s of wall clock, probes included; the rest is one
+    // collect. Summed pauses once let this run to ~8s on a loaded machine.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= Duration::from_secs(6),
+        "the settle bound is wall-clock: {elapsed:?}"
+    );
     // Removed deliberately, background child included.
     assert!(!server.job_dir("e20008").exists());
     assert!(!server.has_session("mule-e20008"));
+}
+
+#[test]
+fn a_removal_that_fails_is_a_fatal_error_not_the_commands_exit_code() {
+    if !tmux_available() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start(1 << 20);
+    let id: JobId = "e2000a".parse().unwrap();
+    start(
+        &server.transport,
+        &server.host,
+        id.clone(),
+        &Request {
+            cmd: "true",
+            cwd: None,
+            max_secs: None,
+        },
+    )
+    .unwrap();
+    // A file inside a 0500 directory cannot be unlinked, so `rm -rf` fails
+    // partway. (Root ignores modes, so this cannot bite as root.)
+    let dir = server.job_dir("e2000a");
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("evidence"), "x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let rooted = std::fs::write(locked.join("probe"), "x").is_ok();
+
+    let result = finish(
+        &server.transport,
+        &server.host,
+        &id,
+        &std::thread::sleep,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    // Restore so the fixture can clean up.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if rooted {
+        eprintln!("skipping: modes are not enforced for this user");
+        return;
+    }
+    // Before: Ok(0) with only a stderr line -- mu would read success and
+    // delete its handle while the job's state was still on the host.
+    let error = result.expect_err("a failed removal must not report the command's rc");
+    let text = format!("{error:#}");
+    assert!(text.contains("could not remove"), "{text}");
+    assert!(text.contains("could not be removed"), "{text}");
+    assert_eq!(mule::errors::exit_code(&error), 1);
+    assert!(locked.join("evidence").exists(), "evidence must be kept");
 }
 
 #[test]

@@ -6,11 +6,11 @@
 //! decides: which stream goes where, what is silent, the exit code, the cadence.
 
 use std::cell::RefCell;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_TRUNCATED, MuleError};
-use mule::exec::{Request, finish, next_interval, start};
+use mule::exec::{Request, finish, finish_within, next_interval, start};
 use mule::transport::{Fake, Output};
 use mule::wrapper::JobId;
 
@@ -170,7 +170,7 @@ fn the_job_is_removed_in_the_same_round_trip_that_reads_it() {
 
     let scripts = fake.scripts();
     let last = scripts.last().unwrap();
-    assert!(last.contains("rm -rf $d"), "{last}");
+    assert!(last.contains("rm -rf \"$d\""), "{last}");
     assert!(last.contains("kill-session -t mule-a1b2c3"), "{last}");
     assert!(last.contains("kill-session -t watch-a1b2c3"), "{last}");
     assert_eq!(scripts.len(), 2, "one probe, one collect");
@@ -323,22 +323,34 @@ fn a_session_that_outlives_rc_is_waited_for_in_probes_not_inside_the_collect() {
 
 #[test]
 fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_partial_log() {
-    let fake = Fake::new();
-    // A background child holds stdout: the session never ends. The first probe
-    // sees rc, then 50 more of 100ms make the 5s bound; the next call is the
-    // collect.
-    for _ in 0..51 {
-        fake.push(state("rc=0\nalive=1"));
+    // A background child holds stdout: the session never ends. Probes keep
+    // saying `alive=1` until the settle bound passes; the next call is the
+    // collect. The bound is wall-clock, so the pause really sleeps and the
+    // probe count is not fixed -- the reply is chosen by what was asked.
+    struct ByScript(Fake);
+    impl mule::transport::Transport for ByScript {
+        fn run_unlocked(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
+            self.0.run_unlocked(host, script)?;
+            Ok(if script.contains("live=0; tmux") {
+                collected_live("")
+            } else {
+                state("rc=0\nalive=1")
+            })
+        }
+        fn mux_op(&self, host: &Host, op: mule::transport::MuxOp) -> anyhow::Result<Output> {
+            self.0.mux_op(host, op)
+        }
     }
-    fake.push(collected_live(""));
-    let pauses = RefCell::new(Duration::ZERO);
+    let fake = ByScript(Fake::new());
     let (mut out, mut err) = (Vec::new(), Vec::new());
+    let started = Instant::now();
 
-    let code = finish(
+    let code = finish_within(
         &fake,
         &host(),
         &id(),
-        &|interval| *pauses.borrow_mut() += interval,
+        Duration::from_millis(500),
+        &std::thread::sleep,
         &mut out,
         &mut err,
     )
@@ -348,13 +360,108 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
     let err = String::from_utf8(err).unwrap();
     assert!(err.contains("output incomplete"), "{err}");
     assert!(err.contains("stdout"), "{err}");
-    let waited = pauses.into_inner();
+    let waited = started.elapsed();
     assert!(
-        waited >= Duration::from_secs(5) && waited < Duration::from_secs(8),
-        "waits a bounded ~5s for the session, in probes: {waited:?}"
+        waited >= Duration::from_millis(500) && waited < Duration::from_millis(1500),
+        "waits a bounded wall-clock time for the session: {waited:?}"
     );
     assert!(
-        fake.scripts().last().unwrap().contains("rm -rf $d"),
+        fake.0.scripts().last().unwrap().contains("rm -rf \"$d\""),
         "the job is still removed"
     );
+}
+
+#[test]
+fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
+    // A probe that takes real time must eat into the bound: with a no-op pause
+    // the only time passing is the probes' own, and the bound still ends the
+    // wait instead of running on for the number of pauses it would take.
+    struct Slow(Fake);
+    impl mule::transport::Transport for Slow {
+        fn run_unlocked(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
+            std::thread::sleep(Duration::from_millis(100));
+            self.0.run_unlocked(host, script)
+        }
+        fn mux_op(&self, host: &Host, op: mule::transport::MuxOp) -> anyhow::Result<Output> {
+            self.0.mux_op(host, op)
+        }
+    }
+    let fake = Fake::new();
+    for _ in 0..100 {
+        fake.push(state("rc=0\nalive=1"));
+    }
+    let slow = Slow(fake);
+    let started = Instant::now();
+
+    // Pauses are no-ops; each probe costs 100ms. 500ms of bound means about
+    // five probes, not the fifty a pause-counting bound would need.
+    let _ = finish_within(
+        &slow,
+        &host(),
+        &id(),
+        Duration::from_millis(500),
+        &no_pause(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(1500),
+        "bound ignored probe time: {waited:?}"
+    );
+    assert!(slow.0.scripts().len() < 15, "{}", slow.0.scripts().len());
+}
+
+#[test]
+fn a_failed_removal_is_a_fatal_exit_one_naming_it_never_the_commands_code() {
+    let fake = Fake::new();
+    fake.push(state("rc=0\nalive=0"));
+    // The collect script's removal step failed: its own status, with the proof
+    // script's reason on stderr.
+    fake.push(Output {
+        stdout: b"trunc=0\nlive=0\nlog=3\nerr=0\nbytes:\nhi\n".to_vec(),
+        stderr: "state dir /x could not be removed (kept)\n".into(),
+        code: 97,
+    });
+
+    let error = finish(
+        &fake,
+        &host(),
+        &id(),
+        &no_pause(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+
+    let text = format!("{error:#}");
+    assert!(text.contains("could not remove"), "{text}");
+    assert!(text.contains("could not be removed"), "{text}");
+    assert_eq!(mule::errors::exit_code(&error), 1);
+}
+
+#[test]
+fn the_collect_script_removes_with_the_rm_proof_not_a_bare_rm() {
+    let fake = Fake::new();
+    fake.push(state("rc=0\nalive=0"));
+    fake.push(collected(false, "", ""));
+
+    finish(
+        &fake,
+        &host(),
+        &id(),
+        &no_pause(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let scripts = fake.scripts();
+    let collect = scripts.last().unwrap();
+    assert!(
+        collect.contains("list-sessions"),
+        "removal is verified by seeing absence: {collect}"
+    );
+    assert!(collect.contains("cannot verify"), "{collect}");
 }

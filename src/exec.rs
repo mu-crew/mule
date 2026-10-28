@@ -42,7 +42,8 @@ const MAX_INTERVAL: Duration = Duration::from_secs(1);
 const SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a job with an `rc` may keep its session before exec gives up on the
-/// rest of its output. A drain takes milliseconds; a session that outlives this
+/// rest of its output. Wall-clock, probe round trips included: counting only
+/// the requested pauses let a slow probe stretch the bound well past 5s. A drain takes milliseconds; a session that outlives this
 /// is held open by a process the command left behind holding its stdout (`sleep
 /// 30 &`), and waiting longer would only be waiting for that process.
 const SESSION_END_WAIT: Duration = Duration::from_secs(5);
@@ -52,6 +53,11 @@ const SESSION_END_WAIT: Duration = Duration::from_secs(5);
 /// Dispatch is sub-second by invariant, but a holder whose ssh fell back to a
 /// direct connect can sit for a TCP timeout, and the signal path must not.
 const DISPATCH_GRACE: Duration = Duration::from_secs(3);
+
+/// The collect script's exit status when the read worked but removing the job
+/// did not. Distinct from ssh's own 255 and from a read failure, so the caller
+/// can still deliver the output it got and then fail naming the removal.
+const REMOVAL_FAILED: i32 = 97;
 
 /// How long a failure waits to learn whether a signal caused it.
 const SIGNAL_GRACE: Duration = Duration::from_millis(250);
@@ -99,12 +105,27 @@ pub fn finish(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
+    finish_within(transport, host, id, SESSION_END_WAIT, pause, out, err)
+}
+
+/// [`finish`] with the settle bound as a parameter, so a test can pin the
+/// wall-clock behaviour without spending 5s.
+pub fn finish_within(
+    transport: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    settle: Duration,
+    pause: &dyn Fn(Duration),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32> {
     let mut interval = FIRST_INTERVAL;
-    // Poll time spent waiting for a finished job's session to end, counted in
-    // requested pauses so a test's injected `pause` sees the same deadline.
-    let mut settled = Duration::ZERO;
+    // When the first probe that saw `rc` began. Measured on the wall clock and
+    // from before the probe, so the bound covers probe round trips too.
+    let mut settling: Option<Instant> = None;
     let code = loop {
         pause(interval);
+        let probed = Instant::now();
         // State only: the output comes back once, in the final read, so a
         // probe never ships bytes it would have to resend.
         let result = probe(transport, host, id, ProbeFrom::StateOnly).with_context(|| {
@@ -120,12 +141,14 @@ pub fn finish(
             // only when the whole pipeline has, so wait for that here, one
             // short probe at a time, rather than inside the one locked read
             // (a 5s wait there held the ticket and starved every other caller).
-            State::Done(code) if !result.alive || settled >= SESSION_END_WAIT => break code,
-            State::Done(_) => {
+            State::Done(code) => {
+                let since = *settling.get_or_insert(probed);
+                if !result.alive || since.elapsed() >= settle {
+                    break code;
+                }
                 // A drain is milliseconds; the probe's own round trip is the
                 // real spacing, so a short fixed pause is enough.
                 interval = SETTLE_INTERVAL;
-                settled += interval;
                 continue;
             }
             State::Orphan => return Err(MuleError::Orphan { id: id.to_string() }.into()),
@@ -147,6 +170,13 @@ pub fn finish(
 /// still alive means a process the command left behind holds its stdout: the
 /// output cannot be known complete, so exec returns exit 7 rather than the
 /// job's code beside a possibly-empty log, and still removes the job.
+///
+/// Removal is proved, not hoped for: it is `rm <id>`'s own script
+/// ([`crate::jobs::remove_one_script`]), so exit 0 means both sessions and the
+/// state directory are seen gone. If it cannot prove that, exec delivers what
+/// it read and then fails with exit 1 naming the leftover -- never the
+/// command's code, which would tell a caller (mu removes a worktree on success)
+/// that the job is gone when a session or its state is still on the host.
 fn collect(
     transport: &dyn Transport,
     host: &Host,
@@ -170,12 +200,11 @@ fn collect(
          if [ $es -gt {max} ]; then es={max}; t=1; fi; \
          printf 'trunc=%s\\nlive=%s\\nlog=%s\\nerr=%s\\nbytes:\\n' $t $live $ls $es; \
          head -c $ls $d/log 2>/dev/null; head -c $es $d/err 2>/dev/null; \
-         tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
-         tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
-         rm -rf $d || echo \"mule: could not remove job state $d\" >&2; exit 0"
+         ( {remove} ) >/dev/null || exit {REMOVAL_FAILED}; exit 0",
+        remove = crate::jobs::remove_one_script(host, id),
     );
     let output = transport.run(host, &script)?;
-    if output.code != 0 {
+    if output.code != 0 && output.code != REMOVAL_FAILED {
         bail!(
             "reading the command's output failed: {}",
             output.stderr.trim()
@@ -208,10 +237,12 @@ fn collect(
     out.write_all(&bytes[..log_len])?;
     out.flush()?;
     err.write_all(&bytes[log_len..log_len + err_len])?;
-    // A removal failure is mule talking about itself, so it is a fatal-grade
-    // line even though the command's result is still good.
-    if output.stderr.contains("could not remove") {
-        write!(err, "{}", output.stderr)?;
+    if output.code == REMOVAL_FAILED {
+        bail!(
+            "could not remove job {id} on {}: {}",
+            host.name,
+            output.stderr.trim()
+        );
     }
     if live {
         writeln!(
