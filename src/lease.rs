@@ -64,12 +64,26 @@ pub struct Request<'a> {
     pub metadata: JobMetadata,
 }
 
-/// Write `id` to `path` atomically: a temp file in the same directory (mode
-/// 0600, one line, fsynced), then a rename, then an fsync of the directory.
+/// How many fresh temp names `write_job_file` tries before giving up. Each is
+/// random, so a collision means somebody is planting names in the directory;
+/// a bound turns that into an error instead of a spin.
+const TEMP_ATTEMPTS: u32 = 16;
+
+/// Write `id` to `path` atomically: a fresh temp file in the same directory
+/// (one line, fsynced), then a rename, then an fsync of the directory.
 ///
 /// Atomic because mu polls for this file and parses its one line: a reader
 /// must never see a half-written handle. Durable because the file is the only
 /// pointer to the job if the lease is SIGKILLed a moment later.
+///
+/// The temp is created exclusively (`O_CREAT|O_EXCL`) and never through a
+/// symlink (`O_NOFOLLOW`), under a random name, then `fchmod`ed to 0600. The
+/// documented `--job-file /tmp/w1.job` sits in a world-writable directory, and
+/// the old predictable `F.tmp<pid>` opened with create+truncate let a planted
+/// symlink overwrite its target with the id and then become F itself, and let
+/// a planted 0644 file lend its mode to F (both reproduced, review round 1).
+/// An existing path is never opened, truncated or followed: a name that is
+/// taken is skipped for another.
 pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
@@ -78,26 +92,66 @@ pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
     let name = path
         .file_name()
         .with_context(|| format!("job file {} has no file name", path.display()))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(format!(".tmp{}", std::process::id()));
-    let tmp = dir.join(tmp_name);
+    let (tmp, mut file) = create_temp(&dir, name)
+        .with_context(|| format!("cannot write job file {}", path.display()))?;
     let written = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        // `mode` applies only at creation and is masked by the umask; the
+        // explicit fchmod makes 0600 the mode whatever the umask.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(format!("{id}\n").as_bytes())?;
         file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, path)?;
         // The rename is only durable once the directory entry is.
         std::fs::File::open(&dir)?.sync_all()
     })();
     if written.is_err() {
+        // Ours: created exclusively above, so removing it removes nobody
+        // else's file.
         let _ = std::fs::remove_file(&tmp);
     }
     written.with_context(|| format!("cannot write job file {}", path.display()))
+}
+
+/// Create a new, empty, private temp file beside the job file, under a name
+/// nobody else holds.
+fn create_temp(dir: &Path, name: &std::ffi::OsStr) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut last = None;
+    for _ in 0..TEMP_ATTEMPTS {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        tmp_name.push(format!(".tmp{}-{:016x}", std::process::id(), random_u64()));
+        let tmp = dir.join(tmp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((tmp, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no temp name tried")))
+}
+
+/// Unpredictable enough that a temp name cannot be planted ahead of time:
+/// `RandomState` is seeded from the OS per process and per instance. Not a
+/// secret -- `O_EXCL|O_NOFOLLOW` are what make a planted name harmless; the
+/// randomness only keeps a planter from forcing every retry to collide.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.finish()
 }
 
 /// Name the job, then dispatch it as `run --tui` does.
@@ -172,6 +226,9 @@ struct Holder<'a, 'h> {
     /// A change of state outside the mirror window earns one screen, fetched
     /// by the next tick's probe.
     want_screen: bool,
+    /// The job's code, seen by a state-only probe. The final screen is the
+    /// next tick's one locked call, not a second call in the seeing tick.
+    ending: Option<i32>,
 }
 
 impl Holder<'_, '_> {
@@ -292,6 +349,22 @@ impl Holder<'_, '_> {
             .collect()
     }
 
+    /// The tick after a state-only probe saw `Done(code)`: its one locked call
+    /// is the final capture. The code was decided by what was seen; a capture
+    /// that fails, or finds the state already removed, costs only the screen.
+    /// No drift repair: the job is over, and its forwards are about to go.
+    fn finish(&mut self, code: i32) -> i32 {
+        match probe(self.t, self.h.host, self.h.id, ProbeFrom::Screen) {
+            Ok(result) if matches!(result.state, State::Done(_)) => self.show(&result.bytes),
+            _ => {
+                let line = self.status_line();
+                self.say(&line);
+            }
+        }
+        self.unforward();
+        code
+    }
+
     fn unforward(&mut self) {
         if let Err(error) = forward::unforward(self.t, self.h.host, self.h.specs) {
             self.say(&format!("mule: {error:#}\n"));
@@ -301,6 +374,9 @@ impl Holder<'_, '_> {
     /// One tick. `Some(code)` ends the lease; `None` means hold on, with
     /// whether anything changed (for the cadence).
     fn tick(&mut self) -> (Option<i32>, bool) {
+        if let Some(code) = self.ending {
+            return (Some(self.finish(code)), true);
+        }
         // `-O check`: lock-free, no channel.
         let Some(pid) = forward::check_master(self.t, self.h.host) else {
             if self.link != Link::MasterGone {
@@ -356,21 +432,18 @@ impl Holder<'_, '_> {
         self.state = Some(result.state.clone());
 
         match result.state {
-            State::Done(code) => {
-                let screen = if from == ProbeFrom::Screen {
-                    Ok(result.bytes)
-                } else {
-                    probe(self.t, self.h.host, self.h.id, ProbeFrom::Screen).map(|p| p.bytes)
-                };
-                match screen {
-                    Ok(screen) => self.show(&screen),
-                    Err(_) => {
-                        let line = self.status_line();
-                        self.say(&line);
-                    }
-                }
+            State::Done(code) if from == ProbeFrom::Screen => {
+                self.show(&result.bytes);
                 self.unforward();
                 (Some(code), true)
+            }
+            State::Done(code) => {
+                // A state-only probe cannot know it will see the end, and a
+                // capture now would be a second locked call this tick (SPEC §
+                // Leases: one per tick, exit included). The next tick fetches
+                // the screen; the code is already decided.
+                self.ending = Some(code);
+                (None, true)
             }
             State::Orphan => {
                 let line = self.status_line();
@@ -432,6 +505,7 @@ pub fn hold(
         forward_error: None,
         last_screen: None,
         want_screen: false,
+        ending: None,
     };
     let line = holder.status_line();
     holder.say(&line);

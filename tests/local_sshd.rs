@@ -2808,13 +2808,46 @@ impl Drop for Pane {
     }
 }
 
+/// An `ssh` shim that logs `s` when an ssh starts and `e` when it ends, so a
+/// test can see that nothing is in flight and how long since anything ran.
+fn activity_ssh(sshd: &Sshd, log: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = sshd.dir.join("activity");
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("ssh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh
+echo s >> '{log}'
+'{ssh}' \"$@\"\nrc=$?\necho e >> '{log}'\nexit $rc\n",
+            log = log.display(),
+            ssh = sshd.dir.join("ssh").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// Which `ssh` the lease in the pane runs.
+#[derive(Clone, Copy)]
+enum Shim {
+    /// Every probe sleeps 5s after writing its pid to the flag file.
+    SlowProbe,
+    /// Every ssh is logged to the flag file as it starts and ends.
+    Activity,
+}
+
 /// Run a lease in a tmux pane, kill the pane when `ready` says so, and check
 /// what a pane death must leave behind: exit 129 (no panic), the job's session
 /// and state gone, the forward cancelled, LOCAL gone.
+///
+/// `ready` gets the pane (to send it keys) and the shim's flag file.
 fn kill_pane_ends_the_lease_and_its_job(
     tag: &str,
-    slow_probe: bool,
-    ready: &dyn Fn(&Sshd, &std::path::Path) -> bool,
+    shim: Shim,
+    ready: &dyn Fn(&Pane, &std::path::Path) -> bool,
 ) {
     require_sshd!();
     if std::process::Command::new("tmux")
@@ -2832,11 +2865,12 @@ fn kill_pane_ends_the_lease_and_its_job(
     let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
     let _serve = Serve::start(remote.clone(), "pane");
     let job_file = sshd.dir.join("pane.job");
-    let flag = sshd.dir.join("probe-in-flight");
-    let mut path = sshd.path_env();
-    if slow_probe {
-        path = format!("{}:{path}", slow_probe_ssh(&sshd, &flag).display());
-    }
+    let flag = sshd.dir.join("shim-flag");
+    let shim_dir = match shim {
+        Shim::SlowProbe => slow_probe_ssh(&sshd, &flag),
+        Shim::Activity => activity_ssh(&sshd, &flag),
+    };
+    let path = format!("{}:{}", shim_dir.display(), sshd.path_env());
     let status = sshd.dir.join("status");
     let stderr = sshd.dir.join("stderr");
 
@@ -2899,7 +2933,7 @@ fn kill_pane_ends_the_lease_and_its_job(
     wait_until(
         "the moment to kill the pane",
         Duration::from_secs(20),
-        || ready(&sshd, &flag),
+        || ready(&pane, &flag),
     );
 
     let killed = pane.tmux(&["kill-pane", "-t", "lease"]);
@@ -2944,11 +2978,54 @@ fn kill_pane_ends_the_lease_and_its_job(
     assert_eq!(through(&local), "fresh");
 }
 
+/// The quiet that proves the lease is stuck in a write: longer than the hold
+/// loop's longest pause (5s) plus margin. Every tick starts with an `ssh -O
+/// check`, so a lease that is neither in an ssh nor in its pause runs one at
+/// least every 5s; with nothing in flight and nothing run for this long, the
+/// only place left for it to be is a blocked write to the pane.
+const STUCK_IN_WRITE: Duration = Duration::from_millis(6500);
+
 #[test]
 fn kill_pane_mid_print_stops_the_job_and_cancels_the_forward_without_a_panic() {
-    // The job prints every 200ms and the lease mirrors it every tick, so the
-    // pane dies while the lease is writing to it.
-    kill_pane_ends_the_lease_and_its_job("lease-kpprint", false, &|_, _| {
+    // XOFF (C-s) freezes the pane's tty: output queues and, once the queue is
+    // full, the lease's next write blocks in the kernel (measured: a writer in
+    // a frozen tmux pane makes no progress until C-q). The job prints every
+    // 200ms, so every mirrored screen differs and the lease writes ~5KB each
+    // second -- the queue fills within a few ticks. The pane is killed only
+    // once the activity log shows the lease is stuck there, so the hangup
+    // lands on a write in progress, not on a sleep or a probe.
+    let frozen: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::default();
+    let seen: std::cell::RefCell<(String, std::time::Instant)> =
+        std::cell::RefCell::new((String::new(), std::time::Instant::now()));
+    kill_pane_ends_the_lease_and_its_job("lease-kpprint", Shim::Activity, &|pane, log| {
+        if frozen.get().is_none() {
+            // Let the mirror get going (screens are being written) first.
+            std::thread::sleep(Duration::from_millis(1500));
+            let out = pane.tmux(&["send-keys", "-t", "lease", "C-s"]);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            frozen.set(Some(std::time::Instant::now()));
+            return false;
+        }
+        let text = std::fs::read_to_string(log).unwrap_or_default();
+        let mut seen = seen.borrow_mut();
+        if text != seen.0 {
+            *seen = (text, std::time::Instant::now());
+            return false;
+        }
+        let in_flight = seen.0.matches('s').count() != seen.0.matches('e').count();
+        !in_flight && seen.1.elapsed() >= STUCK_IN_WRITE
+    });
+}
+
+#[test]
+fn kill_pane_while_holding_stops_the_job_and_cancels_the_forward() {
+    // The ordinary hangup: the pane dies at whatever moment the lease is in,
+    // almost always its pause between ticks.
+    kill_pane_ends_the_lease_and_its_job("lease-kphold", Shim::Activity, &|_, _| {
         std::thread::sleep(Duration::from_millis(2500));
         true
     });
@@ -2956,7 +3033,7 @@ fn kill_pane_mid_print_stops_the_job_and_cancels_the_forward_without_a_panic() {
 
 #[test]
 fn kill_pane_mid_probe_abandons_the_probe_and_still_stops_the_job() {
-    kill_pane_ends_the_lease_and_its_job("lease-kpprobe", true, &|_, flag| {
+    kill_pane_ends_the_lease_and_its_job("lease-kpprobe", Shim::SlowProbe, &|_, flag| {
         std::fs::read_to_string(flag).is_ok_and(|pid| !pid.trim().is_empty())
     });
 }
