@@ -29,7 +29,8 @@ mule tail --transcript "$id"    # raw terminal transcript, explicitly
 ```
 
 TUI dispatch prints pasteable `murmur pick`, `mu agent spawn`, and
-`mule kill --rm` commands on stderr. `tail -f` refuses TUI jobs because a redraw
+`mule kill --rm` commands on stderr. A mu worker uses `run --lease` instead
+(below): its pane is the job's life, not a viewer. `tail -f` refuses TUI jobs because a redraw
 stream is not a useful log; use the screen or attach through murmur instead.
 
 ## The job's shell
@@ -153,6 +154,43 @@ that recorded forward too: leaving it in the master's table would let the next
 Concurrent `forward`/`unforward` of the same LOCAL take turns on a local lock;
 different LOCALs never wait on each other.
 
+## Holding a job for a pane's life: `run --lease`
+
+```sh
+mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] \
+  --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>
+```
+
+For a local pane whose life must be the job's: a mu remote worker, run by mu's
+lease profile. It is `run --tui` plus a foreground holder, and holds no session
+in between: a probe per tick (1s settling to 5s) over mule's own connection.
+
+- **The id is in `F` before the job exists** (one line, mode 0600, written
+  atomically). If the write fails, nothing is dispatched (exit 1). The stop is
+  always `mule rm --host H $(cat F)`, even if the lease died a moment after
+  writing it.
+- **Forwards** each `--forward-unix` as `mule forward` does, straight away
+  (REMOTE need not exist yet), and re-forwards when LOCAL is removed or
+  replaced, or the master is replaced.
+- **Exits with the job.** The job's own code when it ends; 1 if it is missing;
+  5 if orphaned. On the way out it prints the final screen and unforwards.
+- **A lost master does not end it.** It prints once `master for H is gone; a
+  human must run: ssh -MNf …`, keeps checking every 5s, and re-forwards when the
+  master is back. Exit 3 happens only at startup, before anything is dispatched.
+- **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143) through a detached
+  `mule rm`, and cancel the forwards. Closing the pane is a SIGHUP. `kill -9`
+  cannot be handled: the job keeps running and `F` names it.
+- **The pane shows** a status line (job, host, state, forwards, the
+  `murmur pick --all  # select mule-<id>` attach command and the stop command)
+  and mirrors the remote screen for 30s after the first forward, then only on
+  a change of state and at exit. Keystrokes are not forwarded; attach through
+  murmur to interact.
+
+```sh
+mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
+  --forward-unix /tmp/w1.sock:/home/me/.mu/w1.sock -- env K=v sh -c 'pi'
+```
+
 ## Running a command and waiting: `exec`
 
 ```sh
@@ -198,11 +236,12 @@ only). `mule host info` probes OS, cores, RAM, and GPU and takes the lock.
 | Code | Meaning |
 | --- | --- |
 | 0 | mule operation or job succeeded |
-| 3 | No SSH control master: a human must open it (see the README) |
+| 3 | No SSH control master: a human must open it (see the README). `run --lease`: only at startup |
 | 4 | Timed out waiting (`wait --timeout`); the job keeps running |
-| 5 | Orphaned job: no exit code will arrive |
+| 5 | Orphaned job: no exit code will arrive (`run --lease` too) |
 | 6 | Connection dropped while waiting; wait again |
 | 7 | `exec` only: output incomplete (truncated at `max_log_bytes`, or a leftover process still holds the job's stdout) |
-| *n* | `wait`, `run --wait` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
+| *n* | `wait`, `run --wait`, `run --lease` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
+| 129/130/143 | `exec` and `run --lease` after SIGHUP/SIGINT/SIGTERM: the job was stopped |
 
 `mule --help` carries the same table.

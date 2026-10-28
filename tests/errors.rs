@@ -194,7 +194,9 @@ fn top_level_help_documents_the_operational_contract_and_exit_table() {
         "6   connection dropped while waiting",
         "7   exec only: output incomplete -- truncated at max_log_bytes, or a process",
         "still holds the job's stdout",
-        "<n> wait/--wait return the job's own exit code",
+        "<n> wait/--wait/--lease return the job's own exit code",
+        "129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM",
+        "run --lease exits 3 only at startup",
     ] {
         assert!(help.contains(text), "help missing {text:?}:\n{help}");
     }

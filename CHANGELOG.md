@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+**`mule run --lease --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>`**
+holds a TUI job for a local pane's life, for mu's lease transport. It writes the
+job id to `F` (atomic, 0600, one line) *before* dispatching, so the job can
+always be stopped with `mule rm <id>`; forwards each socket and re-forwards on
+drift (LOCAL removed or replaced, master replaced); exits with the job's code
+(1 missing, 5 orphan) after printing its final screen and unforwarding. A lost
+master or a dropped probe prints a hand-back line once and keeps holding: exit 3
+only at startup. SIGHUP/SIGINT/SIGTERM stop the job through the detached `mule
+rm` and exit 129/130/143. The pane shows a status line (job, host, state,
+forwards, `murmur pick --all  # select mule-<id>`, the stop command) and mirrors
+the remote screen for 30s after the first forward, then on state changes.
+
+The poll probe gains a screen mode that carries `capture-pane` in the same
+locked call, so mirroring costs no extra round trip.
+
 **`mule rm <id>` exit 0 now proves the job is stopped and gone.** It used to
 exit 0 even when `kill-session` did not take or `rm -rf` failed. Now it verifies
 that neither `mule-<id>` nor `watch-<id>` exists and the state directory is

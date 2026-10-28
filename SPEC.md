@@ -66,6 +66,30 @@ The lock poll interval is **5ms**. With four callers, five rounds each, and **50
 
 A lease is a per-job foreground waiter, like `run --wait`. It holds a forward listener, which is not a session. It re-arms forwards after drift. It never re-dispatches, retries, queues or places a job, and every ssh call it makes is sub-second. The carve-out from [Add a local scheduler or supervisor](#add-a-local-scheduler-or-supervisor) covers idempotent forward repair only.
 
+### `mule run --lease`
+
+```text
+mule run --lease [--host H] [--cwd D] [--human] [--max-secs S]
+         --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>
+```
+
+The process mu runs as a remote worker's pane: it lives exactly as long as its job. `--lease` implies `--tui`, requires `--job-file`, and conflicts with `--wait`/`--no-tail`. It lives in `lease.rs`.
+
+1. **Name the job first.** Generate the id and write it to `F` -- a temp file in the same directory, mode 0600, one line, fsynced, renamed over `F`, then the directory fsynced -- *before* the dispatch ssh starts. A write failure exits 1 with nothing dispatched. A lease that dies after the write leaves a name whose `mule rm` is a no-op if the dispatch never ran, so no window remains in which a job exists that nobody can name.
+2. **Dispatch** the job exactly as `run --tui` does (`run::dispatch_with_id`). No master is exit 3, the lease's only exit 3.
+3. **Forward** each spec through `forward`, without waiting for REMOTE: it is resolved per connection, and mu's ctl handshake retries `refused` itself.
+4. **Hold.** One `-O check` (lock-free), a local drift check, and one locked probe per tick, at 1s settling to 5s and resetting on change.
+   - `rc` present: print the final screen, unforward, exit with the job's code. Orphan: unforward, exit 5. Missing: unforward, exit 1.
+   - Master gone, or the probe failed mid-call: **do not exit** -- exiting tells mu the agent died while it still runs. Print once `master for H is gone; a human must run: ssh -MNf …` (or `lost contact`), then check every 5s. When the master returns, the drift check re-forwards.
+   - Drift: no record, LOCAL's dev+inode not the recorded ones, or the master pid not the recorded one (a replaced master has none of the old forwards). Re-run `forward` for those specs only. All local stat plus `-O check`: no channel. A wedge seen here prints the hand-back line once and keeps holding.
+5. **Screen.** A status line names the job, host, state, forwards, the literal `murmur pick --all  # select mule-<id>` (printed, never run) and `mule rm --host H <id>`. While mirroring, the probe is `From::Screen`: the same locked call also runs `capture-pane -p -J` (falling back to the saved `screen`, never the transcript). The screen is mirrored until **30s** after the first successful forward -- enough for mu's startup scan and `mu agent read` -- and after that a probe carries the capture only on the tick after a change of state, and at exit. Stdin is not forwarded. Every write is fallible and ignored.
+6. **Signals** (SIGHUP, SIGTERM, SIGINT), through [detached cleanup](#detached-cleanup): `dup2` `/dev/null` onto fds 1 and 2, spawn the detached `mule rm <id>`, run `unforward` (lock-free; bounded at 1s on a thread, since the main thread may hold a LOCAL's flock), exit 129/143/130. The main thread parks; an in-flight probe is abandoned and its ticket is released by pid death. A signal while the dispatch ssh is in flight waits up to 3s for it first, as exec does; a signal before the job is named stops nothing, because nothing was dispatched.
+7. **SIGKILL** leaves the job running, the forward in the master and `F` naming the job. mu's stop template ends the job; the next `forward` of the same LOCAL replaces the stale listener.
+
+**Exit codes:** the job's own code; 1 missing; 3 only at startup; 5 orphan; 129/130/143 after a signal. These overlap the job's codes, and mu reads none of them: only pane liveness.
+
+**Cost:** one locked call per tick, 1s settling to 5s, with the capture folded in during the mirror window. Four leases at 5s are 0.8 calls/s, roughly 3-8 % channel occupancy at 30-100ms each, fair through the ticket lock.
+
 ### Forwards
 
 `mule forward --unix LOCAL:REMOTE` and `mule unforward` carry control-sized unix sockets over mule's master. OpenSSH's answers cannot be trusted, so each was measured on a loopback `MaxSessions 1` sshd (OpenSSH_10.3p1):
@@ -225,6 +249,8 @@ mule ls [--host H] [--all] [--json] [--full]
 mule kill <id> [--host H] [--rm]
 mule rm [<id> | --all] [--host H]
 mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>
+mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] --job-file F [--forward-unix L:R ...] -- <cmd>
+mule forward | unforward [--host H] --unix LOCAL:REMOTE ...
 mule host list [--json]
 mule host info [--host H] [--json]
 ```
@@ -382,7 +408,7 @@ The design separates four kinds of evidence:
 | --- | --- | --- |
 | 1 | Logic through a fake `Transport`: config, IDs, scripts, state mapping, and lock ordering | None |
 | 2 | The generated wrapper (including `exec`'s split-stream mode) against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
-| 3 | Channel isolation, gated concurrency, dispatch latency, bounded wait, and `exec`'s signal cleanup (private config, no `mule` on PATH, queued behind a held ticket) | Local `sshd` recipe above |
+| 3 | Channel isolation, gated concurrency, dispatch latency, bounded wait, `exec`'s signal cleanup (private config, no `mule` on PATH, queued behind a held ticket), and the lease (traffic during a hold, drift and master-restart re-forward, `tmux kill-pane` mid-print and mid-probe, `kill -9`) | Local `sshd` recipe above |
 | 3b | The 2FA-specific error text and network latency | A capped host and a live master |
 
 Layer 2 uses a private tmux socket and no personal config. It catches quoting, `rc` writes, kill status **137**, and shell exit-code propagation that a fake transport cannot test. Layer 3 reproduces the channel cap without privileged setup. Layer 3b is the only layer that needs a token tap.
@@ -477,7 +503,7 @@ Unix control-socket forwards (`mule forward`) are the one exemption, because the
 
 ### Add a local scheduler or supervisor
 
-Detached tmux and durable artifacts provide survival and completion without a daemon. Reconnect logic, retries, and placement policy would turn a dispatcher into an orchestrator. The one carve-out is idempotent forward repair (see [Leases](#leases)).
+Detached tmux and durable artifacts provide survival and completion without a daemon. Reconnect logic, retries, and placement policy would turn a dispatcher into an orchestrator. The one carve-out is idempotent forward repair (see [Leases](#leases)): a lease is a foreground waiter for one job, it re-arms that job's forwards after drift, and it never re-dispatches, retries, queues or places a job. It is not a daemon -- it is the pane's process and dies with the pane.
 
 ## Deferred choices
 
