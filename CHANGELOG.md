@@ -28,6 +28,13 @@ through a detached `mule rm` and exit 129/130/143.
 its stdout, so the log cannot be known complete. exec no longer returns the
 job's code beside a possibly-empty log in that case.
 
+`exec` removal failure is fatal: the collect step now runs `rm <id>`'s proof
+(sessions and state directory seen gone) and, if it cannot, exits 1 naming the
+leftover instead of returning the command's code. The 5s wait for a finished
+job's session to end is wall-clock (probe time counts), not summed pauses.
+`mule --help` and `mule exec --help` describe exit 7 as "output incomplete:
+truncated at max_log_bytes, or a process still holds the job's stdout".
+
 No locked call in `exec` waits: the wait for the job's session to end moved out
 of the collect round trip (which held the ticket ~14s) into the unlocked poll
 loop. A stop signal that arrives with a probe in flight now always gives exit

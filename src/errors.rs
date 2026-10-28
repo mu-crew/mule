@@ -6,8 +6,9 @@ pub const EXIT_NO_MASTER: i32 = 3;
 pub const EXIT_TIMEOUT: i32 = 4;
 pub const EXIT_ORPHAN: i32 = 5;
 pub const EXIT_DROPPED: i32 = 6;
-/// `mule exec` only: the command's output hit `max_log_bytes`, so what was
-/// printed is partial. Reported instead of the job's own code so a caller that
+/// `mule exec` only: the output is incomplete -- truncated at `max_log_bytes`,
+/// or a process still holds the job's stdout -- so what was printed is partial.
+/// Reported instead of the job's own code so a caller that
 /// parses stdout can never mistake a prefix for the whole answer.
 pub const EXIT_TRUNCATED: i32 = 7;
 
