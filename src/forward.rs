@@ -24,8 +24,19 @@
 //! So `forward` verifies by `connect`, and keeps a small record per LOCAL so a
 //! changed REMOTE cancels the *old* spec first. OpenSSH has no `-O list`; the
 //! record is forward state for the master mule owns, not a job index.
+//!
+//! The record only helps if nobody else changes the LOCAL between reading it
+//! and writing it. Two concurrent `forward`s of one LOCAL to different REMOTEs
+//! both passed the pre-cancel before either wrote a record, then both added
+//! their forward: the wedge, made by mule itself (reproduced against a loopback
+//! sshd: 5 of 40 racing pairs both exited 0, and all 40 left the master wedged).
+//! So every mutation of one LOCAL -- `forward` and `unforward` -- runs under an
+//! exclusive per-(host, LOCAL) file lock ([`lock_local`]). It is deliberately
+//! *not* the session ticket lock: forwards are not sessions, and queueing them
+//! behind a held session would break the property they exist for.
 
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -184,8 +195,66 @@ fn write_record(host: &Host, record: &Record) -> Result<()> {
         .with_context(|| format!("cannot write forward record {}", path.display()))
 }
 
-fn delete_record(host: &Host, local: &Path) {
-    let _ = std::fs::remove_file(record_path(host, local));
+/// Delete the record. Already gone is success: that is what idempotent means.
+fn delete_record(host: &Host, local: &Path) -> Result<()> {
+    let path = record_path(host, local);
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("cannot delete forward record {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Exclusive hold on one LOCAL of one host; released on drop.
+///
+/// `flock` rather than a sentinel file: the kernel releases it when the holder
+/// dies, so a `kill -9` mid-forward cannot leave a LOCAL locked forever. The
+/// lock file itself is never deleted -- unlinking a flock file lets a second
+/// caller lock a new inode while the first still holds the old one.
+#[derive(Debug)]
+pub struct LocalLock {
+    _file: std::fs::File,
+}
+
+/// Block until this process holds the exclusive lock for `(host, local)`.
+///
+/// Never a timeout, for the reason the ticket lock has none: the holder is
+/// inside a few sub-second mux ops, and giving up would just run the race.
+/// Different LOCALs hash to different files and never wait on one another.
+pub fn lock_local(host: &Host, local: &Path) -> Result<LocalLock> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    // LOCK_EX; the same value on Linux and macOS, as in `lock.rs`.
+    const LOCK_EX: i32 = 2;
+
+    let path = record_path(host, local).with_extension("lock");
+    let dir = path.parent().expect("lock paths have a parent");
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("cannot create forward state {}", dir.display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("cannot open forward lock {}", path.display()))?;
+    // The lock is per open file description, so two threads of one process
+    // exclude each other too, which the layer-1 tests rely on.
+    loop {
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+            return Ok(LocalLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error)
+                .with_context(|| format!("cannot lock forward state {}", path.display()));
+        }
+    }
 }
 
 /// The master pid from `-O check`'s `Master running (pid=N)`. ssh prints it on
@@ -264,7 +333,7 @@ pub fn forward(t: &dyn Transport, host: &Host, specs: &[Spec]) -> Result<()> {
                 // Only what this call added: the caller asked for the set, and
                 // a half-applied set is harder to reason about than none.
                 for spec in added {
-                    undo(t, host, spec);
+                    undo_best_effort(t, host, spec);
                 }
                 return Err(error.context(format!(
                     "forwarding {}:{} failed",
@@ -278,6 +347,9 @@ pub fn forward(t: &dyn Transport, host: &Host, specs: &[Spec]) -> Result<()> {
 }
 
 fn forward_one(t: &dyn Transport, host: &Host, spec: &Spec, pid: Option<u32>) -> Result<()> {
+    // Held from the record read to the record write: the whole sequence is one
+    // transaction on this LOCAL. Dropped on every return path.
+    let _lock = lock_local(host, &spec.local)?;
     // 1. Same LOCAL, different REMOTE, same master: the recorded forward is
     //    still in that master's table. Cancel it first or the new one wedges it.
     if let Some(old) = read_record(host, &spec.local)
@@ -324,23 +396,64 @@ fn forward_one(t: &dyn Transport, host: &Host, spec: &Spec, pid: Option<u32>) ->
         dev,
         ino,
     };
-    write_record(host, &record).inspect_err(|_| undo(t, host, spec))
+    write_record(host, &record).inspect_err(|_| {
+        // The lock is already ours; `undo_best_effort` would wait on it forever.
+        let _ = undo(t, host, spec);
+    })
 }
 
-/// Cancel, unlink and forget one spec. Never fails: callers are cleanup paths.
-fn undo(t: &dyn Transport, host: &Host, spec: &Spec) {
+/// Cancel, unlink and forget one spec; the caller holds the LOCAL's lock.
+///
+/// Idempotent: a missing socket, a missing record and a master that is gone are
+/// all success. A *real* local failure is not, and the record is then kept: it
+/// is the only trace that LOCAL is still ours to clean up.
+fn undo(t: &dyn Transport, host: &Host, spec: &Spec) -> Result<()> {
     cancel(t, host, spec.local.clone(), spec.remote.clone());
     // Not `unlink_socket`: a non-socket here is not ours, and is left alone.
-    if std::fs::symlink_metadata(&spec.local).is_ok_and(|m| m.file_type().is_socket()) {
-        let _ = std::fs::remove_file(&spec.local);
+    match std::fs::symlink_metadata(&spec.local) {
+        Ok(meta) if meta.file_type().is_socket() => match std::fs::remove_file(&spec.local) {
+            Err(error) if error.kind() != ErrorKind::NotFound => {
+                return Err(error)
+                    .with_context(|| format!("cannot remove socket {}", spec.local.display()));
+            }
+            _ => {}
+        },
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot stat {}", spec.local.display()));
+        }
     }
-    delete_record(host, &spec.local);
+    delete_record(host, &spec.local)
+}
+
+/// [`undo`] under the LOCAL's lock, ignoring every failure. For cleanup paths
+/// (a failed `forward`'s rollback, signal handlers) that have no one to tell
+/// and must not turn the original error into a different one.
+pub fn undo_best_effort(t: &dyn Transport, host: &Host, spec: &Spec) {
+    // If the lock cannot be taken at all, cleaning up unlocked beats leaving
+    // the forward behind.
+    let _lock = lock_local(host, &spec.local).ok();
+    let _ = undo(t, host, spec);
 }
 
 /// Undo each spec. Idempotent, and needs no master: `cancel` of a master that
 /// is gone fails harmlessly, and the file and record are still ours to remove.
-pub fn unforward(t: &dyn Transport, host: &Host, specs: &[Spec]) {
+///
+/// Every spec is attempted, then the failures are reported together: one
+/// unwritable directory must not leave the other forwards in place. A real
+/// local I/O failure is an error (exit 1) rather than a silent success that
+/// leaves LOCAL behind.
+pub fn unforward(t: &dyn Transport, host: &Host, specs: &[Spec]) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
     for spec in specs {
-        undo(t, host, spec);
+        let result = lock_local(host, &spec.local).and_then(|_lock| undo(t, host, spec));
+        if let Err(error) = result {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    match failures.len() {
+        0 => Ok(()),
+        _ => bail!("unforward failed: {}", failures.join("; ")),
     }
 }

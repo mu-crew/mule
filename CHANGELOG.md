@@ -22,6 +22,12 @@ each forward so changing one LOCAL's REMOTE cannot wedge the master's forward
 table, and exits **3** with `ssh -O exit` and the master command if the table is
 wedged anyway. Unix sockets only; TCP stays out.
 
+Changes to one LOCAL are serialised by an exclusive per-(host, LOCAL) file lock,
+so two concurrent `forward`s of it to different REMOTEs can no longer wedge the
+master. `unforward` exits 1, naming the path and keeping the record, when it
+cannot remove LOCAL or the record; a missing socket, record or master is still
+success.
+
 `Transport::mux_op` is the new lock-free path (`-O check`, `-O forward`,
 `-O cancel` for local unix forwards), as a closed enum so the exemption cannot
 widen by accident. `master_alive` is now `mux_op(Check)`.

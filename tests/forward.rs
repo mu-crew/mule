@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_NO_MASTER, exit_code};
-use mule::forward::{Spec, forward, read_record, unforward};
+use mule::forward::{Spec, forward, lock_local, read_record, unforward};
 use mule::transport::{Fake, MuxOp};
 
 fn isolate_state() {
@@ -298,13 +298,13 @@ fn unforward_cancels_unlinks_forgets_and_is_idempotent() {
     forward(&fake, &host(), &[spec(&local, "/r/x")]).unwrap();
     assert!(local.exists());
 
-    unforward(&fake, &host(), &[spec(&local, "/r/x")]);
+    unforward(&fake, &host(), &[spec(&local, "/r/x")]).unwrap();
     assert!(!local.exists());
     assert!(read_record(&host(), &local).is_none());
     assert!(held.lock().unwrap().is_empty());
 
     // Again, and with no master at all.
-    unforward(&Fake::no_master(), &host(), &[spec(&local, "/r/x")]);
+    unforward(&Fake::no_master(), &host(), &[spec(&local, "/r/x")]).unwrap();
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn unforward_leaves_a_non_socket_alone() {
     let dir = scratch();
     let local = dir.join("h");
     std::fs::write(&local, "keep").unwrap();
-    unforward(&Fake::new(), &host(), &[spec(&local, "/r/x")]);
+    unforward(&Fake::new(), &host(), &[spec(&local, "/r/x")]).unwrap();
     assert_eq!(std::fs::read_to_string(&local).unwrap(), "keep");
 }
 
@@ -366,4 +366,98 @@ fn the_master_command_sets_stream_local_bind_unlink() {
         "{command}"
     );
     assert!(command.contains("ssh -MNf"), "{command}");
+}
+
+/// Run `f` on a thread and report whether it finished within `wait`.
+fn finishes_within<T: Send + 'static>(
+    wait: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> (bool, std::thread::JoinHandle<T>) {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        let out = f();
+        flag.store(true, Ordering::SeqCst);
+        out
+    });
+    std::thread::sleep(wait);
+    (done.load(Ordering::SeqCst), handle)
+}
+
+/// While another holder has LOCAL's lock, `op` must not finish; once released
+/// it must. Layer-1 evidence for lock acquisition order.
+fn assert_waits_for_the_lock(name: &str, op: impl FnOnce(&Path) + Send + 'static) {
+    use std::time::Duration;
+    isolate_state();
+    let dir = scratch();
+    let local = dir.join("lk.sock");
+    let lock = lock_local(&host(), &local).unwrap();
+    let target = local.clone();
+    let (finished, handle) = finishes_within(Duration::from_millis(300), move || op(&target));
+    assert!(!finished, "{name} must wait for the LOCAL's lock");
+    drop(lock);
+    handle.join().unwrap();
+}
+
+#[test]
+fn forward_waits_for_the_locals_lock() {
+    assert_waits_for_the_lock("forward", |local| {
+        let fake = Fake::new();
+        master(&fake);
+        forward(&fake, &host(), &[spec(local, "/r/x")]).unwrap();
+    });
+}
+
+#[test]
+fn unforward_waits_for_the_locals_lock() {
+    assert_waits_for_the_lock("unforward", |local| {
+        unforward(&Fake::new(), &host(), &[spec(local, "/r/x")]).unwrap();
+    });
+}
+
+#[test]
+fn a_held_lock_on_another_local_does_not_block() {
+    use std::time::Duration;
+    isolate_state();
+    let dir = scratch();
+    let _held = lock_local(&host(), &dir.join("other.sock")).unwrap();
+    let s = spec(&dir.join("lk.sock"), "/r/x");
+    let (finished, handle) = finishes_within(Duration::from_millis(300), move || {
+        unforward(&Fake::new(), &host(), &[s]).unwrap()
+    });
+    assert!(finished, "a different LOCAL's lock must not block this one");
+    handle.join().unwrap();
+}
+
+#[test]
+fn unforward_fails_with_exit_one_on_a_real_unlink_error_and_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+    isolate_state();
+    let dir = scratch();
+    let sub = dir.join("ro");
+    std::fs::create_dir(&sub).unwrap();
+    let local = sub.join("g.sock");
+    let fake = Fake::new();
+    master(&fake);
+    forward(&fake, &host(), &[spec(&local, "/r/x")]).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = unforward(&fake, &host(), &[spec(&local, "/r/x")]);
+    let kept = read_record(&host(), &local).is_some();
+    let remains = local.exists();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    if !remains {
+        eprintln!("skipping: permissions are not enforced here (root?)");
+        return;
+    }
+    let error = result.expect_err("a failed unlink is not success");
+    assert_eq!(exit_code(&error), 1);
+    assert!(format!("{error:#}").contains("g.sock"), "{error:#}");
+    assert!(kept, "the record is the only trace of what is left");
+
+    // And once the cause is fixed, the same call finishes the job.
+    unforward(&fake, &host(), &[spec(&local, "/r/x")]).unwrap();
+    assert!(!local.exists());
+    assert!(read_record(&host(), &local).is_none());
 }
