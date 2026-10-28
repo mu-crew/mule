@@ -408,6 +408,18 @@ fn forward_one(t: &dyn Transport, host: &Host, spec: &Spec, pid: Option<u32>) ->
 /// all success. A *real* local failure is not, and the record is then kept: it
 /// is the only trace that LOCAL is still ours to clean up.
 fn undo(t: &dyn Transport, host: &Host, spec: &Spec) -> Result<()> {
+    // The record may name a different REMOTE than the one asked for: that
+    // forward is still in the master's table, and unlinking LOCAL and deleting
+    // the record would orphan it. The next forward of LOCAL would then add a
+    // second REMOTE to the same LOCAL -- the wedge. Cancel it first, as
+    // `forward_one` step 1 does. No master-pid check: `unforward` needs no
+    // master, and a cancel the master does not know is `port not found`, exit
+    // 0, harmless. Read under the caller's lock, like every record read.
+    if let Some(old) = read_record(host, &spec.local)
+        && old.remote != spec.remote
+    {
+        cancel(t, host, old.local, old.remote);
+    }
     cancel(t, host, spec.local.clone(), spec.remote.clone());
     // Not `unlink_socket`: a non-socket here is not ours, and is left alone.
     match std::fs::symlink_metadata(&spec.local) {

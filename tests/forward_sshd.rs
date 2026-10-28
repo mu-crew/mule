@@ -202,3 +202,34 @@ fn concurrent_forwards_of_one_local_leave_one_consistent_record_and_no_wedge() {
     forward(&serial, &host, &[spec(&local, &r1)]).unwrap();
     assert_eq!(through(&local), "one");
 }
+
+/// `unforward L:R2` while the record names L:R1. Without cancelling R1 it
+/// unlinked LOCAL and deleted the record while R1 stayed in the master's table;
+/// the next `forward L:R2` then put a second REMOTE on that LOCAL: the wedge.
+#[test]
+fn unforward_of_a_mismatched_remote_cancels_the_recorded_one_and_does_not_wedge() {
+    if let Some(why) = common::sshd::unavailable() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    isolate_state();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &["-o", "StreamLocalBindUnlink=yes"]);
+    let host = host(&sshd);
+    let local = sshd.dir.join("m.sock");
+    let (r1, r2) = (sshd.dir.join("r1.sock"), sshd.dir.join("r2.sock"));
+    serve(r1.clone(), "one");
+    serve(r2.clone(), "two");
+    let t = Real {
+        sshd: &sshd,
+        rendezvous: None,
+    };
+
+    forward(&t, &host, &[spec(&local, &r1)]).unwrap();
+    unforward(&t, &host, &[spec(&local, &r2)]).unwrap();
+    assert!(read_record(&host, &local).is_none());
+    forward(&t, &host, &[spec(&local, &r2)]).unwrap();
+    assert_eq!(through(&local), "two");
+    forward(&t, &host, &[spec(&local, &r1)]).unwrap();
+    assert_eq!(through(&local), "one");
+}
