@@ -169,3 +169,37 @@ fn poll_does_not_download_the_log() {
         "poll must not read log bytes: {script}"
     );
 }
+
+#[test]
+fn a_screen_probe_carries_the_pane_capture_in_the_same_round_trip() {
+    // The lease mirrors the remote screen while mu's startup scan reads it.
+    // Folding the capture into the probe keeps that one locked call per tick
+    // rather than two.
+    isolate_state();
+    let fake = Fake::new();
+    fake.push(Output::ok(
+        "exists=1\nrc=\nalive=1\nsize=900\nbytes:\npi ready\n> \n",
+    ));
+
+    let result = probe(
+        &fake,
+        &host(),
+        &"abc123".parse().unwrap(),
+        mule::probe::From::Screen,
+    )
+    .unwrap();
+
+    assert_eq!(result.state, State::Running);
+    assert_eq!(result.bytes, b"pi ready\n> \n");
+    let scripts = fake.scripts();
+    assert_eq!(scripts.len(), 1, "one locked call, capture included");
+    let script = &scripts[0];
+    assert!(
+        script.contains("capture-pane -p -J -t mule-abc123"),
+        "{script}"
+    );
+    // A pane that is gone falls back to the saved final screen, never to the
+    // raw transcript (TUI-jobs spec, `mule tail` contract).
+    assert!(script.contains("/screen"), "{script}");
+    assert!(!script.contains("tail -c"), "no log bytes: {script}");
+}
