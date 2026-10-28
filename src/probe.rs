@@ -37,6 +37,11 @@ pub struct Probe {
 pub enum From {
     Offset(u64),
     StateOnly,
+    /// State plus the pane's current screen in `bytes` (`capture-pane`), or
+    /// the saved final screen once the pane is gone. For the lease, which
+    /// mirrors the remote screen while mu's startup scan reads it: folding the
+    /// capture in keeps that one locked call per tick, not two.
+    Screen,
 }
 
 impl From {
@@ -47,7 +52,23 @@ impl From {
             // the top keeps a nonsensical offset from wrapping into a valid
             // one; it reads the last byte instead of the whole file.
             From::Offset(n) => Some(n.saturating_add(1)),
-            From::StateOnly => None,
+            From::StateOnly | From::Screen => None,
+        }
+    }
+
+    /// The command that fills the `bytes:` section of the reply.
+    fn bytes_command(self, socket: &str, id: &JobId) -> String {
+        match self {
+            // Never the transcript as a fallback: raw redraw bytes are not a
+            // readable screen (TUI-jobs spec, `mule tail` contract).
+            From::Screen => format!(
+                "tmux -L {socket} capture-pane -p -J -t mule-{id} 2>/dev/null || \
+                 cat $d/screen 2>/dev/null || true"
+            ),
+            other => match other.tail_arg() {
+                Some(n) => format!("tail -c +{n} $d/log 2>/dev/null"),
+                None => "true".to_string(),
+            },
         }
     }
 }
@@ -69,10 +90,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
          printf 'size=%s\\n' \"$(wc -c < $d/log 2>/dev/null || echo 0)\"; \
          printf 'bytes:\\n'; {}",
         host.tmux_socket,
-        match from.tail_arg() {
-            Some(n) => format!("tail -c +{n} $d/log 2>/dev/null"),
-            None => "true".to_string(),
-        }
+        from.bytes_command(&host.tmux_socket, id)
     );
     let mut output = t.run(host, &script)?;
     if output.code != 0 {
