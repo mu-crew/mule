@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_NO_MASTER, exit_code};
-use mule::forward::{Spec, forward, lock_local, read_record, unforward};
+use mule::forward::{
+    Spec, forward, lock_local, on_record_read, read_record, try_lock_local, unforward,
+};
 use mule::transport::{Fake, MuxOp};
 
 fn isolate_state() {
@@ -470,80 +472,50 @@ fn unforward_fails_with_exit_one_on_a_real_unlink_error_and_keeps_the_record() {
     assert!(read_record(&host(), &local).is_none());
 }
 
-/// Overwrite the record for `local` by hand, as a transaction that finished
-/// while we held the lock would have: the point is that it is a *different*
-/// record from the one on disk when the caller under test started.
-fn rewrite_record(local: &Path, remote: &str) {
-    let path = mule::forward::record_path(&host(), local);
-    let text = format!(
-        "local={}\nremote={remote}\npid=4242\ndev=1\nino=1\n",
-        local.display()
-    );
-    std::fs::write(path, text).unwrap();
-}
-
 /// The lock must precede the record read, not merely the writes.
 ///
-/// While we hold LOCAL's lock, the record is swapped from R1 to R3 -- what a
-/// concurrent holder's transaction does. `op` starts (with the master's
-/// `Check` as the signal that it is under way), is given time to read the
-/// record if it is going to, and then the lock is released. Locked first, it
-/// reads R3 and cancels R3. Locked late, it already read R1 and cancels a
-/// forward that is no longer there, leaving R3 in the table: the wedge.
-///
-/// The correct code passes whatever the timing; a late lock fails because the
-/// 300ms is ample for a thread that is not blocked to reach its read.
-fn assert_record_read_waits_for_the_lock(
-    name: &str,
-    op: impl FnOnce(&Fake, &Path) + Send + 'static,
-) {
-    use std::time::Duration;
+/// Runs `op` on this thread with a hook on every record read that asks, at the
+/// instant of the read, whether LOCAL's lock is held by someone else (a
+/// try-lock from the hook fails iff `op` already holds it). Locked first, every
+/// read sees the lock held; locked late, the read sees it free. No threads, no
+/// sleeps: the outcome is decided by the order of two calls in `op`, so a slow
+/// or loaded machine cannot change it. A late-lock mutant also fails if it
+/// skips the hook (zero reads observed).
+fn assert_record_read_holds_the_lock(name: &str, op: impl FnOnce(&Fake, &Path)) {
     isolate_state();
     let dir = scratch();
     let local = dir.join("rd.sock");
-    let setup = Fake::new();
-    master(&setup);
-    forward(&setup, &host(), &[spec(&local, "/r/1")]).unwrap();
+    let fake = Fake::new();
+    master(&fake);
+    forward(&fake, &host(), &[spec(&local, "/r/1")]).unwrap();
 
-    let lock = lock_local(&host(), &local).unwrap();
-    let (started, signal) = std::sync::mpsc::channel::<()>();
-    let started = Mutex::new(started);
-    let fake = Arc::new(Fake::new());
-    master_and(&fake, move |op| {
-        if matches!(op, MuxOp::Check) {
-            let _ = started.lock().unwrap().send(());
-        }
+    let reads: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let log = Arc::clone(&reads);
+    let guard = on_record_read(move |host, target| {
+        let held = try_lock_local(host, target).unwrap().is_none();
+        log.lock().unwrap().push(held);
     });
-    let (thread_fake, target) = (Arc::clone(&fake), local.clone());
-    let handle = std::thread::spawn(move || op(&thread_fake, &target));
-    // `unforward` makes no Check, so it cannot signal; give both a moment.
-    let _ = signal.recv_timeout(Duration::from_millis(100));
-    std::thread::sleep(Duration::from_millis(300));
-    rewrite_record(&local, "/r/3");
-    drop(lock);
-    handle.join().unwrap();
+    op(&fake, &local);
+    drop(guard);
 
-    let ops = kinds(&fake.mux_ops());
+    let reads = reads.lock().unwrap();
+    assert!(!reads.is_empty(), "{name} never read the record");
     assert!(
-        ops.contains(&"cancel /r/3".to_string()),
-        "{name} read the record before taking the lock: {ops:?}"
-    );
-    assert!(
-        !ops.contains(&"cancel /r/1".to_string()),
-        "{name} acted on a stale record: {ops:?}"
+        reads.iter().all(|held| *held),
+        "{name} read the record without holding the LOCAL's lock: {reads:?}"
     );
 }
 
 #[test]
 fn forward_takes_the_lock_before_it_reads_the_record() {
-    assert_record_read_waits_for_the_lock("forward", |fake, local| {
+    assert_record_read_holds_the_lock("forward", |fake, local| {
         forward(fake, &host(), &[spec(local, "/r/2")]).unwrap();
     });
 }
 
 #[test]
 fn unforward_takes_the_lock_before_it_reads_the_record() {
-    assert_record_read_waits_for_the_lock("unforward", |fake, local| {
+    assert_record_read_holds_the_lock("unforward", |fake, local| {
         unforward(fake, &host(), &[spec(local, "/r/2")]).unwrap();
     });
 }
