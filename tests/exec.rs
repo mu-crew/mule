@@ -407,9 +407,12 @@ fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
         &mut Vec::new(),
     );
 
+    // The probe count is the deterministic discriminator (2 by the clock, 5 by
+    // a pause count); elapsed time is only a loose sanity bound, since a busy
+    // machine stretches every 300ms probe.
     let waited = started.elapsed();
     assert!(
-        waited < Duration::from_millis(1200),
+        waited < Duration::from_secs(5),
         "bound ignored probe time: {waited:?}"
     );
     let probes = slow.0.scripts().len();
