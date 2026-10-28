@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mule::config::{Config, Host};
-use mule::jobs::{decode_command, kill, list, list_with_hidden, prune};
+use mule::jobs::{
+    Target, decode_command, kill, list, list_with_hidden, prune, remove, remove_one_script,
+};
 use mule::probe::State;
 use mule::transport::{Fake, Output, Transport};
 
@@ -360,4 +362,80 @@ fn prune_uses_two_horizons_and_never_touches_running_jobs() {
     });
     assert!(doubled.contains("-mtime +30"), "{doubled}");
     assert!(doubled.contains("-mtime +120"), "{doubled}");
+}
+
+fn job_id() -> mule::wrapper::JobId {
+    "abc123".parse().unwrap()
+}
+
+#[test]
+fn rm_one_script_kills_both_sessions_then_verifies_before_claiming_success() {
+    let script = remove_one_script(&host(), &job_id());
+
+    // Both sessions are killed: the watchdog's sleeper would otherwise live to
+    // `max_secs` and could write rc 124 into a directory about to be reused.
+    assert!(script.contains("kill-session -t mule-abc123"), "{script}");
+    assert!(script.contains("kill-session -t watch-abc123"), "{script}");
+
+    // Exit 0 is a proof, so the script must ask tmux again rather than trust
+    // `kill-session`'s status, and must look at the directory after `rm -rf`.
+    let verify = script.find("has-session").expect("must verify sessions");
+    let last_kill = script.rfind("kill-session -t").unwrap();
+    assert!(verify > last_kill, "verify after killing: {script}");
+    assert!(script.contains("-t \"$s\""), "{script}");
+    assert!(script.contains("mule-abc123 watch-abc123"), "{script}");
+    let rm = script.find("rm -rf").expect("must remove the dir");
+    let check = script.find("[ -e \"$d\" ]").expect("must re-check the dir");
+    assert!(check > rm, "check the dir after removing it: {script}");
+
+    // The old script ended in an unconditional `exit 0` that masked both.
+    assert!(!script.contains("rm -rf $d && echo"), "{script}");
+    assert!(script.contains("exit 1"), "{script}");
+}
+
+#[test]
+fn rm_one_is_one_round_trip() {
+    let fake = Fake::new();
+    fake.push(Output::ok("abc123\n"));
+
+    let removed = remove(&fake, &host(), &Target::One(job_id())).unwrap();
+
+    assert_eq!(removed, vec!["abc123"]);
+    assert_eq!(fake.scripts().len(), 1);
+}
+
+#[test]
+fn rm_one_of_a_missing_job_exits_zero_with_nothing_removed() {
+    let fake = Fake::new();
+    fake.push(Output::ok(""));
+
+    let removed = remove(&fake, &host(), &Target::One(job_id())).unwrap();
+
+    assert!(removed.is_empty());
+}
+
+#[test]
+fn rm_one_failure_maps_to_exit_one_and_carries_the_remote_evidence() {
+    let fake = Fake::new();
+    fake.push(Output::fail(
+        1,
+        "session still alive after kill-session: mule-abc123 (state dir kept)\n",
+    ));
+
+    let error = remove(&fake, &host(), &Target::One(job_id())).unwrap_err();
+
+    assert_eq!(mule::errors::exit_code(&error), 1);
+    let text = format!("{error:#}");
+    assert!(text.contains("mule-abc123"), "must name which: {text}");
+    assert!(text.contains("kept"), "{text}");
+}
+
+#[test]
+fn rm_all_script_is_unchanged_and_never_kills() {
+    let fake = Fake::new();
+    remove(&fake, &host(), &Target::AllDone).unwrap();
+
+    let script = &fake.scripts()[0];
+    assert!(!script.contains("kill-session"), "{script}");
+    assert!(script.contains("-f \"$d/rc\""), "{script}");
 }

@@ -106,6 +106,11 @@ in the table, and `mule ls --json` as the machine surface; JSON keeps `age_secs`
 and adds `runtime_secs`.
 
 `mule rm <id>` ends that job if it is still running, then removes its state.
+Exit 0 means it is stopped and gone: neither tmux session exists and the state
+directory is removed. A job that is already missing also exits 0, so it is safe
+to repeat. If a session survives the kill or the directory cannot be removed it
+exits 1, names which, and keeps what is left, so a script can treat exit 0 as
+proof before deleting its own handle.
 `mule rm --all` removes every **finished** job, ignoring `keep_days`, and leaves
 running jobs and orphans alone. Prefer `mule kill` when you want the exit code
 recorded as **137** without dropping state; use `kill --rm` to end and discard

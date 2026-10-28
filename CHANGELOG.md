@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**`mule rm <id>` exit 0 now proves the job is stopped and gone.** It used to
+exit 0 even when `kill-session` did not take or `rm -rf` failed. Now it verifies
+that neither `mule-<id>` nor `watch-<id>` exists and the state directory is
+gone; otherwise it exits 1 naming which and keeps what is left. A missing job
+still exits 0. `rm --all` is unchanged.
+
 ## 0.2.1 — 2026-09-27
 
 First release on npm: `npm i -g @mu-crew/mule` installs a prebuilt binary for

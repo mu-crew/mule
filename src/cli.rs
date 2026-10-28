@@ -291,7 +291,7 @@ pub enum Commands {
         #[arg(long)]
         rm: bool,
     },
-    /// Drop a job's state directory
+    /// Stop a job and drop its state directory; exit 0 proves both
     Rm {
         /// The job to remove. Omit with --all.
         id: Option<crate::wrapper::JobId>,
