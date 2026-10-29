@@ -28,6 +28,13 @@ pub enum MuleError {
         "the master is down or its one slot is held\n  run ssh -O check with mule's configured ControlPath to tell which"
     )]
     SessionChannelBusy,
+    /// The master refused to open a session, proven from ssh's OWN log (`-E`),
+    /// with nothing on stdout: the remote script never started, so running it
+    /// again cannot run it twice. Internal: [`crate::transport::Transport::run`]
+    /// re-queues on it and reports [`MuleError::SessionChannelBusy`] once its
+    /// recovery budget is spent, so a caller never sees this variant.
+    #[error("the master refused a session before the script started")]
+    MuxRefusedPreExec,
     #[error(
         "the local ssh agent is unreachable; ssh-add -l cannot use SSH_AUTH_SOCK\n  re-establish or re-attach the agent; an authentication prompt may be waiting where you cannot see it"
     )]
@@ -75,14 +82,22 @@ pub enum AgentState {
     Unknown,
 }
 
-pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<MuleError> {
-    let stderr = stderr.to_ascii_lowercase();
-    if ["session request failed", "session open refused"]
+/// Does this text carry the mux client's refusal to open a session?
+///
+/// What ssh logs (measured, OpenSSH 10): `mux_client_request_session: session
+/// request failed: Session open refused by peer`.
+fn mux_refused(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    ["session request failed", "session open refused"]
         .iter()
-        .any(|pattern| stderr.contains(pattern))
-    {
+        .any(|pattern| text.contains(pattern))
+}
+
+pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<MuleError> {
+    if mux_refused(stderr) {
         return Some(MuleError::SessionChannelBusy);
     }
+    let stderr = stderr.to_ascii_lowercase();
     if !stderr.contains("permission denied (keyboard-interactive)") {
         return None;
     }
@@ -94,6 +109,29 @@ pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Optio
     })
 }
 
+/// Classify one ssh call from ssh's own log and the remote's stdout.
+///
+/// `ssh_log` must be what `ssh -E` wrote, never the remote stderr. Remote
+/// stderr has no provenance: a script that ran can print the refusal text and
+/// exit 255, and treating that as a refusal re-ran it -- measured, two calls,
+/// two side effects. `-E` sends ssh's diagnostics to a file and leaves the
+/// remote's stderr on the pipe, so the spoof stays on stderr and the log stays
+/// empty (measured).
+///
+/// Retryable ([`MuleError::MuxRefusedPreExec`]) only for a mux refusal with
+/// empty stdout. Refusal with output means something ran, so it is reported
+/// busy and never retried; everything else maps as [`classify`] does.
+pub fn classify_attempt(
+    ssh_log: &str,
+    stdout: &[u8],
+    agent_state: impl FnOnce() -> AgentState,
+) -> Option<MuleError> {
+    if mux_refused(ssh_log) && stdout.is_empty() {
+        return Some(MuleError::MuxRefusedPreExec);
+    }
+    classify(ssh_log, agent_state)
+}
+
 pub fn exit_code(error: &AnyhowError) -> i32 {
     match error.downcast_ref::<MuleError>() {
         Some(MuleError::NoMaster { .. } | MuleError::ForwardWedged { .. }) => EXIT_NO_MASTER,
@@ -103,6 +141,7 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
         Some(
             MuleError::MissingJob { .. }
             | MuleError::SessionChannelBusy
+            | MuleError::MuxRefusedPreExec
             | MuleError::SshAgentUnreachable
             | MuleError::SshAgentHasNoKeys
             | MuleError::KeyboardInteractiveAmbiguous,

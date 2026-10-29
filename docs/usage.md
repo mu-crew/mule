@@ -231,6 +231,18 @@ Every job verb accepts `--host`; with one configured host you can omit it.
 `mule host list` reports which configured hosts have a master (`ssh -O check`
 only). `mule host info` probes OS, cores, RAM, and GPU and takes the lock.
 
+Every mule ssh goes through mule's master or fails: it never falls back to a
+fresh connection (`ProxyCommand=/usr/bin/false`). If the master refuses a
+session that something outside mule's queue still holds -- typically the ssh of
+a mule process that was killed mid-call -- the verb waits its turn again, at the
+back of the queue, for up to 12s, and only then fails with "the master is down
+or its one slot is held" (exit 1; `rm` keeps the job). A refusal is retried only
+when ssh itself reports it and the command printed nothing, so a command is
+never run twice. Waiting for the queue has no limit of its own: if you need a
+hard wall-clock bound on a mule verb, impose it yourself (mu runs its stop
+command under a 20s timeout). `ssh -O check` is bounded at 2s, so a stopped
+master reads as down rather than hanging the verb.
+
 ## Exit codes
 
 | Code | Meaning |

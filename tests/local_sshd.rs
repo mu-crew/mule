@@ -114,22 +114,17 @@ fn mule_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
     let tmux = Tmux::new(&sshd, "busy");
     let config = sshd.write_config(&tmux.name);
 
-    // Occupy the single MaxSessions slot outside mule's lock. The next mule
-    // verb still takes the lock, then ssh, and must classify the refusal
-    // rather than dump Permission denied (keyboard-interactive).
-    let mut holder = std::process::Command::new(sshd.dir.join("ssh"))
-        .arg("-S")
-        .arg(&sshd.socket)
-        .args(["-o", "BatchMode=yes", "127.0.0.1", "sleep", "8"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    // Occupy the single MaxSessions slot outside mule's lock, for longer than
+    // mule's refusal recovery. The next mule verb takes the lock, is refused,
+    // re-queues until the recovery budget is spent, and must then classify
+    // the refusal rather than dump Permission denied (keyboard-interactive).
+    let mut holder = holding_the_only_session(&sshd, "40");
 
+    let started = Instant::now();
     let out = sshd.mule(&config, &["poll", "abc123"]);
+    let took = started.elapsed();
     let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
     assert!(
         err.contains("one slot is held") || err.contains("master is down"),
         "must surface SessionChannelBusy, not raw ssh: {err}"
@@ -138,8 +133,45 @@ fn mule_classifies_a_refused_session_instead_of_raw_ssh_stderr() {
         !err.contains("Permission denied") || err.contains("slot"),
         "must not dump unclassified credentials-looking stderr alone: {err}"
     );
+    // Recovery is bounded: it gave up near its 12s budget, neither at once
+    // (no recovery) nor after the 40s holder (unbounded).
+    let budget = mule::transport::REFUSAL_RECOVERY;
+    assert!(
+        took >= budget - Duration::from_secs(2) && took < budget + Duration::from_secs(8),
+        "gave up after {took:?}"
+    );
 
     let _ = holder.kill();
+    let _ = holder.wait();
+}
+
+#[test]
+fn rm_waits_out_a_session_held_by_someone_else_and_proves_the_stop() {
+    // The kill-9 lease failure in miniature: the one session is held by an
+    // ssh no ticket accounts for (there, a dead lease's dispatch), and `rm`
+    // arrives while it runs. It used to fail at once with exit 1, so mu kept a
+    // job it meant to stop; it now re-queues until the session frees.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "rmheld");
+    let config = sshd.write_config(&tmux.name);
+    let id = stdout(&sshd.mule(&config, &["run", "sleep 60"]));
+    assert!(job_state_dir(&sshd, &id).exists());
+
+    let mut holder = holding_the_only_session(&sshd, "2");
+    let started = Instant::now();
+    let out = sshd.mule(&config, &["rm", &id]);
+    let took = started.elapsed();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "after {took:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(took < mule::transport::REFUSAL_RECOVERY, "{took:?}");
+    assert!(!job_state_dir(&sshd, &id).exists());
+    assert!(!sessions(&sshd, &tmux.name).contains(&format!("mule-{id}")));
     let _ = holder.wait();
 }
 
@@ -1533,11 +1565,18 @@ impl Drop for Serve {
 
 /// Connect to `local` and read until EOF. Retries briefly: the forward is bound
 /// before `mule forward` returns, but the remote hop races the first read.
+///
+/// Each read is bounded at 2s, as in [`through_once`]: under three parallel
+/// layer-3 suites a forwarded stream delivered its bytes and never its EOF,
+/// and the unbounded read hung the suite past a 300s timeout (seen at
+/// 8222295 and after). On a timeout `read_to_string` keeps what it read, so
+/// the reply is still checked.
 fn through(local: &std::path::Path) -> String {
     use std::io::Read;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(local) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
             let mut text = String::new();
             let _ = stream.read_to_string(&mut text);
             if !text.is_empty() || Instant::now() > deadline {
@@ -3173,5 +3212,48 @@ fn a_signal_mid_probe_frees_the_session_before_the_lease_exits() {
     );
     wait_until("the job to be stopped", Duration::from_secs(15), || {
         !job_state_dir(&sshd, &id).exists()
+    });
+}
+
+#[test]
+fn a_signal_mid_probe_frees_the_session_before_exec_exits() {
+    // exec's signal path, like the lease's, must not exit under its own
+    // probe: the ticket goes with exec's pid while the remote script still
+    // holds the one session, so the detached `rm` behind it is refused. exec
+    // had no gate at all (design review r0); it now shares the lease's.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "exec-heldprobe");
+    let config = sshd.write_config(&tmux.name);
+    let flag = sshd.dir.join("exec-probe-flag");
+    let dir = held_probe_ssh(&sshd, &flag, 1);
+    let path = PathBuf::from(format!("{}:{}", dir.display(), sshd.path_env()));
+    let exec = spawn_mule(&sshd, &config, &["exec", "sleep 60"], &[("PATH", &path)]);
+    wait_until(
+        "a probe to hold the session",
+        Duration::from_secs(30),
+        || flag.exists(),
+    );
+
+    let signalled = Instant::now();
+    signal(&exec, "TERM");
+    assert_eq!(exec.wait_with_output().unwrap().status.code(), Some(143));
+    let waited = signalled.elapsed();
+
+    // Same bound as the lease: the probe is gone by the exit, or the exit
+    // waited the full 3s grace for it.
+    let probe_pid = std::fs::read_to_string(&flag).unwrap();
+    let probe_alive = std::process::Command::new("kill")
+        .args(["-0", probe_pid.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !probe_alive || waited >= Duration::from_millis(2900),
+        "exec exited after {waited:?} while its probe still held the session"
+    );
+    wait_until("the job to be removed", Duration::from_secs(20), || {
+        job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
     });
 }

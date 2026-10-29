@@ -32,7 +32,7 @@ use crate::cleanup::{self, Signals};
 use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_TRUNCATED, MuleError};
 use crate::probe::{From as ProbeFrom, State, probe};
-use crate::transport::{Ssh, Transport};
+use crate::transport::{InFlight, Ssh, Transport};
 use crate::wrapper::{JobId, JobMetadata, JobMode, new_id, state_dir};
 
 const FIRST_INTERVAL: Duration = Duration::from_millis(100);
@@ -50,8 +50,9 @@ const SESSION_END_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a signal waits for an in-flight dispatch before cleaning up anyway.
 ///
-/// Dispatch is sub-second by invariant, but a holder whose ssh fell back to a
-/// direct connect can sit for a TCP timeout, and the signal path must not.
+/// Dispatch is sub-second by invariant, but it queues for its ticket first,
+/// and may re-queue after a refused session (`transport::run_within`); the
+/// signal path must not wait on either for long.
 pub(crate) const DISPATCH_GRACE: Duration = Duration::from_secs(3);
 
 /// The collect script's exit status when the read worked but removing the job
@@ -297,6 +298,12 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     let id: JobId = new_id().parse().expect("generated ids are valid");
     let dispatching = Arc::new(AtomicBool::new(false));
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
+    // Every locked call goes through one gate the signal path can close, as
+    // the lease's does: a probe in flight holds the one session, and exiting
+    // under it frees the ticket (pid death) but not the session -- the
+    // remote script runs on -- so the detached `rm` would be refused.
+    let ssh = InFlight::new(Ssh);
+    let calls = ssh.stopper();
     {
         let dispatching = Arc::clone(&dispatching);
         let host_name = host.name.clone();
@@ -312,13 +319,17 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
             while dispatching.load(Ordering::SeqCst) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
+            // No new locked call from here, and the one in flight (a probe or
+            // the collect) gets the rest of the same bound. A group signal
+            // kills its ssh too, and the call returns at once.
+            calls.stop(deadline.saturating_duration_since(Instant::now()));
             let _ = cleanup::spawn_rm(config.as_deref(), &host_name, &id);
             std::process::exit(cleanup::exit_status_for(signal));
         });
     }
 
     dispatching.store(true, Ordering::SeqCst);
-    let started = start(&Ssh, host, id.clone(), request);
+    let started = start(&ssh, host, id.clone(), request);
     dispatching.store(false, Ordering::SeqCst);
     if let Err(error) = started {
         park_if_signalled(&signals);
@@ -335,7 +346,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     }
 
     let result = finish(
-        &Ssh,
+        &ssh,
         host,
         &id,
         &|interval| {

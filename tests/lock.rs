@@ -376,3 +376,197 @@ fn mux_ops_never_take_the_lock_while_run_callers_still_never_overlap() {
 
     std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
 }
+
+/// A transport that answers each `run_unlocked` from a script of replies and
+/// records, per attempt, the ticket it ran under -- read from the lock
+/// directory, which is the only witness of re-queueing.
+mod refusal {
+    use super::*;
+    use mule::errors::MuleError;
+    use mule::transport::{MuxOp, Output, Transport};
+    use std::sync::Mutex;
+
+    pub enum Reply {
+        Refused,
+        Busy,
+        Ok,
+    }
+
+    pub struct Scripted {
+        pub replies: Mutex<std::collections::VecDeque<Reply>>,
+        pub tickets: Mutex<Vec<u64>>,
+        pub master: std::sync::atomic::AtomicBool,
+        pub checks: AtomicUsize,
+        pub lock: std::path::PathBuf,
+    }
+
+    impl Scripted {
+        pub fn new(host: &mule::config::Host, replies: Vec<Reply>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                tickets: Mutex::default(),
+                master: true.into(),
+                checks: AtomicUsize::new(0),
+                lock: mule::lock::lock_path(&host.name),
+            }
+        }
+        pub fn attempts(&self) -> usize {
+            self.tickets.lock().unwrap().len()
+        }
+    }
+
+    impl Transport for Scripted {
+        fn run_unlocked(&self, _: &mule::config::Host, _: &str) -> anyhow::Result<Output> {
+            let serving = fs::read_to_string(self.lock.join("serving")).unwrap();
+            self.tickets
+                .lock()
+                .unwrap()
+                .push(serving.trim().parse().unwrap());
+            match self.replies.lock().unwrap().pop_front() {
+                Some(Reply::Refused) => Err(MuleError::MuxRefusedPreExec.into()),
+                Some(Reply::Busy) => Err(MuleError::SessionChannelBusy.into()),
+                Some(Reply::Ok) | None => Ok(Output::ok("done")),
+            }
+        }
+        fn mux_op(&self, _: &mule::config::Host, op: MuxOp) -> anyhow::Result<Output> {
+            assert_eq!(op, MuxOp::Check);
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.master.load(Ordering::SeqCst) {
+                Output::ok("")
+            } else {
+                Output::fail(255, "Control socket connect: No such file or directory")
+            })
+        }
+    }
+
+    pub fn host(tag: &str) -> mule::config::Host {
+        mule::config::Config::parse(&format!(
+            "[hosts.locktest-refusal-{tag}-{}]\ntarget = \"h\"\n",
+            std::process::id()
+        ))
+        .unwrap()
+        .host(None)
+        .unwrap()
+        .clone()
+    }
+}
+
+#[test]
+fn a_proven_refusal_is_retried_on_a_fresh_ticket_until_it_succeeds() {
+    use refusal::*;
+    isolate_state();
+    let host = host("recover");
+    let t = Scripted::new(&host, vec![Reply::Refused, Reply::Refused, Reply::Ok]);
+
+    let out = mule::transport::Transport::run(&t, &host, "rm job").unwrap();
+
+    assert_eq!(out.stdout, b"done");
+    let tickets = t.tickets.lock().unwrap().clone();
+    // A fresh ticket per attempt: the refused attempt gave its ticket back
+    // before backing off, rather than holding the queue through the wait.
+    assert_eq!(tickets, [0, 1, 2]);
+    // The master was asked between attempts, lock-free.
+    assert_eq!(t.checks.load(Ordering::SeqCst), 2);
+    std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
+}
+
+#[test]
+fn a_refused_caller_re_queues_behind_a_caller_that_arrived_during_its_backoff() {
+    use refusal::*;
+    isolate_state();
+    let _lane = timing_lane();
+    let host = host("requeue");
+    let t = Arc::new(Scripted::new(
+        &host,
+        vec![Reply::Refused, Reply::Ok, Reply::Ok],
+    ));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The refused caller's first attempt is ticket 0; while it backs off
+    // (100ms), a second caller takes ticket 1 and must be served first.
+    let first = {
+        let (t, h, order) = (Arc::clone(&t), host.clone(), Arc::clone(&order));
+        std::thread::spawn(move || {
+            mule::transport::Transport::run(&*t, &h, "a").unwrap();
+            order.lock().unwrap().push("first");
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while t.attempts() == 0 {
+        assert!(Instant::now() < deadline, "first attempt never ran");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = {
+        let (t, h, order) = (Arc::clone(&t), host.clone(), Arc::clone(&order));
+        std::thread::spawn(move || {
+            mule::transport::Transport::run(&*t, &h, "b").unwrap();
+            order.lock().unwrap().push("second");
+        })
+    };
+    first.join().unwrap();
+    second.join().unwrap();
+
+    assert_eq!(*order.lock().unwrap(), ["second", "first"]);
+    assert_eq!(*t.tickets.lock().unwrap(), [0, 1, 2]);
+    std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
+}
+
+#[test]
+fn refusal_recovery_is_bounded_and_ends_as_the_busy_error() {
+    use mule::errors::MuleError;
+    use refusal::*;
+    isolate_state();
+    let _lane = timing_lane();
+    let host = host("bounded");
+    // Refused forever.
+    let t = Scripted::new(&host, (0..1000).map(|_| Reply::Refused).collect());
+
+    let started = Instant::now();
+    let error =
+        mule::transport::run_within(&t, &host, "rm job", Duration::from_millis(750)).unwrap_err();
+    let took = started.elapsed();
+
+    assert_eq!(
+        error.downcast_ref::<MuleError>(),
+        Some(&MuleError::SessionChannelBusy),
+        "exhaustion is the user-facing busy error, never the internal one: {error:#}"
+    );
+    assert_eq!(mule::errors::exit_code(&error), 1);
+    // Backoffs 100, 200, 400ms fit in 750ms; the next (800ms) never does, so
+    // the loop stops before overrunning rather than sleeping past the budget.
+    // The count is 3 or 4 depending on scheduling, never more.
+    assert!(took < Duration::from_millis(1050), "{took:?}");
+    assert!((3..=4).contains(&t.attempts()), "{}", t.attempts());
+    std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
+}
+
+#[test]
+fn nothing_but_a_proven_refusal_with_a_live_master_is_retried() {
+    use mule::errors::MuleError;
+    use refusal::*;
+    isolate_state();
+
+    // Busy (ambiguous keyboard-interactive, or refusal with output): once.
+    let host_a = host("busy");
+    let t = Scripted::new(&host_a, vec![Reply::Busy, Reply::Ok]);
+    let error = mule::transport::Transport::run(&t, &host_a, "x").unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<MuleError>(),
+        Some(&MuleError::SessionChannelBusy)
+    );
+    assert_eq!(t.attempts(), 1);
+    assert_eq!(t.checks.load(Ordering::SeqCst), 0);
+    std::fs::remove_dir_all(mule::lock::lock_path(&host_a.name)).ok();
+
+    // A proven refusal with the master gone: no point waiting, once.
+    let host_b = host("nomaster");
+    let t = Scripted::new(&host_b, vec![Reply::Refused, Reply::Ok]);
+    t.master.store(false, Ordering::SeqCst);
+    let error = mule::transport::Transport::run(&t, &host_b, "x").unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<MuleError>(),
+        Some(&MuleError::SessionChannelBusy)
+    );
+    assert_eq!(t.attempts(), 1);
+    std::fs::remove_dir_all(mule::lock::lock_path(&host_b.name)).ok();
+}

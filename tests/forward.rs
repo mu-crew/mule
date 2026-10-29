@@ -362,7 +362,10 @@ fn mux_args_carry_paths_as_single_argv_elements_and_never_a_remote_forward() {
         let args = mule::transport::mux_args(&host, &op);
         assert!(!args.iter().any(|a| a == "-R"), "{args:?}");
         assert!(args.contains(&"BatchMode=yes".to_string()), "{args:?}");
-        assert!(args.contains(&"ProxyCommand=none".to_string()), "{args:?}");
+        assert!(
+            args.contains(&"ProxyCommand=/usr/bin/false".to_string()),
+            "{args:?}"
+        );
     }
 }
 

@@ -3,7 +3,7 @@ use clap::{CommandFactory, Parser};
 use mule::cli::Cli;
 use mule::errors::{
     AgentState, EXIT_DROPPED, EXIT_NO_MASTER, EXIT_ORPHAN, EXIT_TIMEOUT, MuleError, classify,
-    exit_code,
+    classify_attempt, exit_code,
 };
 
 /// Point the lock directory at a temp dir for the whole test binary.
@@ -29,6 +29,56 @@ fn refused_session_diagnostics_are_classified_case_insensitively() {
                 "unambiguous errors must not probe the agent"
             )),
             Some(MuleError::SessionChannelBusy)
+        );
+    }
+}
+
+/// What OpenSSH 10's mux client logs when the master refuses a session.
+const REFUSAL: &str =
+    "mux_client_request_session: session request failed: Session open refused by peer\n";
+
+#[test]
+fn only_a_refusal_in_sshs_own_log_with_no_stdout_is_retryable() {
+    isolate_state();
+    let no_agent = || -> AgentState { panic!("a mux refusal must not probe the agent") };
+    // (ssh -E log, remote stdout, expected)
+    let table: [(&str, &[u8], Option<MuleError>); 6] = [
+        // The one retryable shape: refused before the script ran.
+        (REFUSAL, b"", Some(MuleError::MuxRefusedPreExec)),
+        (
+            "SESSION OPEN REFUSED",
+            b"",
+            Some(MuleError::MuxRefusedPreExec),
+        ),
+        // Something ran and printed: never re-run it, but still say busy.
+        (REFUSAL, b"rc=0\n", Some(MuleError::SessionChannelBusy)),
+        // A clean call: ssh's log empty, whatever the remote did.
+        ("", b"", None),
+        ("", b"exists=1\n", None),
+        // ssh's own non-refusal noise is not a refusal.
+        ("Connection closed by UNKNOWN port 65535\n", b"", None),
+    ];
+    for (log, stdout, expected) in table {
+        assert_eq!(
+            classify_attempt(log, stdout, no_agent),
+            expected,
+            "log={log:?} stdout={stdout:?}"
+        );
+    }
+}
+
+#[test]
+fn keyboard_interactive_in_sshs_log_is_never_retryable() {
+    isolate_state();
+    for (state, expected) in [
+        (AgentState::Keys, MuleError::SessionChannelBusy),
+        (AgentState::NoKeys, MuleError::SshAgentHasNoKeys),
+        (AgentState::Unreachable, MuleError::SshAgentUnreachable),
+        (AgentState::Unknown, MuleError::KeyboardInteractiveAmbiguous),
+    ] {
+        assert_eq!(
+            classify_attempt("Permission denied (keyboard-interactive)", b"", || state),
+            Some(expected)
         );
     }
 }

@@ -19,11 +19,41 @@
 //! exemption means editing the enum, in review, not passing a different string.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use crate::config::Host;
+use crate::errors::MuleError;
+
+/// How long one caller keeps re-queueing after proven pre-exec refusals.
+///
+/// A scope limit on the retry loop only -- backoff plus re-queued attempts --
+/// not a bound on the call: the ticket wait before each attempt is
+/// deliberately unbounded (SPEC § Contention), so a caller needing a hard
+/// wall-clock limit imposes it itself, as mu does. 12s because mu's stop
+/// template runs `mule rm` under a 20s budget, and recovery must leave room
+/// inside it for the queue, the ssh and the removal. The refusal it absorbs
+/// is a session held by a dead caller's still-running ssh: a lease TERMed
+/// mid-dispatch, whose dispatch outlived its 3s grace, held it for seconds
+/// under three parallel layer-3 suites and failed the next `mule rm`.
+pub const REFUSAL_RECOVERY: Duration = Duration::from_secs(12);
+
+/// First pause after a refusal; doubles to [`MAX_BACKOFF`]. A held session
+/// frees when a remote script ends, so the first retries come quickly.
+const FIRST_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Hard bound on one `ssh -O check`.
+///
+/// A stopped master (SIGSTOP, a wedged mux loop) answers nothing, and a plain
+/// `-O check` then blocks with it: measured still blocked at 12.31s. Every
+/// verb checks the master before it queues, and the recovery loop checks it
+/// between attempts, so one wedged master would hang both. A live master
+/// answers in ~0s (measured); 2s also covers a loaded machine, where spawning
+/// an ssh for a mux op took up to 0.45s.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
@@ -121,8 +151,58 @@ pub trait Transport {
     /// Provided rather than required, so no implementation can weaken it: the
     /// lock is applied here, once, and an implementor supplies only the
     /// unlocked primitive.
+    ///
+    /// One exception to "one ticket, one attempt": a session refused before
+    /// the script started (see [`run_within`]) is retried on a fresh ticket.
     fn run(&self, host: &Host, script: &str) -> Result<Output> {
-        crate::lock::with_lock(&host.name, || self.run_unlocked(host, script))?
+        run_within(self, host, script, REFUSAL_RECOVERY)
+    }
+}
+
+/// [`Transport::run`] with the refusal-recovery budget as a parameter, so a
+/// test can pin the bound without spending 12s.
+///
+/// Each attempt takes its own ticket and holds it only for the attempt. On
+/// [`MuleError::MuxRefusedPreExec`] -- proven from ssh's own log, nothing on
+/// stdout, so the script never ran -- and only while `-O check` still finds
+/// the master, the ticket is released, the caller backs off, and re-queues
+/// at the BACK. Holding the ticket through the backoff would stall every
+/// caller behind a session none of them can get; re-queueing first means
+/// later callers may complete first, so FIFO holds per attempt, not per call
+/// (SPEC § Contention, recovery exception).
+///
+/// The budget bounds only this loop: once the time left is shorter than the
+/// next backoff it stops and reports [`MuleError::SessionChannelBusy`], which
+/// keeps `rm`'s exit 1 (the job is not proven stopped) for its caller.
+#[doc(hidden)]
+pub fn run_within<T: Transport + ?Sized>(
+    t: &T,
+    host: &Host,
+    script: &str,
+    budget: Duration,
+) -> Result<Output> {
+    let deadline = Instant::now() + budget;
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        let result = crate::lock::with_lock(&host.name, || t.run_unlocked(host, script))?;
+        let refused = matches!(
+            result
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<MuleError>()),
+            Some(MuleError::MuxRefusedPreExec)
+        );
+        if !refused {
+            return result;
+        }
+        // Lock-free: `-O check` opens no session. A master that is gone, or
+        // too wedged to answer within CHECK_TIMEOUT, will not hand out a
+        // session however long we wait.
+        if !t.master_alive(host) || deadline.saturating_duration_since(Instant::now()) < backoff {
+            return Err(MuleError::SessionChannelBusy.into());
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -136,16 +216,26 @@ pub trait Transport {
 /// no indication of which invocation was asking.
 ///
 /// Three settings close it:
-///   BatchMode=yes           - ssh itself never asks
-///   ControlMaster=no        - never create a master as a side effect; mule
-///                             requires one to exist and refuses otherwise
-///   ProxyCommand=none       - do not run a site wrapper that can prompt
+///   BatchMode=yes                - ssh itself never asks
+///   ControlMaster=no             - never create a master as a side effect;
+///                                  mule requires one and refuses otherwise
+///   ProxyCommand=/usr/bin/false  - never reach the host except through the
+///                                  master
 ///
-/// `ProxyCommand=none` is safe precisely because mule only ever multiplexes
-/// over an EXISTING master: the socket is already connected, so no proxy is
-/// needed to reach the host. The master the user opens by hand keeps its own
-/// ProxyCommand, which is where 2FA belongs -- once per ControlPersist window,
-/// deliberately, with the user watching.
+/// The proxy setting is what makes every mule ssh FAIL CLOSED. When the mux
+/// client cannot get a session -- the master refused one, or is gone -- ssh
+/// falls back to a fresh connection of its own. `ProxyCommand=none` (mule's
+/// earlier setting) let that fallback dial the host directly, and where keys
+/// alone authenticate it ran the script outside the master: measured on a
+/// capped loopback sshd, a refused call executed its script anyway, while
+/// mule reported the refusal. That is a session the ticket lock cannot see,
+/// and a refusal mule cannot safely retry. `/usr/bin/false` kills the
+/// fallback at once (no prompt, no connect, no execution: measured, a site
+/// `ProxyCommand` never started), and a command-line ProxyCommand also wins
+/// over a configured `ProxyJump` (`ssh -G`). Multiplexing over the master is
+/// unaffected: the socket is already connected, so no proxy is consulted. The
+/// master the user opens by hand keeps its own ProxyCommand, which is where
+/// 2FA belongs -- once per ControlPersist window, with the user watching.
 fn base_args(host: &Host) -> Vec<String> {
     vec![
         "-S".into(),
@@ -155,7 +245,7 @@ fn base_args(host: &Host) -> Vec<String> {
         "-o".into(),
         "ControlMaster=no".into(),
         "-o".into(),
-        "ProxyCommand=none".into(),
+        "ProxyCommand=/usr/bin/false".into(),
         host.target.clone(),
     ]
 }
@@ -198,12 +288,6 @@ pub fn run_args(host: &Host, script: &str) -> Vec<String> {
     args
 }
 
-fn base_command(host: &Host) -> Command {
-    let mut cmd = Command::new("ssh");
-    cmd.args(base_args(host));
-    cmd
-}
-
 fn ssh_agent_state() -> crate::errors::AgentState {
     match Command::new("ssh-add").arg("-l").output() {
         Ok(output) if output.status.success() => crate::errors::AgentState::Keys,
@@ -219,14 +303,25 @@ pub struct Ssh;
 
 impl Transport for Ssh {
     fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output> {
-        let out = base_command(host)
-            .arg(script)
+        // ssh's own diagnostics go to a private file (`-E`), apart from the
+        // remote script's stderr: only they may drive a retry. See
+        // `errors::classify_attempt` for the spoof that made this necessary.
+        let log = SshLog::create()?;
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-E").arg(&log.0).args(run_args(host, script));
+        let out = cmd
             .output()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if let Some(error) = crate::errors::classify(&stderr, ssh_agent_state) {
+        let ssh_log = std::fs::read_to_string(&log.0).unwrap_or_default();
+        if let Some(error) = crate::errors::classify_attempt(&ssh_log, &out.stdout, ssh_agent_state)
+        {
             return Err(error.into());
         }
+        // Callers quote stderr in their failures, and before `-E` it carried
+        // ssh's diagnostics too (a lost master, a dropped connection): keep
+        // them, after the remote's own text.
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        stderr.push_str(&ssh_log);
         Ok(Output {
             stdout: out.stdout,
             stderr,
@@ -237,9 +332,25 @@ impl Transport for Ssh {
     fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output> {
         let mut cmd = Command::new("ssh");
         cmd.args(mux_args(host, &op));
-        let out = cmd
-            .output()
-            .with_context(|| format!("spawning ssh for host {}", host.name))?;
+        let out = if op == MuxOp::Check {
+            match output_within(&mut cmd, CHECK_TIMEOUT)
+                .with_context(|| format!("spawning ssh for host {}", host.name))?
+            {
+                Some(out) => out,
+                None => {
+                    return Ok(Output::fail(
+                        255,
+                        format!(
+                            "ssh -O check did not answer within {}s",
+                            CHECK_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+            }
+        } else {
+            cmd.output()
+                .with_context(|| format!("spawning ssh for host {}", host.name))?
+        };
         Ok(Output {
             stdout: out.stdout,
             // Not classified: a mux op opens no session, so the refused-channel
@@ -248,6 +359,72 @@ impl Transport for Ssh {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             code: out.status.code().unwrap_or(-1),
         })
+    }
+}
+
+/// Run `cmd` to completion, or kill it at `limit` and return `None`.
+///
+/// For replies of a few bytes only: the pipes are drained after exit, so an
+/// output larger than a pipe buffer would stall the child until the limit.
+fn output_within(
+    cmd: &mut Command,
+    limit: Duration,
+) -> std::io::Result<Option<std::process::Output>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// One call's private `ssh -E` file, removed on drop.
+///
+/// Created exclusively (`create_new`, so a planted file or symlink fails the
+/// call rather than being written through) and 0600, under a name no other
+/// call can choose.
+struct SshLog(PathBuf);
+
+impl SshLog {
+    fn create() -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "mule-ssh-{}-{}-{nanos}.log",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&path)
+            .with_context(|| format!("cannot create ssh log {}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for SshLog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 

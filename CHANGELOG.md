@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**A refused session is waited out, and never run twice.** After a mule process
+died mid-call, its ssh could keep the one session after its ticket was freed,
+and the next caller was refused: under three parallel layer-3 suites a `mule rm`
+right after a TERMed lease exited 1 (3 of 15 runs), so mu kept a job it meant to
+stop. Now a call the master refused before its script started -- proven from
+ssh's own `-E` log, not the remote's stderr, with nothing on stdout and the
+master still answering -- releases its ticket, backs off, and re-queues at the
+back, for up to 12s, then reports the busy error as before (exit 1). Later
+callers may finish first. Waiting for a ticket stays unbounded; a caller that
+needs a wall-clock bound imposes it, as mu does.
+
+Every mule ssh passes `ProxyCommand=/usr/bin/false` instead of `none`, so a
+refused or masterless call can never fall back to a direct connection and run
+the command outside the master. `ssh -O check` is killed after 2s, so a stopped
+master reads as down instead of hanging every verb. `mule exec` now waits for
+its in-flight probe on a signal, as the lease does, so its detached `rm` is not
+refused.
+
 **`mule run --lease --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>`**
 holds a TUI job for a local pane's life, for mu's lease transport. It writes the
 job id to `F` (atomic, 0600, one line) *before* dispatching, so the job can
