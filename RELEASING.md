@@ -38,4 +38,5 @@ add the trusted publisher, and let CI publish from then on.
 
 The workflow also creates the GitHub release for the tag, with the matching
 CHANGELOG section as its notes. It fails if that section is missing, so add
-the CHANGELOG entry before tagging.
+the CHANGELOG entry before tagging. The release carries a `mule-<version>-<target>.tar.gz`
+per platform (Linux x64/arm64 musl, macOS arm64) and a `SHA256SUMS`.
