@@ -76,10 +76,19 @@ impl From {
 pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) -> Result<Probe> {
     let dir = state_dir(id);
     let from = from.into();
+    // `alive` is read BEFORE `rc`, never after. Every path that ends a job
+    // writes `rc` before its session goes (the wrapper's last act; `kill`
+    // and the watchdog write it before `kill-session`), so "no session, then
+    // no rc" can only be an orphan. The other order is a race: `rc` read
+    // empty, the job finishes, `has-session` misses -- a done job reported as
+    // an orphan. Under 3 parallel layer-3 suites the lease hit it 3 of 3 (a
+    // job ending `exit 7` read as exit 5; `rc` held 7 a moment later), since
+    // a loaded tmux client widens the gap. `list_script` reads the live set
+    // first for the same reason.
     let script = format!(
         "d={dir}; [ -d $d ] && exists=1 || exists=0; printf 'exists=%s\\n' \"$exists\"; \
-         rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
          alive=$(tmux -L {} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
+         rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
          printf 'alive=%s\\n' \"$alive\"; \
          cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
          if [ -n \"$rc\" ]; then end_mtime=$(stat -c %Y $d/rc 2>/dev/null || stat -f %m $d/rc 2>/dev/null); \

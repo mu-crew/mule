@@ -36,7 +36,7 @@ use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_ORPHAN, MuleError};
 use crate::forward::{self, Spec};
 use crate::probe::{From as ProbeFrom, State, probe};
-use crate::transport::{Ssh, Transport};
+use crate::transport::{InFlight, Ssh, Stopper, Transport};
 use crate::wrapper::{JobId, JobMetadata, JobMode, new_id};
 
 /// How long the remote screen is mirrored into the pane after the first
@@ -51,9 +51,16 @@ const FIRST_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the signal path waits for its own `unforward` before exiting
-/// anyway. `unforward` is local work plus lock-free mux ops, normally a few
-/// ms; the bound is for a main thread that holds the LOCAL's flock mid-forward.
-const UNFORWARD_GRACE: Duration = Duration::from_secs(1);
+/// anyway. `unforward` is local work plus lock-free mux ops; the bound is for
+/// a main thread that holds the LOCAL's flock mid-forward.
+///
+/// Not 1s: on a loaded machine each `ssh -O cancel` spawn took 0.25-0.45s, and
+/// with three layer-3 suites in parallel 8 of 45 signal-path unforwards ran
+/// past 1s (the slowest that finished took 0.997s). The process then exited
+/// mid-unforward and left LOCAL and its record behind. 3s, the same bound as
+/// `DISPATCH_GRACE`, keeps the exit prompt and still covers a forward in
+/// progress on the main thread.
+const UNFORWARD_GRACE: Duration = Duration::from_secs(3);
 
 /// What to run.
 #[derive(Debug, Clone)]
@@ -564,6 +571,8 @@ struct RealSignalSteps {
     specs: Vec<Spec>,
     config: Option<PathBuf>,
     dispatching: Arc<AtomicBool>,
+    /// The main thread's locked calls (dispatch, probes).
+    calls: Stopper,
 }
 
 impl SignalSteps for RealSignalSteps {
@@ -578,6 +587,15 @@ impl SignalSteps for RealSignalSteps {
         while self.dispatching.load(Ordering::SeqCst) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A probe in flight holds the one session, and exiting would not free
+        // it: the remote script runs on, while the ticket goes with our pid.
+        // The `rm` would be served a taken channel and refused -- under three
+        // parallel layer-3 suites a probe took 2s, and a `mule rm` right after
+        // a TERMed lease failed this way. So no new call starts from here on,
+        // and the one running gets the rest of the same bound. A group signal
+        // kills that ssh too, and its call returns at once.
+        self.calls
+            .stop(deadline.saturating_duration_since(Instant::now()));
         let _ = cleanup::spawn_rm(self.config.as_deref(), &self.host.name, &self.id);
     }
 
@@ -606,12 +624,15 @@ pub fn run_cli(
 ) -> Result<i32> {
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
     let dispatching = Arc::new(AtomicBool::new(false));
+    let ssh = InFlight::new(Ssh);
+    let calls = ssh.stopper();
     // The id is known only once `start` has generated it; until then a signal
     // has nothing to stop (nothing was dispatched) and just exits.
     let named: Arc<std::sync::Mutex<Option<JobId>>> = Arc::default();
     {
         let (host, specs, config) = (host.clone(), specs.clone(), config.clone());
         let (dispatching, named) = (Arc::clone(&dispatching), Arc::clone(&named));
+        let calls = calls.clone();
         signals.on_signal(move |signal| {
             // Held to the exit when no id is named yet: `on_dispatch` takes the
             // same lock before the dispatch ssh, so a dispatch can never start
@@ -629,6 +650,7 @@ pub fn run_cli(
                         specs,
                         config,
                         dispatching,
+                        calls,
                     },
                     signal,
                 ),
@@ -643,7 +665,7 @@ pub fn run_cli(
 
     let mut stderr = std::io::stderr();
     let started = start(
-        &Ssh,
+        &ssh,
         host,
         job_file,
         request,
@@ -689,7 +711,7 @@ pub fn run_cli(
     };
 
     let code = hold(
-        &Ssh,
+        &ssh,
         &Hold {
             host,
             id: &id,

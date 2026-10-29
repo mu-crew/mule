@@ -251,6 +251,97 @@ impl Transport for Ssh {
     }
 }
 
+/// A transport whose locked calls a signal path can stop and wait out.
+///
+/// For a process that exits on a signal mid-call: killing a local ssh does
+/// not free the session it holds -- the remote command keeps the channel
+/// until it ends (measured: a SIGKILLed `sleep 3` holder left the channel
+/// refused for 2.99s). The ticket, though, is released by the caller's death.
+/// So a caller that exits mid-call hands the next ticket holder a channel
+/// that is still taken, and that holder is refused.
+///
+/// [`Stopper::stop`] closes the gate -- no new call starts -- and waits for the
+/// one in flight. Both halves matter: a signal path that only waited could see
+/// nothing in flight, then lose to a main thread starting its next probe while
+/// the path was busy elsewhere, and exit with that probe holding the session.
+///
+/// It lives here, not with its user, because it is a `Transport`: delegating
+/// `run_unlocked` is safe only inside the provided `run`, which holds the lock.
+pub struct InFlight<T> {
+    inner: T,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+const GATE_IDLE: u8 = 0;
+const GATE_BUSY: u8 = 1;
+const GATE_STOPPED: u8 = 2;
+
+impl<T: Transport> InFlight<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(GATE_IDLE)),
+        }
+    }
+
+    pub fn stopper(&self) -> Stopper {
+        Stopper(std::sync::Arc::clone(&self.state))
+    }
+}
+
+impl<T: Transport> Transport for InFlight<T> {
+    fn run_unlocked(&self, host: &Host, script: &str) -> Result<Output> {
+        use std::sync::atomic::Ordering;
+        if self
+            .state
+            .compare_exchange(GATE_IDLE, GATE_BUSY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("not started: mule is stopping");
+        }
+        let out = self.inner.run_unlocked(host, script);
+        // Fails only if `stop` gave up waiting and closed the gate anyway.
+        let _ =
+            self.state
+                .compare_exchange(GATE_BUSY, GATE_IDLE, Ordering::SeqCst, Ordering::SeqCst);
+        out
+    }
+
+    fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output> {
+        self.inner.mux_op(host, op)
+    }
+}
+
+/// The signal path's handle on an [`InFlight`].
+#[derive(Clone)]
+pub struct Stopper(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl Stopper {
+    /// Refuse every new locked call, and wait up to `grace` for the one in
+    /// flight. True when nothing is left running. On a timeout the gate is
+    /// closed anyway: the caller is about to exit and must not start more.
+    pub fn stop(&self, grace: std::time::Duration) -> bool {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            match self.0.compare_exchange(
+                GATE_IDLE,
+                GATE_STOPPED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(GATE_STOPPED) => return true,
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    self.0.store(GATE_STOPPED, Ordering::SeqCst);
+                    return false;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+}
+
 /// A recording transport for test layer 1.
 ///
 /// Deliberately **not** `#[cfg(test)]`: integration tests live in their own
