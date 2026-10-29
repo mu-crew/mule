@@ -86,4 +86,11 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           python3 scripts/changelog-section.py CHANGELOG.md "$version" > notes.md
-          gh release create "$GITHUB_REF_NAME" --title "mule $version" --notes-file notes.md --verify-tag
+          mkdir dist
+          for pair in x86_64-unknown-linux-musl:mule-linux-x64 aarch64-unknown-linux-musl:mule-linux-arm64 aarch64-apple-darwin:mule-darwin-arm64; do
+            target="${pair%%:*}" package="${pair#*:}"
+            chmod +x "artifacts/$package/mule"
+            tar -C "artifacts/$package" -czf "dist/mule-$version-$target.tar.gz" mule
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" --title "mule $version" --notes-file notes.md --verify-tag dist/*
