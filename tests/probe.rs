@@ -203,3 +203,71 @@ fn a_screen_probe_carries_the_pane_capture_in_the_same_round_trip() {
     assert!(script.contains("/screen"), "{script}");
     assert!(!script.contains("tail -c"), "no log bytes: {script}");
 }
+
+/// Runs the real probe script under `sh`, with a `tmux` shim first on PATH.
+struct Shimmed {
+    path: String,
+    state: PathBuf,
+}
+
+impl mule::transport::Transport for Shimmed {
+    fn run_unlocked(&self, _: &Host, script: &str) -> anyhow::Result<Output> {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .env("PATH", &self.path)
+            .env("XDG_STATE_HOME", &self.state)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        Ok(Output {
+            stdout: out.stdout,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            code: out.status.code().unwrap_or(-1),
+        })
+    }
+
+    fn mux_op(&self, _: &Host, _: mule::transport::MuxOp) -> anyhow::Result<Output> {
+        Ok(Output::ok(""))
+    }
+}
+
+#[test]
+fn a_job_that_ends_between_the_reads_is_done_not_orphaned() {
+    // Every path that ends a job writes `rc` before its session goes, so the
+    // probe must look at the session first and `rc` second. Read the other way
+    // round, a job finishing between the two reads shows "no rc, no session":
+    // an orphan. Under three parallel layer-3 suites the lease read a job
+    // that exited 7 as orphan (exit 5) in 3 of 3 runs, with rc=7 on disk a
+    // moment later.
+    //
+    // The shim makes that interleaving certain: its `has-session` is the
+    // instant the job ends -- it writes `rc`, then reports the session gone.
+    isolate_state();
+    let root = std::env::temp_dir().join(format!("mule-probe-race-{}", std::process::id()));
+    let state = root.join("state");
+    let id: mule::wrapper::JobId = "abc123".parse().unwrap();
+    let job = state.join("mule/jobs").join(id.as_str());
+    std::fs::create_dir_all(&job).unwrap();
+    std::fs::write(job.join("cmd"), "exit 7\n").unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("tmux");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *has-session*) echo 7 > '{}'; exit 1;; esac\nexit 1\n",
+            job.join("rc").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let transport = Shimmed {
+        path: format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        state,
+    };
+
+    let result = probe(&transport, &host(), &id, mule::probe::From::StateOnly);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_eq!(result.unwrap().state, State::Done(7));
+}

@@ -87,16 +87,7 @@ fn the_cap_refuses_a_second_session_on_one_connection() {
     let _master = sshd.open_master(&socket);
 
     // Occupy the single channel.
-    let mut holder = std::process::Command::new(sshd.dir.join("ssh"))
-        .arg("-S")
-        .arg(&socket)
-        .args(["-o", "BatchMode=yes", "127.0.0.1", "sleep", "5"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    let mut holder = occupy_the_only_session(&sshd, &socket, "5");
 
     // A second command on the SAME socket is refused, and the refusal is the
     // misleading one: ssh falls back to a fresh connection and fails there, so
@@ -1564,16 +1555,38 @@ fn unix_spec(local: &std::path::Path, remote: &std::path::Path) -> String {
 }
 
 fn holding_the_only_session(sshd: &Sshd, secs: &str) -> std::process::Child {
+    occupy_the_only_session(sshd, &sshd.socket, secs)
+}
+
+/// Hold the one session on `socket` for `secs`, and return once it is held.
+///
+/// Held means the remote command is running, which is observable: on loopback
+/// the remote is this machine, so it drops a file. A fixed 400ms sleep stood
+/// in for that and was too short under three parallel layer-3 suites: the
+/// "second" session found the channel still free and succeeded.
+fn occupy_the_only_session(
+    sshd: &Sshd,
+    socket: &std::path::Path,
+    secs: &str,
+) -> std::process::Child {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let flag = sshd.dir.join(format!(
+        "held-{}",
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let holder = std::process::Command::new(sshd.dir.join("ssh"))
         .arg("-S")
-        .arg(&sshd.socket)
-        .args(["-o", "BatchMode=yes", "127.0.0.1", "sleep", secs])
+        .arg(socket)
+        .args(["-o", "BatchMode=yes", "127.0.0.1"])
+        .arg(format!("touch '{}'; sleep {secs}", flag.display()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_until("the holder's session", Duration::from_secs(30), || {
+        flag.exists()
+    });
     holder
 }
 
@@ -1595,8 +1608,11 @@ fn a_forward_carries_traffic_while_the_only_session_is_held() {
         "forward during a held session: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The holder keeps the session 8s, so anything well under that proves
+    // the forward did not queue. Not 3s: with three layer-3 suites in
+    // parallel a forward's check+cancel+forward+check took over 3s once.
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(6),
         "a forward is not a session and must not queue behind one"
     );
     assert_eq!(through(&local), "hello");
@@ -2019,10 +2035,12 @@ fn a_long_exec_leaves_a_default_master_usable_and_a_signal_leaves_no_job() {
         std::thread::sleep(Duration::from_millis(300));
     }
     // And mule's own channel is not held either: a poll-shaped call is quick.
+    // Held, it would wait out the 30s job; 15s leaves room for a loaded
+    // machine (5s failed once with three layer-3 suites in parallel).
     let started = Instant::now();
     let listed = sshd.mule(&config, &["ls", "--quiet"]);
     assert!(listed.status.success());
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(15));
 
     // SIGTERM mid-exec: no job left.
     signal(&exec, "TERM");
@@ -2469,6 +2487,21 @@ fn record_dir(sshd: &Sshd) -> PathBuf {
     sshd.state_root.join("mule/forwards/live")
 }
 
+/// Wait for a lease's first forward: its record written and LOCAL accepting.
+///
+/// `Lease::id` returns once the job file exists, which is BEFORE the dispatch,
+/// and the lease forwards only after the dispatch returns. Under three
+/// parallel layer-3 suites a TUI dispatch took 5.2-5.7s (each of its ~7 tmux
+/// client calls went from ~12ms to 0.1-0.8s), so a bare `through` -- 5s of
+/// retries -- gave up before the forward existed and read "", which looked
+/// like a forward that does not carry. The bound is generous because it is
+/// only reached when something is actually broken.
+fn wait_forwarded(sshd: &Sshd, local: &std::path::Path) {
+    wait_until("the lease's first forward", Duration::from_secs(30), || {
+        records(sshd) >= 1 && std::os::unix::net::UnixStream::connect(local).is_ok()
+    });
+}
+
 fn records(sshd: &Sshd) -> usize {
     std::fs::read_dir(record_dir(sshd))
         .map(|dir| {
@@ -2500,8 +2533,11 @@ fn a_lease_forwards_traffic_and_leaves_another_master_usable_while_it_holds() {
     let id = lease.id();
     // Forwarded without waiting for REMOTE: LOCAL listens before anything
     // serves the far end (connect succeeds and reads EOF).
-    wait_until("LOCAL to listen", Duration::from_secs(10), || {
-        std::os::unix::net::UnixStream::connect(&local).is_ok()
+    wait_forwarded(&sshd, &local);
+    // The forward precedes the first probe; under parallel load that probe
+    // took 2s, so "running" is waited for rather than assumed.
+    wait_until("the first probe's status", Duration::from_secs(30), || {
+        lease.output().contains("on live: running")
     });
     // On loopback "remote" is this machine, so the test plays the job's server.
     let _serve = Serve::start(remote.clone(), "from-the-job");
@@ -2631,6 +2667,7 @@ fn removing_local_while_leased_is_re_forwarded_on_a_later_tick() {
         &["sleep 60"],
     );
     let id = lease.id();
+    wait_forwarded(&sshd, &local);
     assert_eq!(through(&local), "back");
 
     std::fs::remove_file(&local).unwrap();
@@ -2663,6 +2700,7 @@ fn a_lease_survives_a_master_restart_and_re_forwards_on_the_new_pid() {
         &["sleep 60"],
     );
     let id = lease.id();
+    wait_forwarded(&sshd, &local);
     assert_eq!(through(&local), "alive");
 
     // `ssh -O exit`: the master and every forward it held are gone.
@@ -2722,6 +2760,7 @@ fn kill_9_of_a_lease_leaves_the_job_named_and_a_new_forward_of_local_works() {
         &["sleep 60"],
     );
     let id = first.id();
+    wait_forwarded(&sshd, &local);
     assert_eq!(through(&local), "still");
     first.child.kill().unwrap();
     first.child.wait().unwrap();
@@ -2741,7 +2780,8 @@ fn kill_9_of_a_lease_leaves_the_job_named_and_a_new_forward_of_local_works() {
     let second_id = second.id();
     wait_until(
         "the second lease's forward",
-        Duration::from_secs(10),
+        // Behind a dispatch, like the first (see `wait_forwarded`).
+        Duration::from_secs(30),
         || records(&sshd) == 1 && through_once(&local) == "still",
     );
     signal(&second.child, "TERM");
@@ -2927,12 +2967,17 @@ fn kill_pane_ends_the_lease_and_its_job(
         .unwrap()
         .trim()
         .to_string();
-    wait_until("the forward", Duration::from_secs(10), || {
+    // Not 10s: the forward follows the dispatch, which took 5s+ under
+    // parallel load (see `wait_forwarded`).
+    wait_until("the forward", Duration::from_secs(30), || {
         records(&sshd) == 1
     });
     wait_until(
         "the moment to kill the pane",
-        Duration::from_secs(20),
+        // The mid-print case needs 6.5s with no ssh in flight after the pane
+        // freezes; with parallel suites (load average ~100) a single probe
+        // took 2s+, so 20s timed out once in 15 suites.
+        Duration::from_secs(60),
         || ready(&pane, &flag),
     );
 
@@ -3035,5 +3080,98 @@ fn kill_pane_while_holding_stops_the_job_and_cancels_the_forward() {
 fn kill_pane_mid_probe_abandons_the_probe_and_still_stops_the_job() {
     kill_pane_ends_the_lease_and_its_job("lease-kpprobe", Shim::SlowProbe, &|_, flag| {
         std::fs::read_to_string(flag).is_ok_and(|pid| !pid.trim().is_empty())
+    });
+}
+
+/// An `ssh` whose probes hold the session `secs` longer on the remote side,
+/// and drop a flag file when one starts. Unlike [`slow_probe_ssh`], the delay
+/// is in the remote script, so it is the channel that is held -- what a probe
+/// on a loaded host looks like -- not the local shim.
+fn held_probe_ssh(sshd: &Sshd, flag: &std::path::Path, secs: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = sshd.dir.join("held-probe");
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("ssh");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *exists=*) echo $$ > '{flag}'; exec '{ssh}' \"$@\" '; sleep {secs}';; esac\nexec '{ssh}' \"$@\"\n",
+            flag = flag.display(),
+            ssh = sshd.dir.join("ssh").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+#[test]
+fn a_signal_mid_probe_frees_the_session_before_the_lease_exits() {
+    // TERM to the lease alone (not its group) while a probe holds the one
+    // session. The lease used to exit at once, abandoning the probe's ssh:
+    // its ticket was released by pid death while the orphaned ssh still held
+    // the channel, so the next locked caller -- the detached stop, or any
+    // `mule` verb -- was refused (`the master is down or its one slot is
+    // held`). Under three parallel layer-3 suites, where a probe took 2s, this
+    // failed the kill-9 lease test's `mule rm`. On a real capped host the
+    // refusal has no fallback, so the stop fails and the job leaks.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let tmux = Tmux::new(&sshd, "lease-heldprobe");
+    let config = sshd.write_config(&tmux.name);
+    let flag = sshd.dir.join("probe-flag");
+    let dir = held_probe_ssh(&sshd, &flag, 1);
+    let path = PathBuf::from(format!("{}:{}", dir.display(), sshd.path_env()));
+    let job_file = sshd.dir.join("held.job");
+    let mut lease = mule_command(
+        &sshd,
+        &config,
+        &[
+            "run",
+            "--lease",
+            "--human",
+            "--job-file",
+            job_file.to_str().unwrap(),
+            "--",
+            "sleep 60",
+        ],
+        &[("PATH", path.as_path())],
+    )
+    .stdout(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+    wait_until(
+        "a probe to hold the session",
+        Duration::from_secs(30),
+        || flag.exists(),
+    );
+    let id = std::fs::read_to_string(&job_file)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let signalled = Instant::now();
+    signal(&lease, "TERM");
+    assert_eq!(lease.wait().unwrap().code(), Some(143));
+    let waited = signalled.elapsed();
+
+    // The lease's ticket is released by its death, so its ssh must be gone
+    // too: one still alive holds the channel no lock now accounts for. The
+    // wait is bounded (3s, as for a dispatch), so a probe slower than that --
+    // seen at load average 100 -- may outlive the lease, but only after the
+    // full bound. The unfixed lease exited at once with the probe alive.
+    let probe_pid = std::fs::read_to_string(&flag).unwrap();
+    let probe_alive = std::process::Command::new("kill")
+        .args(["-0", probe_pid.trim()])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !probe_alive || waited >= Duration::from_millis(2900),
+        "the lease exited after {waited:?} while its probe still held the session"
+    );
+    wait_until("the job to be stopped", Duration::from_secs(15), || {
+        !job_state_dir(&sshd, &id).exists()
     });
 }

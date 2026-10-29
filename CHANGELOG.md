@@ -21,6 +21,19 @@ tick makes one locked call, the last included: a state-only probe that sees the
 job done leaves the final screen to the next tick's probe, and the code it saw
 stands even if that capture fails.
 
+**The probe reads session liveness before `rc`.** Every path that ends a job
+writes `rc` before its session goes, so this order cannot see "no session, no
+rc" for a job that finished between the two reads. The old order could, and
+reported a done job as an orphan: under three parallel layer-3 suites a lease
+whose job exited 7 exited 5 instead, 3 runs in 3. `poll`, `wait`, `tail` and
+`exec` share the probe and get the fix.
+
+On a signal, a lease starts no further locked call and waits up to 3s for the
+one in flight (its dispatch or a probe) before it exits. Killing a local ssh leaves the remote script holding
+the one session while the ticket goes with the lease, so the detached stop (or
+any next `mule` call) was refused. The signal-path `unforward` bound is 3s, up
+from 1s, which a loaded machine overran.
+
 The poll probe gains a screen mode that carries `capture-pane` in the same
 locked call, so mirroring costs no extra round trip.
 

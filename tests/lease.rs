@@ -714,3 +714,82 @@ fn the_signal_path_redirects_then_stops_then_unforwards_then_exits() {
         assert_eq!(steps.0, ["redirect", "stop", "unforward"]);
     }
 }
+
+/// A transport whose locked call blocks until released, so a test can stop
+/// the gate with a call in flight.
+struct Gated {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl Transport for Gated {
+    fn run_unlocked(&self, _: &Host, _: &str) -> anyhow::Result<Output> {
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(Output::ok(""))
+    }
+
+    fn mux_op(&self, _: &Host, _: MuxOp) -> anyhow::Result<Output> {
+        Ok(Output::ok(""))
+    }
+}
+
+#[test]
+fn stopping_waits_for_the_call_in_flight_and_refuses_the_next() {
+    // The signal path must not exit while its probe holds the one session
+    // (killing the local ssh leaves the remote script holding it), and must
+    // not let the main thread start another probe meanwhile.
+    use mule::transport::InFlight;
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let ssh = Arc::new(InFlight::new(Gated {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let stopper = ssh.stopper();
+
+    let call = {
+        let ssh = Arc::clone(&ssh);
+        std::thread::spawn(move || ssh.run(&host(), "probe").is_ok())
+    };
+    entered_rx.recv().unwrap();
+
+    // In flight: a short stop gives up and reports it.
+    assert!(!stopper.stop(Duration::from_millis(50)));
+
+    release_tx.send(()).unwrap();
+    assert!(call.join().unwrap(), "the call in flight finishes normally");
+    assert!(stopper.stop(Duration::ZERO), "nothing left running");
+    // The gate stayed closed: the next call never reaches ssh. (Checked after
+    // the first returns, because both queue on the same ticket lock. With the
+    // sender gone, a call that did reach `Gated` panics rather than hangs.)
+    drop(release_tx);
+    assert!(ssh.run(&host(), "next probe").is_err());
+}
+
+#[test]
+fn stopping_returns_once_the_call_in_flight_returns() {
+    use mule::transport::InFlight;
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let ssh = Arc::new(InFlight::new(Gated {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let stopper = ssh.stopper();
+    let call = {
+        let ssh = Arc::clone(&ssh);
+        std::thread::spawn(move || ssh.run(&host(), "probe").is_ok())
+    };
+    entered_rx.recv().unwrap();
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+    });
+    let started = std::time::Instant::now();
+    assert!(stopper.stop(Duration::from_secs(10)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(call.join().unwrap());
+    releaser.join().unwrap();
+}
