@@ -109,38 +109,24 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
 
     loop {
         let acquired = with_counter_lock(path, || {
-            let serving = read_counters(path)?.serving;
+            let read = read_counters(path)?.serving;
+            // Step over every consecutive dead ticket in this one pass, not
+            // one per poll: after a SIGKILL storm `serving` can trail by
+            // hundreds of abandoned tickets, and one step per 5ms poll made
+            // the next caller sleep through all of them (400 measured at
+            // 3.96s; the storm test's 10s recovery bound flaked under load).
+            let mut serving = read;
+            while serving < ticket && ticket_is_abandoned(path, serving)? {
+                serving += 1;
+            }
+            if serving != read {
+                publish(path, "serving", serving)?;
+            }
             if serving == ticket {
                 publish(path, "holder", std::process::id()).context("cannot record lock holder")?;
                 // Our turn: we are the holder now, not a waiter.
                 fs::remove_file(waiter_file(path, ticket)).ok();
                 return Ok(true);
-            }
-
-            if serving < ticket {
-                match process(&path.join("holder"))? {
-                    // A holder that died mid-work, or whose pid never made it
-                    // to disk. Step over it.
-                    Process::Dead => {
-                        fs::remove_file(path.join("holder")).ok();
-                        publish(path, "serving", serving + 1)?;
-                    }
-                    Process::Live => {}
-                    // Nobody holds the lock, so whoever owns `serving` is
-                    // either waiting for it or gone. Deciding by pid rather
-                    // than by a timeout keeps this deterministic: a live
-                    // waiter writes `holder` inside the same counter lock we
-                    // are inside now, so it cannot be mid-claim here.
-                    Process::Missing => {
-                        let waiter = waiter_file(path, serving);
-                        // No waiter file (handed out, then lost), a dead pid,
-                        // or a torn file: no live process holds this ticket.
-                        if process(&waiter)? != Process::Live {
-                            fs::remove_file(&waiter).ok();
-                            publish(path, "serving", serving + 1)?;
-                        }
-                    }
-                }
             }
             Ok(false)
         })?;
@@ -168,6 +154,33 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
             warned = true;
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Whether no live process owns ticket `serving`, removing what it left behind.
+/// Call inside the counter lock.
+fn ticket_is_abandoned(path: &Path, serving: u64) -> Result<bool> {
+    match process(&path.join("holder"))? {
+        // A holder that died mid-work, or whose pid never made it to disk.
+        Process::Dead => {
+            fs::remove_file(path.join("holder")).ok();
+            Ok(true)
+        }
+        Process::Live => Ok(false),
+        // Nobody holds the lock, so whoever owns `serving` is either waiting
+        // for it or gone. Deciding by pid rather than by a timeout keeps this
+        // deterministic: a live waiter writes `holder` inside the same counter
+        // lock the caller is inside now, so it cannot be mid-claim here.
+        Process::Missing => {
+            let waiter = waiter_file(path, serving);
+            // No waiter file (handed out, then lost), a dead pid, or a torn
+            // file: no live process holds this ticket.
+            if process(&waiter)? == Process::Live {
+                return Ok(false);
+            }
+            fs::remove_file(&waiter).ok();
+            Ok(true)
+        }
     }
 }
 
@@ -252,10 +265,13 @@ const PUBLISH_TMP: &str = "publish.tmp";
 /// the file: 1 close in 9 smoke runs, and 12 of 12 SIGKILL-storm trials within
 /// 7-252 rounds. A rename publishes all of the value or none of it.
 ///
-/// The fsync orders the data before the rename, so a crash of the machine
-/// cannot publish the new name over unwritten blocks either. The directory is
-/// not synced: a rename lost to a crash leaves the old value, and after a
-/// reboot every pid in the directory is dead and is stepped over anyway.
+/// No fsync, deliberately. Atomicity against a dead *process* needs only the
+/// rename; an fsync buys durability across power loss, which this state does
+/// not need: after a reboot every recorded pid is dead, and a file a crash
+/// left empty or torn reads as dead or is rebuilt (see [`read_parsed`],
+/// [`read_counters`]). It cost every mule ssh inside the counter flock: plain
+/// `fsync(2)` took an uncontended locked call from 9ms to 14ms, and
+/// `File::sync_all` (`F_FULLFSYNC` on macOS) to 37ms.
 fn publish(path: &Path, name: &str, value: impl std::fmt::Display) -> Result<()> {
     use std::io::Write;
 
@@ -267,9 +283,7 @@ fn publish(path: &Path, name: &str, value: impl std::fmt::Display) -> Result<()>
         .truncate(true)
         .open(&tmp)
         .with_context(|| format!("cannot write {}", tmp.display()))?;
-    writeln!(file, "{value}")
-        .and_then(|()| fsync(&file))
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    writeln!(file, "{value}").with_context(|| format!("cannot write {}", tmp.display()))?;
     drop(file);
     fs::rename(&tmp, &target).with_context(|| format!("cannot write {}", target.display()))
 }
@@ -322,13 +336,14 @@ struct Counters {
 /// Neither may default to 0. A `next` of 0 re-issues tickets that are still
 /// out, and a `serving` read too high grants a ticket while its predecessor
 /// still holds the lock: both are two holders. A `serving` read too low only
-/// costs one step-over per poll. So each is rebuilt from what the directory
-/// proves:
+/// costs one step-over pass, which clears every dead ticket at once. So each
+/// is rebuilt from what the directory proves:
 ///
 /// - `next` is past every ticket on disk: `max(waiter.N + 1, serving + 1 if a
 ///   holder file exists, else serving)`. Re-issuing a dead ticket's number is
 ///   harmless; only a live one matters, and a live ticket has a waiter file or
-///   is the holder's, which is `serving`.
+///   is the holder's, which is `serving`. With `serving` torn too, a live
+///   holder still means `next` is at least 1: its ticket is below `next`.
 /// - `serving` is the lowest live ticket -- the lowest live waiter, or `next`
 ///   if there is none -- minus one while a live holder still has the lock. The
 ///   holder's own ticket is not on disk, but it is below every live waiter, so
@@ -392,31 +407,6 @@ fn read_counters(path: &Path) -> Result<Counters> {
         }
     };
     Ok(Counters { next, serving })
-}
-
-/// Plain `fsync(2)`, deliberately not `File::sync_all`.
-///
-/// On macOS `sync_all` issues `F_FULLFSYNC`, a drive-cache flush: measured at
-/// 37ms per uncontended locked call against 9ms before atomic publication, a
-/// tax on every mule ssh. Plain `fsync` measured 14ms. What it gives up is
-/// durability across power loss, which this state does not need: after a
-/// reboot every recorded pid is dead, and a torn file reads as dead or is
-/// rebuilt (see [`read_parsed`], [`read_counters`]).
-#[cfg(unix)]
-fn fsync(file: &fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    // SAFETY: the fd is owned by `file`, which outlives the call.
-    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn fsync(file: &fs::File) -> std::io::Result<()> {
-    file.sync_all()
 }
 
 #[cfg(unix)]
