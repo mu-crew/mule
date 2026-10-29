@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-29
 
 **A mule killed mid-write no longer wedges the host.** The ticket lock wrote its
 files by truncate-then-write, so a SIGKILL between the two left an empty
