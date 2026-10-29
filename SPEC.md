@@ -60,6 +60,10 @@ The exemption is structural too. `Transport::mux_op(host, MuxOp)` is the one loc
 
 The lock lives at `~/.local/state/mule/<host>.lock`. A ticket lock gives bounded, first-come-first-served progress. A retrying mutex did not: four callers produced a worst wait of **4.14s** for **0.25s** of work. The lock records each waiter's PID and the holder PID, then skips either when that process is gone. After about **5s**, a waiter reports its ticket position and the holder PID but keeps waiting.
 
+**Recovery exception.** A session can be held by an ssh no ticket accounts for: a mule process that dies mid-call releases its ticket (pid death) while its ssh, or the remote script behind it, keeps the session. Measured: a lease TERMed mid-dispatch, whose dispatch outlived its 3s grace, held the session for seconds under three parallel layer-3 suites, and the next `mule rm` was refused -- mu kept a job it meant to stop. So `Transport::run` retries one failure: a mux refusal proven from ssh's **own** log (`ssh -E` to a private 0600 file), with nothing on stdout, while `-O check` still finds the master. That attempt never started the script, so it cannot run twice. Remote stderr never drives a retry: a script that ran can print the same text and exit 255, and judging by stderr re-ran it (measured: two calls, two side effects; with `-E` the spoof stays on stderr and ssh's log stays empty). On a proven refusal the caller releases its ticket, backs off (100ms doubling to 1s), and takes a fresh ticket **at the back**, so a refused caller never holds the queue through its wait. Later callers may therefore complete first: FIFO holds per attempt, not per call. The loop's budget is **12s**, inside mu's 20s stop budget with room for the queue, the ssh and the removal; when the time left is shorter than the next backoff it stops and reports the busy error (exit 1, so `rm` keeps the job). The 12s bounds only the retry loop. The ticket wait before each attempt is unbounded, deliberately (see above), so mule verbs may block on the queue, and **a caller needing a hard wall-clock bound must impose it** -- as mu does, with process-group termination and a timed-out stop that keeps the handle. Each `-O check` is killed after **2s**: a SIGSTOPped master left a plain check blocked at 12.31s (measured), and every verb checks the master before it queues.
+
+The retry is safe only because no mule ssh can reach the host except through the master. When the mux client is refused, ssh falls back to a connection of its own; with `ProxyCommand=none` that fallback dialled the host directly and, where keys alone authenticate, ran the script outside the master (measured on the loopback sshd). mule therefore passes `ProxyCommand=/usr/bin/false`: the fallback dies at once, with no prompt, no connect and no execution, and a site `ProxyCommand` never starts (measured). It overrides a configured `ProxyJump` too. Multiplexing over the master is unaffected, since the socket is already connected.
+
 The lock poll interval is **5ms**. With four callers, five rounds each, and **50ms** of work per round, the workload has **1s** of serialized work and an ideal peak wait near **200ms**. A **20ms** poll interval had a roughly **275ms** median and **443ms** worst wait, and exceeded a **600ms** bound once in 15 runs. A **5ms** interval had a roughly **237ms** median and **261ms** worst wait across six runs.
 
 ## Leases
@@ -301,7 +305,7 @@ Cost: about 125ms to dispatch plus at least 100ms of polling, against 33ms for a
 
 ### Detached cleanup
 
-A foreground waiter cannot stop its own job from a signal path: `rm` queues on the ticket lock, and a holder whose ssh fell back to a direct connect can keep the ticket for a TCP timeout. So the waiter spawns a detached child and exits at once:
+A foreground waiter cannot stop its own job from a signal path: `rm` queues on the ticket lock, and the wait for a ticket has no bound of its own. So the waiter spawns a detached child and exits at once:
 
 - **Executable:** `std::env::current_exe()`, never `mule` from PATH. A worker or a test runs a freshly built binary, and PATH may hold another or none.
 - **Arguments:** the effective `--config` path when one was given (made absolute), then `--quiet`, `rm`, `--host H`, the id. The child must never fall back to, or seed, the default config.
@@ -345,7 +349,7 @@ Truncation is recorded in a marker file and reported on stderr by `tail`, becaus
 - A missing job exits **1** with `job <id> not found`.
 - A dropped connection during `wait` exits **6** while the remote job continues.
 - `exec` output past `max_log_bytes` exits **7** in place of the command's code, so a stdout parser never mistakes a prefix for the whole answer.
-- A refused channel reports a busy or down master rather than raw SSH authentication text.
+- A refused channel is retried on a fresh ticket for up to 12s when ssh's own log proves the script never started, then reports a busy or down master rather than raw SSH authentication text.
 - An unreachable configured host remains visible in `ls` diagnostics.
 
 ## Reproduce the channel cap locally
@@ -396,7 +400,7 @@ kill "$(cat "$tmp/sshd.pid")"
 rm -rf "$tmp"
 ```
 
-The check reports `Master running (pid=NNN)`. While `sleep 6` occupies its only session, the same socket reports `Session open refused by peer`; SSH may then open a fallback connection. The explicitly separate connection succeeds. Mule treats the refusal text as a busy channel even if SSH's fallback succeeds.
+The check reports `Master running (pid=NNN)`. While `sleep 6` occupies its only session, the same socket reports `Session open refused by peer`; SSH may then open a fallback connection. The explicitly separate connection succeeds. mule's own calls cannot take that fallback (`ProxyCommand=/usr/bin/false`, see [Contention and fairness](#contention-and-fairness)), and it reads the refusal from ssh's `-E` log, never from the remote's stderr.
 
 The important setup details are a free ephemeral port, mode `600` on keys and config, `StrictModes no` for a temporary directory, quoted option arrays, and cleanup through `PidFile`. A previously unquoted option string made SSH parse `-i` as part of the config filename, and the probe passed without testing the intended connection.
 
@@ -445,7 +449,7 @@ An attachment is another long-lived SSH session. Follow mode polls by byte offse
 
 ### Use a retrying mutex
 
-Repeated acquisition was unfair: one **0.25s** operation caused a **4.14s** wait. Ticket order bounds the wait and handles dead holders and waiters by PID.
+Repeated acquisition was unfair: one **0.25s** operation caused a **4.14s** wait. Ticket order bounds the wait and handles dead holders and waiters by PID. The refusal [recovery exception](#contention-and-fairness) is not this: each retry takes a fresh ticket at the back of the same queue, never spins on acquisition, and is bounded at 12s.
 
 A dead *waiter* matters as much as a dead holder. A caller that claims a ticket and exits before its turn writes no holder file, so nothing identifies the gap; the queue then stops at that number permanently. Each waiter therefore records its PID at claim time, and a successor steps over a ticket whose waiter is gone.
 

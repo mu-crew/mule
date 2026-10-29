@@ -3,8 +3,8 @@
 //! `mule exec` (and, later, the lease) is a foreground waiter for a detached
 //! job. When its terminal goes away or the caller sends TERM, the job must not
 //! outlive it -- but the process cannot do the stop itself: `rm` queues on the
-//! ticket lock, and a holder whose ssh fell back to a direct connect can keep
-//! the ticket for a TCP timeout. So the stop is handed to a **detached child**
+//! ticket lock, whose wait has no bound of its own, and may re-queue after a
+//! refused session. So the stop is handed to a **detached child**
 //! (this binary, `rm <id>`) and the waiter exits at once. The child queues like
 //! any caller, and a dead waiter's ticket is skipped by `wait_for_turn`.
 //!

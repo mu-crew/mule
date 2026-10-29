@@ -158,7 +158,11 @@ fn every_ssh_invocation_is_incapable_of_prompting() {
         // socket is already connected, so no proxy is needed to reach the host.
         // The user's hand-opened master keeps its own ProxyCommand, which is
         // where 2FA belongs -- once per ControlPersist window, deliberately.
-        assert!(flat.contains("ProxyCommand=none"), "{flat}");
+        // `/usr/bin/false`, not `none`: `none` let ssh's fallback after a
+        // refused session dial the host directly and run the script outside
+        // the master (layer 3 proves the fail-closed half).
+        assert!(flat.contains("ProxyCommand=/usr/bin/false"), "{flat}");
+        assert!(!flat.contains("ProxyCommand=none"), "{flat}");
     }
 }
 
