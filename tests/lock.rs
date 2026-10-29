@@ -964,3 +964,80 @@ fn sigkill_at_random_points_never_wedges_or_doubles_the_lock() {
         Err(_) => panic!("lock wedged after the storm; files {leftovers:?}"),
     }
 }
+
+/// Starts a caller and reports whether it was granted the lock within 300ms.
+///
+/// Used while a live holder still has the lock, so any grant is two holders.
+fn granted_early(path: &std::path::Path) -> (bool, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let p = path.to_path_buf();
+    let caller = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&p, || tx.send(()).ok()).unwrap();
+    });
+    (rx.recv_timeout(Duration::from_millis(300)).is_ok(), caller)
+}
+
+#[test]
+fn a_rebuilt_next_clears_a_live_holders_ticket_with_no_waiters() {
+    isolate_state();
+    // The holder's ticket is `serving` and has no waiter file, so only the
+    // `serving + 1` clause keeps a rebuilt `next` past it. Without the +1 the
+    // next caller draws the holder's own number, which is already being
+    // served, and is granted at once. Five rounds first so `serving` is not 0,
+    // where the "live holder means next >= 1" clause would mask the bug.
+    let dir = mule::lock::lock_path(&format!("torn-next-holder-{}", std::process::id()));
+    for _ in 0..5 {
+        mule::lock::with_lock_at(&dir, || ()).unwrap();
+    }
+    let inside = Arc::new(AtomicUsize::new(0));
+    let (release, holder) = hold(&dir, &inside);
+    fs::write(dir.join("next"), "").unwrap();
+    let (early, caller) = granted_early(&dir);
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    caller.join().unwrap();
+    fs::remove_dir_all(&dir).ok();
+    assert!(!early, "granted while a live holder held the lock");
+}
+
+#[test]
+fn both_counters_torn_under_a_live_holder_never_grant_its_ticket() {
+    isolate_state();
+    // With both counters gone nothing on disk names the holder's ticket 0: no
+    // `serving` to add 1 to, no waiter file. Only "a live holder means next is
+    // at least 1" stops ticket 0 being re-issued and granted beside it.
+    let dir = mule::lock::lock_path(&format!("torn-both-holder-{}", std::process::id()));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let (release, holder) = hold(&dir, &inside);
+    fs::write(dir.join("next"), "").unwrap();
+    fs::write(dir.join("serving"), "").unwrap();
+    let (early, caller) = granted_early(&dir);
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    caller.join().unwrap();
+    fs::remove_dir_all(&dir).ok();
+    assert!(!early, "granted while a live holder held the lock");
+}
+
+#[test]
+fn a_run_of_abandoned_tickets_is_stepped_over_in_one_pass() {
+    isolate_state();
+    let _lane = timing_lane();
+    // After a SIGKILL storm, `serving` can trail `next` by many tickets whose
+    // callers are all gone. Stepping over one per poll made the next caller
+    // pay POLL_INTERVAL per dead ticket: 400 here is at least 2s of sleeping,
+    // and the storm test's 10s recovery bound flaked under load. One pass
+    // under the counter flock reads 400 absent files.
+    let dir = mule::lock::lock_path(&format!("dead-run-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("next"), "400\n").unwrap();
+    fs::write(dir.join("serving"), "0\n").unwrap();
+    fs::write(dir.join("holder"), "").unwrap();
+    let started = Instant::now();
+    mule::lock::with_lock_at(&dir, || ()).unwrap();
+    let took = started.elapsed();
+    fs::remove_dir_all(&dir).ok();
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+}
