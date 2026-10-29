@@ -1,6 +1,6 @@
 {
   "name": "@mu-crew/mule",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Run long remote jobs without holding an SSH session",
   "license": "MIT",
   "repository": {
@@ -14,8 +14,8 @@
     "bin/mule"
   ],
   "optionalDependencies": {
-    "@mu-crew/mule-linux-x64": "0.2.1",
-    "@mu-crew/mule-linux-arm64": "0.2.1",
-    "@mu-crew/mule-darwin-arm64": "0.2.1"
+    "@mu-crew/mule-linux-x64": "0.3.0",
+    "@mu-crew/mule-linux-arm64": "0.3.0",
+    "@mu-crew/mule-darwin-arm64": "0.3.0"
   }
 }
