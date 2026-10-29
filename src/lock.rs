@@ -74,17 +74,14 @@ pub fn with_lock_at<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T> {
         .with_context(|| format!("cannot create lock directory {}", path.display()))?;
 
     let ticket = with_counter_lock(path, || {
-        let next = read_counter(&path.join("next"))?;
-        write_counter(&path.join("next"), next + 1)?;
-        if !path.join("serving").exists() {
-            write_counter(&path.join("serving"), 0)?;
-        }
+        let next = read_counters(path)?.next;
+        publish(path, "next", next + 1)?;
         // Record that a live process is waiting on this ticket. Without it, a
         // caller that dies *before* its turn arrives leaves a gap nothing can
         // detect: `serving` reaches its number, no `holder` was ever written,
         // and every later caller queues behind a ticket that will never be
         // claimed. Reproduced -- it wedged the host indefinitely.
-        fs::write(waiter_file(path, next), format!("{}\n", std::process::id()))
+        publish(path, &waiter_name(next), std::process::id())
             .context("cannot record lock waiter")?;
         Ok(next)
     })?;
@@ -98,8 +95,12 @@ pub fn with_lock_at<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T> {
     Ok(result)
 }
 
+fn waiter_name(ticket: u64) -> String {
+    format!("waiter.{ticket}")
+}
+
 fn waiter_file(path: &Path, ticket: u64) -> PathBuf {
-    path.join(format!("waiter.{ticket}"))
+    path.join(waiter_name(ticket))
 }
 
 fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
@@ -108,38 +109,35 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
 
     loop {
         let acquired = with_counter_lock(path, || {
-            let serving = read_counter(&path.join("serving"))?;
+            let serving = read_counters(path)?.serving;
             if serving == ticket {
-                fs::write(path.join("holder"), format!("{}\n", std::process::id()))
-                    .context("cannot record lock holder")?;
+                publish(path, "holder", std::process::id()).context("cannot record lock holder")?;
                 // Our turn: we are the holder now, not a waiter.
                 fs::remove_file(waiter_file(path, ticket)).ok();
                 return Ok(true);
             }
 
             if serving < ticket {
-                match read_pid(&path.join("holder"))? {
-                    // A holder that died mid-work. Step over it.
-                    Some(pid) if !pid_is_alive(pid) => {
+                match process(&path.join("holder"))? {
+                    // A holder that died mid-work, or whose pid never made it
+                    // to disk. Step over it.
+                    Process::Dead => {
                         fs::remove_file(path.join("holder")).ok();
-                        write_counter(&path.join("serving"), serving + 1)?;
+                        publish(path, "serving", serving + 1)?;
                     }
-                    Some(_) => {}
+                    Process::Live => {}
                     // Nobody holds the lock, so whoever owns `serving` is
                     // either waiting for it or gone. Deciding by pid rather
                     // than by a timeout keeps this deterministic: a live
                     // waiter writes `holder` inside the same counter lock we
                     // are inside now, so it cannot be mid-claim here.
-                    None => {
+                    Process::Missing => {
                         let waiter = waiter_file(path, serving);
-                        let abandoned = match read_pid(&waiter)? {
-                            Some(pid) => !pid_is_alive(pid),
-                            // No waiter file at all: handed out, then lost.
-                            None => true,
-                        };
-                        if abandoned {
+                        // No waiter file (handed out, then lost), a dead pid,
+                        // or a torn file: no live process holds this ticket.
+                        if process(&waiter)? != Process::Live {
                             fs::remove_file(&waiter).ok();
-                            write_counter(&path.join("serving"), serving + 1)?;
+                            publish(path, "serving", serving + 1)?;
                         }
                     }
                 }
@@ -155,8 +153,13 @@ fn wait_for_turn(path: &Path, ticket: u64) -> Result<()> {
             && started.elapsed() >= WARN_AFTER
             && !QUIET.load(std::sync::atomic::Ordering::Relaxed)
         {
-            let serving = read_counter(&path.join("serving")).unwrap_or(ticket);
-            let holder = read_pid(&path.join("holder")).ok().flatten();
+            // Outside the counter lock, so only a hint: a publication is a
+            // rename, so this sees an old or a new value, never a torn one.
+            let serving = read_parsed::<u64>(&path.join("serving"))
+                .ok()
+                .flatten()
+                .unwrap_or(ticket);
+            let holder = read_parsed::<u32>(&path.join("holder")).ok().flatten();
             eprintln!(
                 "mule: waiting for lock ticket {ticket} ({} ahead, holder pid {})",
                 ticket.saturating_sub(serving),
@@ -175,9 +178,9 @@ struct HeldLock {
 impl Drop for HeldLock {
     fn drop(&mut self) {
         let result = with_counter_lock(&self.path, || {
-            let serving = read_counter(&self.path.join("serving"))?;
+            let serving = read_counters(&self.path)?.serving;
             fs::remove_file(self.path.join("holder")).ok();
-            write_counter(&self.path.join("serving"), serving + 1)
+            publish(&self.path, "serving", serving + 1)
         });
         if let Err(error) = result {
             eprintln!("mule: could not release lock: {error:#}");
@@ -233,32 +236,187 @@ fn with_counter_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T>
     }
 }
 
-fn read_counter(path: &Path) -> Result<u64> {
-    match fs::read_to_string(path) {
-        Ok(value) => value
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid counter in {}", path.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
-        Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
-    }
+/// The temp file every publication is written to before its rename.
+///
+/// One fixed name, because every publication happens inside the counter lock:
+/// there is never a second writer to collide with, and a writer SIGKILLed
+/// mid-write leaves one stale temp that the next publication truncates, rather
+/// than one per death.
+const PUBLISH_TMP: &str = "publish.tmp";
+
+/// Replace lock file `name` with `value`, atomically. Call inside the counter lock.
+///
+/// `fs::write` truncates and then writes, so a mule SIGKILLed between the two
+/// left a 0-byte `holder`, `waiter.N`, `next` or `serving` (measured on APFS),
+/// and every later locked call on the host failed on it until a human deleted
+/// the file: 1 close in 9 smoke runs, and 12 of 12 SIGKILL-storm trials within
+/// 7-252 rounds. A rename publishes all of the value or none of it.
+///
+/// The fsync orders the data before the rename, so a crash of the machine
+/// cannot publish the new name over unwritten blocks either. The directory is
+/// not synced: a rename lost to a crash leaves the old value, and after a
+/// reboot every pid in the directory is dead and is stepped over anyway.
+fn publish(path: &Path, name: &str, value: impl std::fmt::Display) -> Result<()> {
+    use std::io::Write;
+
+    let tmp = path.join(PUBLISH_TMP);
+    let target = path.join(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    writeln!(file, "{value}")
+        .and_then(|()| fsync(&file))
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    drop(file);
+    fs::rename(&tmp, &target).with_context(|| format!("cannot write {}", target.display()))
 }
 
-fn write_counter(path: &Path, value: u64) -> Result<()> {
-    fs::write(path, format!("{value}\n"))
-        .with_context(|| format!("cannot write {}", path.display()))
-}
-
-fn read_pid(path: &Path) -> Result<Option<u32>> {
+/// A lock file's value: `Ok(None)` when it is missing, empty or unparsable.
+///
+/// Empty or unparsable means torn: a writer died mid-write. Since publication
+/// is a rename, only an older mule can have left one, and it heals here.
+/// Reading it as absent is safe inside the counter lock because every writer
+/// holds that lock too, so no *live* writer can be mid-publication when this
+/// looks.
+fn read_parsed<T: std::str::FromStr>(path: &Path) -> Result<Option<T>> {
     match fs::read_to_string(path) {
-        Ok(value) => {
-            Ok(Some(value.trim().parse().with_context(|| {
-                format!("invalid pid in {}", path.display())
-            })?))
-        }
+        Ok(value) => Ok(value.trim().parse().ok()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("cannot read {}", path.display())),
     }
+}
+
+/// What a `holder` or `waiter.N` file says about its process.
+#[derive(Debug, PartialEq, Eq)]
+enum Process {
+    /// No file.
+    Missing,
+    Live,
+    /// A pid that is gone, or a torn file: either way no live process.
+    Dead,
+}
+
+fn process(path: &Path) -> Result<Process> {
+    if !path.exists() {
+        return Ok(Process::Missing);
+    }
+    Ok(match read_parsed::<u32>(path)? {
+        Some(pid) if pid_is_alive(pid) => Process::Live,
+        // Missing between `exists` and the read is impossible: every remover
+        // holds the counter lock, as the caller does.
+        _ => Process::Dead,
+    })
+}
+
+struct Counters {
+    next: u64,
+    serving: u64,
+}
+
+/// Read `next` and `serving`, rebuilding either one that is missing or torn.
+/// Call inside the counter lock.
+///
+/// Neither may default to 0. A `next` of 0 re-issues tickets that are still
+/// out, and a `serving` read too high grants a ticket while its predecessor
+/// still holds the lock: both are two holders. A `serving` read too low only
+/// costs one step-over per poll. So each is rebuilt from what the directory
+/// proves:
+///
+/// - `next` is past every ticket on disk: `max(waiter.N + 1, serving + 1 if a
+///   holder file exists, else serving)`. Re-issuing a dead ticket's number is
+///   harmless; only a live one matters, and a live ticket has a waiter file or
+///   is the holder's, which is `serving`.
+/// - `serving` is the lowest live ticket -- the lowest live waiter, or `next`
+///   if there is none -- minus one while a live holder still has the lock. The
+///   holder's own ticket is not on disk, but it is below every live waiter, so
+///   its release (`serving + 1`) is what grants the next one.
+///
+/// The rebuilt value is published, so the next reader finds a whole file. This
+/// always recovers; no torn counter needs a human.
+fn read_counters(path: &Path) -> Result<Counters> {
+    let next = read_parsed::<u64>(&path.join("next"))?;
+    let serving = read_parsed::<u64>(&path.join("serving"))?;
+    if let (Some(next), Some(serving)) = (next, serving) {
+        return Ok(Counters { next, serving });
+    }
+
+    let holder = process(&path.join("holder"))?;
+    let mut waiters = Vec::new();
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("cannot read lock directory {}", path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("cannot read lock directory {}", path.display()))?;
+        if let Some(ticket) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix("waiter."))
+            .and_then(|ticket| ticket.parse::<u64>().ok())
+        {
+            waiters.push((ticket, process(&entry.path())? == Process::Live));
+        }
+    }
+
+    let next = match next {
+        Some(next) => next,
+        None => {
+            let past_holder = serving.map_or(0, |s| s + u64::from(holder != Process::Missing));
+            let rebuilt = waiters
+                .iter()
+                .map(|&(ticket, _)| ticket + 1)
+                .fold(past_holder, u64::max)
+                // A live holder's ticket is below `next`, so `next` is at least 1.
+                .max(u64::from(holder == Process::Live));
+            publish(path, "next", rebuilt)?;
+            rebuilt
+        }
+    };
+    let serving = match serving {
+        Some(serving) => serving,
+        None => {
+            let lowest = waiters
+                .iter()
+                .filter(|&&(_, live)| live)
+                .map(|&(ticket, _)| ticket)
+                .fold(next, u64::min);
+            let rebuilt = if holder == Process::Live {
+                lowest.saturating_sub(1)
+            } else {
+                lowest
+            };
+            publish(path, "serving", rebuilt)?;
+            rebuilt
+        }
+    };
+    Ok(Counters { next, serving })
+}
+
+/// Plain `fsync(2)`, deliberately not `File::sync_all`.
+///
+/// On macOS `sync_all` issues `F_FULLFSYNC`, a drive-cache flush: measured at
+/// 37ms per uncontended locked call against 9ms before atomic publication, a
+/// tax on every mule ssh. Plain `fsync` measured 14ms. What it gives up is
+/// durability across power loss, which this state does not need: after a
+/// reboot every recorded pid is dead, and a torn file reads as dead or is
+/// rebuilt (see [`read_parsed`], [`read_counters`]).
+#[cfg(unix)]
+fn fsync(file: &fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the fd is owned by `file`, which outlives the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 #[cfg(unix)]

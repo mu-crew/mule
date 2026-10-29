@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**A mule killed mid-write no longer wedges the host.** The ticket lock wrote its
+files by truncate-then-write, so a SIGKILL between the two left an empty
+`holder`, `waiter.N`, `next` or `serving`, and every later mule call on that
+host failed (`invalid pid ... cannot parse integer from empty string`) until
+someone deleted the file. Lock files are now written to a temp file, fsynced and
+renamed inside the counter lock. An empty or unparsable pid file counts as a dead
+process, and a torn counter is rebuilt from the waiter files rather than read as
+0, so hosts an older mule already wedged recover on the next call.
+
 **A refused session is waited out, and never run twice.** After a mule process
 died mid-call, its ssh could keep the one session after its ticket was freed,
 and the next caller was refused: under three parallel layer-3 suites a `mule rm`

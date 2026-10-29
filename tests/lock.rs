@@ -607,3 +607,341 @@ fn nothing_but_a_proven_refusal_with_a_live_master_is_retried() {
     assert_eq!(t.attempts(), 1);
     std::fs::remove_dir_all(mule::lock::lock_path(&host_b.name)).ok();
 }
+
+/// Plants lock-directory state, then requires one `with_lock_at` to get through.
+///
+/// Each file below is what a mule SIGKILLed between `open(O_TRUNC)` and
+/// `write` used to leave: measured on APFS, a 0-byte file. Before the fix every
+/// later locked call on that host failed at once ("invalid pid ... cannot parse
+/// integer from empty string", or "invalid counter") until a human deleted it.
+fn proceeds_past(tag: &str, files: &[(&str, &str)]) {
+    isolate_state();
+    let dir = mule::lock::lock_path(&format!("torn-{tag}-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for (name, contents) in files {
+        fs::write(dir.join(name), contents).unwrap();
+    }
+    let (tx, rx) = mpsc::channel();
+    let path = dir.clone();
+    std::thread::spawn(move || {
+        tx.send(mule::lock::with_lock_at(&path, || ()).map_err(|e| format!("{e:#}")))
+            .ok();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    let after = mule::lock::with_lock_at(&dir, || ()).map_err(|e| format!("{e:#}"));
+    fs::remove_dir_all(&dir).ok();
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("{tag}: a torn lock file failed the call: {error}"),
+        Err(_) => panic!("{tag}: a torn lock file wedged the host"),
+    }
+    // And it stays healed: the next call does not trip over the same file.
+    after.unwrap_or_else(|error| panic!("{tag}: second call failed: {error}"));
+}
+
+#[test]
+fn an_empty_holder_reads_as_a_dead_one() {
+    proceeds_past(
+        "holder",
+        &[("next", "1\n"), ("serving", "0\n"), ("holder", "")],
+    );
+    proceeds_past(
+        "holder-junk",
+        &[("next", "1\n"), ("serving", "0\n"), ("holder", "12x\n")],
+    );
+}
+
+#[test]
+fn an_empty_waiter_reads_as_an_abandoned_ticket() {
+    // serving=0 with no holder and an empty waiter.0: the exact state from the
+    // smoke_e2e failure (`invalid pid in .../waiter.57`).
+    proceeds_past(
+        "waiter",
+        &[("next", "2\n"), ("serving", "0\n"), ("waiter.0", "")],
+    );
+}
+
+#[test]
+fn empty_counters_are_rebuilt_not_read_as_zero() {
+    proceeds_past("next", &[("next", ""), ("serving", "3\n")]);
+    proceeds_past("serving", &[("next", "3\n"), ("serving", "")]);
+    proceeds_past("both", &[("next", ""), ("serving", ""), ("waiter.7", "")]);
+}
+
+/// Holds the lock on a thread until told to release it.
+fn hold(
+    path: &std::path::Path,
+    inside: &Arc<AtomicUsize>,
+) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let (path, inside) = (path.to_path_buf(), Arc::clone(inside));
+    let holder = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&path, || {
+            assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            assert_eq!(inside.fetch_sub(1, Ordering::SeqCst), 1, "two holders");
+        })
+        .unwrap();
+    });
+    held_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Queues a caller that records its turn, and waits until its ticket is out.
+fn queue(
+    path: &std::path::Path,
+    inside: &Arc<AtomicUsize>,
+    order: &Arc<std::sync::Mutex<Vec<&'static str>>>,
+    name: &'static str,
+    ticket: u64,
+) -> std::thread::JoinHandle<()> {
+    let (p, inside, order) = (path.to_path_buf(), Arc::clone(inside), Arc::clone(order));
+    let handle = std::thread::spawn(move || {
+        mule::lock::with_lock_at(&p, || {
+            assert_eq!(inside.fetch_add(1, Ordering::SeqCst), 0, "two holders");
+            order.lock().unwrap().push(name);
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(inside.fetch_sub(1, Ordering::SeqCst), 1, "two holders");
+        })
+        .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.join(format!("waiter.{ticket}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{name} never took ticket {ticket}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    handle
+}
+
+#[test]
+fn a_rebuilt_next_never_reissues_a_live_ticket() {
+    isolate_state();
+    // Defaulting an empty `next` to 0 would hand ticket 0 out again. With a
+    // live holder on ticket 0 that grants it at once: two holders. The rebuilt
+    // value must clear every ticket the directory shows is out.
+    let dir = mule::lock::lock_path(&format!("torn-next-live-{}", std::process::id()));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (release, holder) = hold(&dir, &inside);
+    let b = queue(&dir, &inside, &order, "b", 1);
+    fs::write(dir.join("next"), "").unwrap();
+    let c = queue(&dir, &inside, &order, "c", 2);
+
+    release.send(()).unwrap();
+    for t in [holder, b, c] {
+        t.join().unwrap();
+    }
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(*order.lock().unwrap(), ["b", "c"]);
+}
+
+#[test]
+fn a_rebuilt_serving_never_grants_past_a_live_holder() {
+    isolate_state();
+    // Rebuilding `serving` as "the lowest waiting ticket" while someone holds
+    // the lock would grant that ticket at once. A live holder's ticket sits
+    // below every waiter, so the rebuilt value must sit below them too.
+    let dir = mule::lock::lock_path(&format!("torn-serving-live-{}", std::process::id()));
+    let inside = Arc::new(AtomicUsize::new(0));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (release, holder) = hold(&dir, &inside);
+    let b = queue(&dir, &inside, &order, "b", 1);
+    let c = queue(&dir, &inside, &order, "c", 2);
+    fs::write(dir.join("serving"), "").unwrap();
+    // Give b and c many polls to misread it while the holder is still inside.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(order.lock().unwrap().is_empty(), "granted while held");
+
+    release.send(()).unwrap();
+    for t in [holder, b, c] {
+        t.join().unwrap();
+    }
+    fs::remove_dir_all(&dir).ok();
+    assert_eq!(*order.lock().unwrap(), ["b", "c"]);
+}
+
+#[test]
+fn a_concurrent_reader_never_sees_a_torn_lock_file() {
+    isolate_state();
+    let _lane = timing_lane();
+    // A truncating write is visible as an empty file to anyone who looks
+    // between the truncate and the write; a rename is not. The lock's own
+    // readers hold the counter flock, so this unlocked reader is the only one
+    // that can witness the difference without killing anyone.
+    let dir = mule::lock::lock_path(&format!("torn-reader-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut callers = Vec::new();
+    for _ in 0..3 {
+        let (dir, done) = (dir.clone(), Arc::clone(&done));
+        callers.push(std::thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                mule::lock::with_lock_at(&dir, || ()).unwrap();
+            }
+        }));
+    }
+    let started = Instant::now();
+    let mut torn = Vec::new();
+    while started.elapsed() < Duration::from_millis(1500) && torn.is_empty() {
+        for name in ["next", "serving", "holder"] {
+            if let Ok(contents) = fs::read_to_string(dir.join(name))
+                && !contents.ends_with('\n')
+            {
+                torn.push(format!("{name}={contents:?}"));
+            }
+        }
+    }
+    done.store(true, Ordering::SeqCst);
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    fs::remove_dir_all(&dir).ok();
+    assert!(torn.is_empty(), "saw a partly written lock file: {torn:?}");
+}
+
+/// Where the stress test's children queue; unset in a normal run.
+const STRESS_DIR: &str = "MULE_LOCK_STRESS_DIR";
+
+/// The child half of [`sigkill_at_random_points_never_wedges_or_doubles_the_lock`].
+///
+/// A no-op unless the parent re-ran this binary with [`STRESS_DIR`] set, since
+/// a SIGKILL needs a process to kill and a test thread is not one.
+#[test]
+fn lock_stress_child() {
+    let Some(root) = std::env::var_os(STRESS_DIR).map(std::path::PathBuf::from) else {
+        return;
+    };
+    let lock = root.join("lock");
+    loop {
+        let result = mule::lock::with_lock_at(&lock, || {
+            // The cross-process overlap detector: only a holder may own the
+            // marker. A holder SIGKILLed inside leaves it behind, so a marker
+            // naming a dead (reaped) pid is stale, not a second holder.
+            // Published by hard link, which is atomic and never replaces, so
+            // the marker always carries a whole pid: an empty one cannot hide
+            // a second holder that was mid-write.
+            let marker = root.join("inside");
+            let mine = root.join(format!("inside.{}", std::process::id()));
+            fs::write(&mine, std::process::id().to_string()).unwrap();
+            while fs::hard_link(&mine, &marker).is_err() {
+                let owner = fs::read_to_string(&marker).unwrap_or_default();
+                let alive = owner.trim().parse::<i32>().is_ok_and(|pid| {
+                    // SAFETY: signal 0 only checks the pid exists.
+                    unsafe { libc::kill(pid, 0) == 0 }
+                });
+                if alive {
+                    fs::write(root.join("overlap"), format!("{owner} and me\n")).ok();
+                    std::process::exit(2);
+                }
+                // A holder SIGKILLed inside, already reaped by the parent.
+                fs::remove_file(&marker).ok();
+            }
+            fs::remove_file(&mine).ok();
+            // Long enough for a second holder to be seen. With 300us of hold
+            // and a mutant granting every seventh ticket out of turn, this
+            // test passed; at 10ms, over 400 rounds, it failed 6 runs of 6.
+            std::thread::sleep(Duration::from_millis(10));
+            fs::remove_file(&marker).unwrap();
+        });
+        if let Err(error) = result {
+            fs::write(root.join("error"), format!("{error:#}\n")).ok();
+            std::process::exit(1);
+        }
+    }
+}
+
+#[test]
+fn sigkill_at_random_points_never_wedges_or_doubles_the_lock() {
+    let _lane = timing_lane();
+    // Four processes cycle through the lock while one at a time is SIGKILLed
+    // after a random 0-15ms, landing between any two syscalls -- inside the
+    // counter flock, mid-publication, while holding, while queued. Before
+    // atomic publication this left an empty holder, waiter.N, next or serving
+    // within 7-252 rounds in all 12 measured trials, and the host was wedged.
+    let root = std::env::temp_dir().join(format!("mule-lock-stress-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let spawn = || {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lock_stress_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STRESS_DIR, &root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut children: Vec<_> = (0..4).map(|_| spawn()).collect();
+    // xorshift, seeded from the clock: no rand dependency for one test.
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        | 1;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let failed = |root: &std::path::Path| {
+        ["overlap", "error"].iter().find_map(|name| {
+            fs::read_to_string(root.join(name))
+                .ok()
+                .map(|s| format!("{name}: {s}"))
+        })
+    };
+
+    for round in 0..400 {
+        std::thread::sleep(Duration::from_micros(next() % 15_000));
+        let victim = (next() % children.len() as u64) as usize;
+        children[victim].kill().unwrap();
+        // Reap before respawning: an unreaped zombie still answers kill(pid, 0),
+        // so the lock would wait on it as a live process.
+        children[victim].wait().unwrap();
+        if let Some(failure) = failed(&root) {
+            panic!("round {round}: {failure}");
+        }
+        children[victim] = spawn();
+    }
+    for child in &mut children {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    if let Some(failure) = failed(&root) {
+        panic!("{failure}");
+    }
+
+    // No wedge: with every caller dead, whatever they left behind is stepped
+    // over promptly.
+    let (tx, rx) = mpsc::channel();
+    let lock = root.join("lock");
+    std::thread::spawn(move || {
+        tx.send(mule::lock::with_lock_at(&lock, || ()).map_err(|e| format!("{e:#}")))
+            .ok();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(10));
+    let leftovers: Vec<_> = fs::read_dir(root.join("lock"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let contents = fs::read_to_string(e.path()).unwrap_or_default();
+            format!("{name}={contents:?}")
+        })
+        .collect();
+    fs::remove_dir_all(&root).ok();
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("lock failed after the storm: {error}; files {leftovers:?}"),
+        Err(_) => panic!("lock wedged after the storm; files {leftovers:?}"),
+    }
+}
