@@ -114,6 +114,7 @@ fn refusals_are_retried_only_when_proven_and_never_execute_twice() {
     let host = host(&sshd);
 
     a_spoofed_refusal_on_remote_stderr_is_not_retried(&sshd, &host);
+    a_refusal_quoted_by_sshs_debug_echo_is_not_retried(&sshd, &host);
     a_held_session_is_waited_out_and_the_script_runs_once(&sshd, &host);
     a_refusal_never_falls_back_to_a_direct_connection(&sshd, &host);
     a_stopped_master_fails_the_check_within_its_bound(&sshd, &host);
@@ -135,6 +136,39 @@ fn a_spoofed_refusal_on_remote_stderr_is_not_retried(sshd: &Sshd, host: &Host) {
     assert_eq!(out.code, 255);
     assert!(out.stderr.contains(REFUSAL), "{}", out.stderr);
     assert_eq!(lines(&marker), 1, "the spoofed refusal was retried");
+}
+
+fn a_refusal_quoted_by_sshs_debug_echo_is_not_retried(sshd: &Sshd, host: &Host) {
+    // Reviewer-26's case: under a command-line -vvv, ssh echoes its argv --
+    // script included -- into its own -E log (`debug3: Started with: ...`).
+    // The unanchored classifier found the refusal there and ran this silent,
+    // accepted script 14 times. The shim is rewritten, not PATH, so no
+    // environment changes under a running binary.
+    let shim = sshd.dir.join("ssh");
+    let plain = std::fs::read_to_string(&shim).unwrap();
+    let verbose = plain.replacen("exec /usr/bin/ssh ", "exec /usr/bin/ssh -vvv ", 1);
+    assert_ne!(
+        plain, verbose,
+        "the shim's shape changed; -vvv was not added"
+    );
+    std::fs::write(&shim, verbose).unwrap();
+
+    let marker = sshd.dir.join("echo-executions");
+    let script = format!(
+        "echo execution >> '{}'; printf '{REFUSAL}\\n' >&2; exit 255",
+        marker.display()
+    );
+    let out = Ssh.run(host, &script);
+    std::fs::write(&shim, plain).unwrap();
+
+    let out = out.expect("a script that ran is not an error");
+    assert!(
+        out.stderr.contains("debug3: Started with:"),
+        "no argv echo, so this case proves nothing: {}",
+        out.stderr
+    );
+    assert_eq!(out.code, 255);
+    assert_eq!(lines(&marker), 1, "the echoed refusal was retried");
 }
 
 fn a_held_session_is_waited_out_and_the_script_runs_once(sshd: &Sshd, host: &Host) {

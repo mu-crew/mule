@@ -318,6 +318,15 @@ fn mux_ops_never_take_the_lock_while_run_callers_still_never_overlap() {
         ) -> anyhow::Result<Output> {
             let n = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(n, Ordering::SeqCst);
+            // Stay inside until a mux op has been seen during a run, rather
+            // than hoping a fixed window catches one: under a loaded machine
+            // a 120ms window saw 42 ops and no run (measured). A mux op that
+            // queued behind the lock could never be seen here, so this waits
+            // out its 5s and the assertion below still fails.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.mux_during_run.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             std::thread::sleep(Duration::from_millis(40));
             self.inside.fetch_sub(1, Ordering::SeqCst);
             Ok(Output::ok(""))
@@ -349,10 +358,14 @@ fn mux_ops_never_take_the_lock_while_run_callers_still_never_overlap() {
             t.run(&h, "echo hi").unwrap();
         }));
     }
-    // Poll the ops while the four runs queue and execute: 160ms of work.
+    // Poll the ops while the four runs queue and execute, until all are done.
     let started = Instant::now();
     let mut ops = 0;
-    while started.elapsed() < Duration::from_millis(120) {
+    while !handles.iter().all(|h| h.is_finished()) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "runs never finished"
+        );
         transport.mux_op(host, MuxOp::Check).unwrap();
         transport
             .mux_op(host, MuxOp::CancelUnix("/l".into(), "/r".into()))
@@ -395,6 +408,8 @@ mod refusal {
     pub struct Scripted {
         pub replies: Mutex<std::collections::VecDeque<Reply>>,
         pub tickets: Mutex<Vec<u64>>,
+        /// When each attempt started.
+        pub at: Mutex<Vec<Instant>>,
         pub master: std::sync::atomic::AtomicBool,
         pub checks: AtomicUsize,
         pub lock: std::path::PathBuf,
@@ -405,6 +420,7 @@ mod refusal {
             Self {
                 replies: Mutex::new(replies.into()),
                 tickets: Mutex::default(),
+                at: Mutex::default(),
                 master: true.into(),
                 checks: AtomicUsize::new(0),
                 lock: mule::lock::lock_path(&host.name),
@@ -417,6 +433,7 @@ mod refusal {
 
     impl Transport for Scripted {
         fn run_unlocked(&self, _: &mule::config::Host, _: &str) -> anyhow::Result<Output> {
+            self.at.lock().unwrap().push(Instant::now());
             let serving = fs::read_to_string(self.lock.join("serving")).unwrap();
             self.tickets
                 .lock()
@@ -534,9 +551,29 @@ fn refusal_recovery_is_bounded_and_ends_as_the_busy_error() {
     assert_eq!(mule::errors::exit_code(&error), 1);
     // Backoffs 100, 200, 400ms fit in 750ms; the next (800ms) never does, so
     // the loop stops before overrunning rather than sleeping past the budget.
-    // The count is 3 or 4 depending on scheduling, never more.
+    // Unloaded that is 3 or 4 attempts. Load only lengthens each attempt and
+    // sleep, so the budget may admit fewer -- 2, measured in a loaded full
+    // gate -- but never more: 4 is fixed by the schedule.
     assert!(took < Duration::from_millis(1050), "{took:?}");
-    assert!((3..=4).contains(&t.attempts()), "{}", t.attempts());
+    let attempts = t.attempts();
+    assert!((1..=4).contains(&attempts), "{attempts}");
+    // What the old lower bound (3) stood for, without a timing guess: it gave
+    // up only once the time left was shorter than the next backoff. It checks
+    // before returning, so `took` is late, and load makes this only truer.
+    let next = Duration::from_millis(100 << (attempts - 1));
+    assert!(
+        Duration::from_millis(750).saturating_sub(took) < next,
+        "gave up after {attempts} attempts at {took:?} with room for a {next:?} backoff"
+    );
+    // And every retry waited out its backoff, each one doubling.
+    let at = t.at.lock().unwrap().clone();
+    for (i, gap) in at.windows(2).map(|w| w[1] - w[0]).enumerate() {
+        let backoff = Duration::from_millis(100 << i);
+        assert!(
+            gap >= backoff,
+            "retry {i} after {gap:?}, before its {backoff:?} backoff"
+        );
+    }
     std::fs::remove_dir_all(mule::lock::lock_path(&host.name)).ok();
 }
 
