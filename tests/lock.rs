@@ -817,7 +817,16 @@ fn lock_stress_child() {
         return;
     };
     let lock = root.join("lock");
+    // The parent's unwind guard reaps us on a panic, but a parent that is
+    // itself SIGKILLed (a harness timeout) unwinds nothing. Re-parented means
+    // orphaned: stop rather than cycle through the lock forever.
+    // SAFETY: getppid has no preconditions.
+    let parent = unsafe { libc::getppid() };
     loop {
+        // SAFETY: as above.
+        if unsafe { libc::getppid() } != parent {
+            std::process::exit(0);
+        }
         let result = mule::lock::with_lock_at(&lock, || {
             // The cross-process overlap detector: only a holder may own the
             // marker. A holder SIGKILLed inside leaves it behind, so a marker
@@ -879,7 +888,20 @@ fn sigkill_at_random_points_never_wedges_or_doubles_the_lock() {
             .spawn()
             .unwrap()
     };
-    let mut children: Vec<_> = (0..4).map(|_| spawn()).collect();
+    // Unwind-safe teardown: every exit from here, a failed round's panic
+    // included, kills and reaps every child. Before this, a failure leaked
+    // three children cycling through the lock forever, since the kill loop
+    // after the rounds was the only one.
+    struct Reap(Vec<std::process::Child>);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                child.kill().ok();
+                child.wait().ok();
+            }
+        }
+    }
+    let mut children = Reap((0..4).map(|_| spawn()).collect());
     // xorshift, seeded from the clock: no rand dependency for one test.
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -902,20 +924,17 @@ fn sigkill_at_random_points_never_wedges_or_doubles_the_lock() {
 
     for round in 0..400 {
         std::thread::sleep(Duration::from_micros(next() % 15_000));
-        let victim = (next() % children.len() as u64) as usize;
-        children[victim].kill().unwrap();
+        let victim = (next() % children.0.len() as u64) as usize;
+        children.0[victim].kill().unwrap();
         // Reap before respawning: an unreaped zombie still answers kill(pid, 0),
         // so the lock would wait on it as a live process.
-        children[victim].wait().unwrap();
+        children.0[victim].wait().unwrap();
         if let Some(failure) = failed(&root) {
             panic!("round {round}: {failure}");
         }
-        children[victim] = spawn();
+        children.0[victim] = spawn();
     }
-    for child in &mut children {
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
+    drop(children);
     if let Some(failure) = failed(&root) {
         panic!("{failure}");
     }

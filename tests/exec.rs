@@ -24,13 +24,26 @@ fn isolate_state() {
     });
 }
 
+/// A host of its own per call, so per test.
+///
+/// `Transport::run` takes the host's ticket lock, and the tests run in
+/// parallel: on one shared host they queue behind each other's locked calls,
+/// and the wall-clock settle tests measure that queue instead of exec. Under
+/// 3 parallel layer-3 suites a shared `dev` stretched a 0.6s run past 10s,
+/// and the 5s settle bound expired between two probes of a test that expects
+/// a third.
 fn host() -> Host {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     isolate_state();
-    Config::parse("[hosts.dev]\ntarget = \"build.example\"\nsocket = \"/tmp/mule.sock\"\n")
-        .unwrap()
-        .host(None)
-        .unwrap()
-        .clone()
+    let name = format!("dev-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    Config::parse(&format!(
+        "[hosts.{name}]\ntarget = \"build.example\"\nsocket = \"/tmp/mule.sock\"\n"
+    ))
+    .unwrap()
+    .host(None)
+    .unwrap()
+    .clone()
 }
 
 fn id() -> JobId {
@@ -360,9 +373,13 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
     let err = String::from_utf8(err).unwrap();
     assert!(err.contains("output incomplete"), "{err}");
     assert!(err.contains("stdout"), "{err}");
+    // Exit 7 above is the deterministic discriminator; elapsed time is only a
+    // sanity bound. The floor is exact (the bound is wall-clock); the ceiling
+    // is loose because a loaded gate stretched a ~0.6s run to 1.53s and 1.63s
+    // against the old 1.5s ceiling.
     let waited = started.elapsed();
     assert!(
-        waited >= Duration::from_millis(500) && waited < Duration::from_millis(1500),
+        waited >= Duration::from_millis(500) && waited < Duration::from_secs(5),
         "waits a bounded wall-clock time for the session: {waited:?}"
     );
     assert!(

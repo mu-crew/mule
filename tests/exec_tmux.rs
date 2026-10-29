@@ -337,10 +337,15 @@ fn a_background_child_holding_stdout_is_exit_seven_and_no_locked_call_runs_long(
         "a locked call ran {longest:?}; the ticket is held for all of it"
     );
     // The settle bound is 5s of wall clock, probes included; the rest is one
-    // collect. Summed pauses once let this run to ~8s on a loaded machine.
+    // collect. What this shows is that exec stops waiting well short of the
+    // 30s child. Whether the bound is wall-clock rather than a pause count is
+    // pinned deterministically, by probe count, in layer 1
+    // (`the_settle_bound_counts_probe_time_not_just_requested_pauses`). A 6s
+    // ceiling here measured the machine instead: 7.1s and 8.7s under 3
+    // parallel layer-3 suites at load average 54-140.
     let elapsed = started.elapsed();
     assert!(
-        elapsed <= Duration::from_secs(6),
+        elapsed < Duration::from_secs(20),
         "the settle bound is wall-clock: {elapsed:?}"
     );
     // Removed deliberately, background child included.
