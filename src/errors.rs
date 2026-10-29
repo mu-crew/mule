@@ -82,23 +82,46 @@ pub enum AgentState {
     Unknown,
 }
 
-/// Does this text carry the mux client's refusal to open a session?
+/// Does ssh's log carry the mux client's own refusal to open a session?
 ///
-/// What ssh logs (measured, OpenSSH 10): `mux_client_request_session: session
-/// request failed: Session open refused by peer`.
-fn mux_refused(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    ["session request failed", "session open refused"]
-        .iter()
-        .any(|pattern| text.contains(pattern))
+/// What ssh logs (measured, OpenSSH 10.3, identical at the default level and
+/// at -v/-vv/-vvv): `mux_client_request_session: session request failed:
+/// Session open refused by peer`, as a message of its own.
+///
+/// Anchored to the start of one of ssh's messages, never a substring: under a
+/// command-line `-vvv` ssh echoes its argv (`debug3: Started with: ...`) into
+/// the same log, so a script that merely mentions the refusal put the text
+/// there, and an unanchored match re-ran that script 14 times (measured).
+/// Messages are split on `\r\n` because ssh ends every one with it (measured,
+/// all levels), while an argv newline is echoed as a bare `\n` and stays
+/// inside the echo. Only an argv holding a literal `\r\n` before the refusal
+/// line, under `-vvv`, could still fool it; mule passes no `-v`, and its
+/// scripts are `\n`-joined text around base64. Any miss is the safe direction:
+/// the call is reported as it came back, never retried.
+fn mux_refused(ssh_log: &str) -> bool {
+    diagnostics(ssh_log)
+        .any(|message| message.starts_with("mux_client_request_session: session request failed"))
 }
 
-pub fn classify(stderr: &str, agent_state: impl FnOnce() -> AgentState) -> Option<MuleError> {
-    if mux_refused(stderr) {
+/// ssh's messages in its `-E` log, minus its `debugN:` tracing, which can
+/// quote anything (the argv echo above) and is never itself a diagnostic.
+fn diagnostics(ssh_log: &str) -> impl Iterator<Item = &str> {
+    ssh_log
+        .split("\r\n")
+        .filter(|message| !message.starts_with("debug"))
+}
+
+/// Classify ssh's own `-E` log; see [`classify_attempt`].
+pub fn classify(ssh_log: &str, agent_state: impl FnOnce() -> AgentState) -> Option<MuleError> {
+    if mux_refused(ssh_log) {
         return Some(MuleError::SessionChannelBusy);
     }
-    let stderr = stderr.to_ascii_lowercase();
-    if !stderr.contains("permission denied (keyboard-interactive)") {
+    // A substring within a message: ssh prefixes this one with `user@host: `.
+    if !diagnostics(ssh_log).any(|message| {
+        message
+            .to_ascii_lowercase()
+            .contains("permission denied (keyboard-interactive)")
+    }) {
         return None;
     }
     Some(match agent_state() {

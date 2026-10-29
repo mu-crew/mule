@@ -21,35 +21,30 @@ fn isolate_state() {
 }
 
 #[test]
-fn refused_session_diagnostics_are_classified_case_insensitively() {
+fn a_refused_session_in_sshs_log_is_classified_busy() {
     isolate_state();
-    for stderr in ["session request failed", "SESSION OPEN REFUSED"] {
-        assert_eq!(
-            classify(stderr, || panic!(
-                "unambiguous errors must not probe the agent"
-            )),
-            Some(MuleError::SessionChannelBusy)
-        );
-    }
+    assert_eq!(
+        classify(REFUSAL, || panic!(
+            "unambiguous errors must not probe the agent"
+        )),
+        Some(MuleError::SessionChannelBusy)
+    );
 }
 
 /// What OpenSSH 10's mux client logs when the master refuses a session.
+/// ssh ends every message it writes to `-E` with `\r\n` (measured, at every
+/// log level).
 const REFUSAL: &str =
-    "mux_client_request_session: session request failed: Session open refused by peer\n";
+    "mux_client_request_session: session request failed: Session open refused by peer\r\n";
 
 #[test]
 fn only_a_refusal_in_sshs_own_log_with_no_stdout_is_retryable() {
     isolate_state();
     let no_agent = || -> AgentState { panic!("a mux refusal must not probe the agent") };
     // (ssh -E log, remote stdout, expected)
-    let table: [(&str, &[u8], Option<MuleError>); 6] = [
+    let table: [(&str, &[u8], Option<MuleError>); 5] = [
         // The one retryable shape: refused before the script ran.
         (REFUSAL, b"", Some(MuleError::MuxRefusedPreExec)),
-        (
-            "SESSION OPEN REFUSED",
-            b"",
-            Some(MuleError::MuxRefusedPreExec),
-        ),
         // Something ran and printed: never re-run it, but still say busy.
         (REFUSAL, b"rc=0\n", Some(MuleError::SessionChannelBusy)),
         // A clean call: ssh's log empty, whatever the remote did.
@@ -65,6 +60,62 @@ fn only_a_refusal_in_sshs_own_log_with_no_stdout_is_retryable() {
             "log={log:?} stdout={stdout:?}"
         );
     }
+}
+
+#[test]
+fn refusal_text_inside_another_ssh_message_is_not_a_refusal() {
+    isolate_state();
+    let no_agent = || -> AgentState { panic!("not a refusal, and not keyboard-interactive") };
+    // Under a command-line -vvv, ssh echoes its own argv into the -E log
+    // (measured, OpenSSH 10.3): a script that merely *mentions* the refusal
+    // put it in ssh's own log, and an unanchored match re-ran that script 14
+    // times. ssh ends every message with \r\n; an argv newline is a bare \n, so
+    // the echo stays one message that starts with `debug3:`.
+    let echoed = format!(
+        "debug1: OpenSSH_10.3p1, LibreSSL 3.3.6\r\n\
+         debug3: Started with: /usr/bin/ssh -vvv -E /tmp/log 127.0.0.1 \"echo x >> m; \
+         printf '{}' >&2; exit 255\"\r\n\
+         debug1: Reading configuration data /dev/null\r\n",
+        REFUSAL.trim_end()
+    );
+    let with_newline = format!(
+        "debug3: Started with: ssh 127.0.0.1 \"echo x\n{}\"\r\n",
+        REFUSAL.trim_end()
+    );
+    for log in [
+        echoed.as_str(),
+        with_newline.as_str(),
+        // Mid-message, or a bare fragment, is not ssh's refusal line either.
+        "debug1: session request failed\r\n",
+        "Session open refused by peer\r\n",
+    ] {
+        assert_eq!(classify_attempt(log, b"", no_agent), None, "log={log:?}");
+    }
+    // The genuine line still counts wherever it sits among ssh's -vvv noise
+    // (measured: line 15 of the -vvv log, line 1 at the default level).
+    for genuine in [
+        format!("{REFUSAL}Connection closed by UNKNOWN port 65535\r\n"),
+        format!("{echoed}debug3: mux_client_request_session: entering\r\n{REFUSAL}"),
+    ] {
+        assert_eq!(
+            classify_attempt(&genuine, b"", no_agent),
+            Some(MuleError::MuxRefusedPreExec),
+            "log={genuine:?}"
+        );
+    }
+    // The same echo can quote the keyboard-interactive failure: a script that
+    // ran must not be reported as an auth or busy error for mentioning it.
+    let quoted =
+        "debug3: Started with: ssh h \"echo 'Permission denied (keyboard-interactive)'\"\r\n";
+    assert_eq!(classify_attempt(quoted, b"", no_agent), None);
+    assert_eq!(
+        classify_attempt(
+            "me@h: Permission denied (keyboard-interactive).\r\n",
+            b"",
+            || AgentState::NoKeys
+        ),
+        Some(MuleError::SshAgentHasNoKeys)
+    );
 }
 
 #[test]
