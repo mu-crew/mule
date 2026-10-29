@@ -117,6 +117,18 @@ impl TmuxServer {
             assert!(Instant::now() < deadline, "timed out waiting for {id}");
             thread::sleep(Duration::from_millis(10));
         }
+        // `rc` is written by the left end of the log pipeline, the log by the
+        // right end, so `rc` can land before the last bytes do. The session
+        // ends only when the whole pipeline has: wait for that before reading
+        // the log (a loaded gate read an empty log here once).
+        let session = format!("mule-{id}");
+        while has_session(self, &session) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {id} to end"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         state
     }
 
