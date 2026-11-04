@@ -323,7 +323,15 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
             // the collect) gets the rest of the same bound. A group signal
             // kills its ssh too, and the call returns at once.
             calls.stop(deadline.saturating_duration_since(Instant::now()));
-            let _ = cleanup::spawn_rm(config.as_deref(), &host_name, &id);
+            // Retried like a lease's stop, but unfenced and unrecorded: nothing
+            // reattaches to an exec job, and there is no job file to put a
+            // record beside.
+            let retry = cleanup::StopRetry {
+                retry_for: cleanup::stop_retry_for(),
+                fence_gen: None,
+                failed_file: None,
+            };
+            let _ = cleanup::spawn_rm(config.as_deref(), &host_name, &id, Some(&retry));
             std::process::exit(cleanup::exit_status_for(signal));
         });
     }
@@ -341,7 +349,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
             return Ok(EXIT_NO_MASTER);
         }
         // The dispatch may have landed before the reply was lost.
-        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id);
+        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
         return Err(error);
     }
 
@@ -363,7 +371,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     if result.is_err() {
         park_if_signalled(&signals);
         // No id was ever printed, so nobody else can remove this job.
-        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id);
+        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
     }
     result
 }

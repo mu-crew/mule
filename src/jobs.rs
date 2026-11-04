@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 
@@ -416,4 +419,243 @@ pub fn decode_command(input: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .context("invalid command encoding in ls reply")
+}
+
+/// How often a stop child re-checks a missing master. `-O check` is lock-free,
+/// opens no session and is killed after 2s, so polling it costs the capped
+/// channel nothing.
+pub const MASTER_POLL: Duration = Duration::from_secs(5);
+
+/// The backoff between failed `rm` attempts: 5, 10, 20, then 30s from there.
+/// It runs after the ticket is released, so it holds no queue slot.
+const RETRY_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
+];
+
+/// The stop-failure record's cap (cross-repo contract § 2): mu shows it in
+/// `agent list`, escaped and cut again on its side.
+pub const RECORD_MAX_BYTES: usize = 512;
+
+/// A retrying stop, as `rm --retry-for` runs it.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    /// Retry until this much monotonic time has passed. A soft deadline: it is
+    /// checked between attempts, and an attempt in flight has no bound (the
+    /// ticket wait is unbounded by design, SPEC § Contention).
+    pub retry_for: Duration,
+    /// The generation the carrier saw when it was signalled. `None` (exec's
+    /// stop) is unfenced: nothing reattaches to an exec job.
+    pub fence_gen: Option<u64>,
+    /// Where to write the stop-failure record on giving up, and what to remove
+    /// on success.
+    pub failed_file: Option<PathBuf>,
+}
+
+/// Time, injected so layer 1 can drive a ten-minute deadline in no time.
+pub trait Clock {
+    /// Monotonic time since some fixed start.
+    fn now(&self) -> Duration;
+    fn sleep(&self, duration: Duration);
+    /// Wall-clock seconds, for the record's `at unix <t>` only.
+    fn unix_now(&self) -> u64;
+}
+
+/// The real clock: `Instant` for the deadline, so a wall-clock step cannot
+/// cut a stop short or stretch it.
+pub struct RealClock(std::time::Instant);
+
+impl RealClock {
+    pub fn new() -> Self {
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Default for RealClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for RealClock {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+    fn unix_now(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_secs())
+    }
+}
+
+/// How a retrying stop ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// `rm` proved the job gone; the ids removed (empty: it already was).
+    Removed(Vec<String>),
+    /// The fence generation moved: the job was reattached since this stop
+    /// began. Nothing was removed, written or deleted.
+    Fenced,
+    /// The deadline passed. `line` is the record, written to `failed_file`
+    /// when one was given; `code` is 3 if the master was never seen, else 1.
+    GaveUp { line: String, code: i32 },
+}
+
+impl StopOutcome {
+    /// `rm --retry-for`'s exit. Nobody reads a detached child's code, but a
+    /// human running the flag by hand gets `rm`'s meanings: 0 the job is gone
+    /// (or no longer this stop's to end), 3 no master, 1 anything else.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Removed(_) | Self::Fenced => 0,
+            Self::GaveUp { code, .. } => *code,
+        }
+    }
+}
+
+/// The lease's signal-path stop: retry `rm <id>` until it proves the job gone,
+/// the fence says the job was reattached, or `policy.retry_for` runs out --
+/// then record the failure rather than leave it silent.
+///
+/// The 2026-11-04 aiv-blog incident is why: a tmux restart hung up six lease
+/// panes, and on the host whose master was down each detached `rm` failed once
+/// in `require_master`, into `/dev/null`, and the jobs ran on unseen.
+///
+/// Master down: no `rm`, a lock-free check every [`MASTER_POLL`]. The child
+/// never opens a master or prompts; it waits for the human the dead pane
+/// already asked. Master up: one whole `rm` under the fence lock, through the
+/// ticketed [`Transport::run`].
+pub fn remove_with_retry(
+    t: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    policy: &RetryPolicy,
+    clock: &dyn Clock,
+    fence: &crate::stopfence::StopFence,
+) -> Result<StopOutcome> {
+    let started = clock.now();
+    let deadline = started + policy.retry_for;
+    let mut attempts = 0u32;
+    let mut last_reason: Option<String> = None;
+    let mut failures = 0usize;
+    loop {
+        // Fenced or not, the lock is held for the whole attempt: a reattach
+        // waits it out, and an attempt never starts on a stale generation.
+        let mut held = match policy.fence_gen {
+            Some(generation) => {
+                let mut lock = fence.lock()?;
+                if lock.generation()? != generation {
+                    return Ok(StopOutcome::Fenced);
+                }
+                Some(lock)
+            }
+            None => None,
+        };
+        let wait = if !t.master_alive(host) {
+            drop(held.take());
+            MASTER_POLL
+        } else {
+            attempts += 1;
+            match remove(t, host, &Target::One(id.clone())) {
+                Ok(removed) => {
+                    // Proven gone, so the fence can go: a waiter on the old
+                    // inode then probes Missing, which is harmless.
+                    if let Some(lock) = held {
+                        let _ = lock.unlink();
+                    }
+                    // Best effort, and only this job's own record.
+                    if let Some(path) = &policy.failed_file {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Ok(StopOutcome::Removed(removed));
+                }
+                Err(error) => {
+                    drop(held.take());
+                    last_reason = Some(first_line(&format!("{error:#}")));
+                    let wait = RETRY_BACKOFF[failures.min(RETRY_BACKOFF.len() - 1)];
+                    failures += 1;
+                    wait
+                }
+            }
+        };
+        let now = clock.now();
+        if now >= deadline {
+            break;
+        }
+        clock.sleep(wait.min(deadline - now));
+    }
+
+    let code = if last_reason.is_none() {
+        crate::errors::EXIT_NO_MASTER
+    } else {
+        1
+    };
+    let line = record_line(
+        id,
+        &host.name,
+        last_reason.as_deref().unwrap_or("no control master"),
+        attempts,
+        (clock.now() - started).as_secs(),
+        clock.unix_now(),
+    );
+    if let Some(path) = &policy.failed_file {
+        // Under the fence and after one more look at it: a reattach that
+        // landed during the last sleep must not get a record saying its job
+        // was abandoned.
+        let _held = match policy.fence_gen {
+            Some(generation) => {
+                let mut lock = fence.lock()?;
+                if lock.generation()? != generation {
+                    return Ok(StopOutcome::Fenced);
+                }
+                Some(lock)
+            }
+            None => None,
+        };
+        crate::lease::write_line_file(path, &line)
+            .with_context(|| format!("cannot write stop record {}: {line}", path.display()))?;
+    }
+    Ok(StopOutcome::GaveUp { line, code })
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// `<id> on <host> not stopped: <reason> (gave up after <n> attempts, <s>s; at
+/// unix <t>)`, at most [`RECORD_MAX_BYTES`].
+///
+/// The reason is shortened first, on a UTF-8 char boundary, so the id, the
+/// host and the counts survive: mu matches the record by its leading id.
+pub fn record_line(
+    id: &JobId,
+    host: &str,
+    reason: &str,
+    attempts: u32,
+    secs: u64,
+    unix: u64,
+) -> String {
+    let head = format!("{id} on {host} not stopped: ");
+    let tail = format!(" (gave up after {attempts} attempts, {secs}s; at unix {unix})");
+    let room = RECORD_MAX_BYTES.saturating_sub(head.len() + tail.len());
+    let line = format!("{head}{}{tail}", cut_utf8(reason, room));
+    // Only reachable with a host name of hundreds of bytes; the id leads, so
+    // it still survives the cut.
+    cut_utf8(&line, RECORD_MAX_BYTES).to_string()
+}
+
+fn cut_utf8(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }

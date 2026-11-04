@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use mule::cleanup::{Signals, exit_status_for, rm_command};
+use mule::cleanup::{STOP_RETRY_FOR, Signals, StopRetry, exit_status_for, rm_command};
 use mule::wrapper::JobId;
 
 fn args(command: &std::process::Command) -> Vec<&OsStr> {
@@ -22,6 +22,7 @@ fn the_cleanup_child_gets_the_effective_config_quiet_host_and_the_id() {
         Some(Path::new("/tmp/private.toml")),
         "dev",
         &id,
+        None,
     );
 
     assert_eq!(command.get_program(), "/opt/mule");
@@ -47,6 +48,7 @@ fn a_relative_config_is_made_absolute_so_the_child_reads_the_same_file() {
         Some(Path::new("c.toml")),
         "dev",
         &id,
+        None,
     );
 
     let config = Path::new(args(&command)[1]);
@@ -57,7 +59,7 @@ fn a_relative_config_is_made_absolute_so_the_child_reads_the_same_file() {
 #[test]
 fn no_config_flag_means_the_child_is_not_given_one() {
     let id: JobId = "abc123".parse().unwrap();
-    let command = rm_command(Path::new("/opt/mule"), None, "dev", &id);
+    let command = rm_command(Path::new("/opt/mule"), None, "dev", &id, None);
 
     assert_eq!(
         args(&command),
@@ -67,11 +69,81 @@ fn no_config_flag_means_the_child_is_not_given_one() {
 }
 
 #[test]
+fn a_lease_stop_retries_is_fenced_and_names_its_own_record() {
+    let id: JobId = "abc123".parse().unwrap();
+    let record = Path::new("/tmp/w1.job.abc123.stop-failed");
+    let retry = StopRetry {
+        retry_for: STOP_RETRY_FOR,
+        fence_gen: Some(7),
+        failed_file: Some(record),
+    };
+
+    let command = rm_command(Path::new("/opt/mule"), None, "dev", &id, Some(&retry));
+
+    assert_eq!(
+        args(&command),
+        [
+            "--quiet",
+            "rm",
+            "--host",
+            "dev",
+            "abc123",
+            "--retry-for",
+            "600",
+            "--fence-gen",
+            "7",
+            "--failed-file",
+            "/tmp/w1.job.abc123.stop-failed",
+        ]
+    );
+}
+
+#[test]
+fn an_exec_stop_retries_but_has_no_failed_file_and_no_fence() {
+    let id: JobId = "abc123".parse().unwrap();
+    let retry = StopRetry {
+        retry_for: STOP_RETRY_FOR,
+        fence_gen: None,
+        failed_file: None,
+    };
+
+    let command = rm_command(Path::new("/opt/mule"), None, "dev", &id, Some(&retry));
+
+    assert_eq!(
+        args(&command),
+        [
+            "--quiet",
+            "rm",
+            "--host",
+            "dev",
+            "abc123",
+            "--retry-for",
+            "600"
+        ]
+    );
+}
+
+#[test]
+fn a_relative_failed_file_is_made_absolute() {
+    let id: JobId = "abc123".parse().unwrap();
+    let retry = StopRetry {
+        retry_for: STOP_RETRY_FOR,
+        fence_gen: Some(0),
+        failed_file: Some(Path::new("w.job.abc123.stop-failed")),
+    };
+
+    let command = rm_command(Path::new("/opt/mule"), None, "dev", &id, Some(&retry));
+
+    let path = Path::new(*args(&command).last().unwrap());
+    assert!(path.is_absolute(), "{path:?}");
+}
+
+#[test]
 fn the_program_is_this_executable_and_never_a_path_lookup() {
     let id: JobId = "abc123".parse().unwrap();
     let exe = std::env::current_exe().unwrap();
 
-    let command = rm_command(&exe, None, "dev", &id);
+    let command = rm_command(&exe, None, "dev", &id, None);
 
     assert!(Path::new(command.get_program()).is_absolute());
     assert_ne!(command.get_program(), "mule");

@@ -129,6 +129,38 @@ pub fn redirect_stdio_to_null() {
     }
 }
 
+/// How long a signal-path stop keeps retrying before it records its failure.
+///
+/// Ten minutes: long enough for a human to see the dead pane's hand-back line
+/// and reopen a master (one hardware-key tap), short enough that a stop child
+/// is not a process that lingers for the rest of the day.
+pub const STOP_RETRY_FOR: Duration = Duration::from_secs(600);
+
+/// [`STOP_RETRY_FOR`], unless `MULE_STOP_RETRY_FOR` (seconds) overrides it.
+///
+/// A test seam, not a setting: layer 3 must see a stop give up and record,
+/// and ten minutes per case is not a test. It is read by the carrier and
+/// handed to the child as an ordinary `--retry-for`, so the child has no
+/// hidden input. Unparsable values are ignored rather than shortening a real
+/// stop by accident.
+pub fn stop_retry_for() -> Duration {
+    std::env::var("MULE_STOP_RETRY_FOR")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+        .map_or(STOP_RETRY_FOR, Duration::from_secs)
+}
+
+/// What makes a detached stop a retrying one (`rm --retry-for ...`).
+#[derive(Debug, Clone)]
+pub struct StopRetry<'a> {
+    pub retry_for: Duration,
+    /// The stop fence generation the carrier read at signal time. A lease
+    /// passes it; exec has nothing that could reattach, so it does not.
+    pub fence_gen: Option<u64>,
+    /// `<job_file>.<id>.stop-failed`. Exec has no job file.
+    pub failed_file: Option<&'a Path>,
+}
+
 /// The detached stop: this mule, this config, `rm <id>`.
 ///
 /// - `exe` is `current_exe()`, never `mule` from PATH: a worker or a test runs a
@@ -136,8 +168,17 @@ pub fn redirect_stdio_to_null() {
 /// - `config` is the effective `--config` when one was given. Without it the
 ///   child would fall back to -- and, on a bare home, seed -- the default
 ///   config, which is not the file the parent used.
-/// - `--quiet`: nothing here is read by anyone, and stdio is `/dev/null`.
-pub fn rm_command(exe: &Path, config: Option<&Path>, host: &str, id: &JobId) -> Command {
+/// - `--quiet`: nothing here is read by anyone, and stdio is `/dev/null`. That
+///   is why a signal-path stop retries and records (`retry`): on 2026-11-04 a
+///   single attempt failed on a down master into `/dev/null`, and six jobs ran
+///   on unseen.
+pub fn rm_command(
+    exe: &Path,
+    config: Option<&Path>,
+    host: &str,
+    id: &JobId,
+    retry: Option<&StopRetry>,
+) -> Command {
     let mut command = Command::new(exe);
     if let Some(config) = config {
         // The child inherits the cwd, but a relative path is one `chdir` away
@@ -147,7 +188,21 @@ pub fn rm_command(exe: &Path, config: Option<&Path>, host: &str, id: &JobId) -> 
     }
     command
         .args(["--quiet", "rm", "--host", host])
-        .arg(id.as_str())
+        .arg(id.as_str());
+    if let Some(retry) = retry {
+        command
+            .arg("--retry-for")
+            .arg(retry.retry_for.as_secs().to_string());
+        if let Some(generation) = retry.fence_gen {
+            command.arg("--fence-gen").arg(generation.to_string());
+        }
+        if let Some(path) = retry.failed_file {
+            // Absolute for the same reason as the config.
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            command.arg("--failed-file").arg(path);
+        }
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -174,7 +229,18 @@ pub fn spawn_detached(mut command: Command) -> io::Result<()> {
     command.spawn().map(drop)
 }
 
-/// Stop `id` from a signal path: build the command and detach it.
-pub fn spawn_rm(config: Option<&Path>, host: &str, id: &JobId) -> io::Result<()> {
-    spawn_detached(rm_command(&std::env::current_exe()?, config, host, id))
+/// Stop `id`: build the command and detach it. `retry` for a signal path.
+pub fn spawn_rm(
+    config: Option<&Path>,
+    host: &str,
+    id: &JobId,
+    retry: Option<&StopRetry>,
+) -> io::Result<()> {
+    spawn_detached(rm_command(
+        &std::env::current_exe()?,
+        config,
+        host,
+        id,
+        retry,
+    ))
 }
