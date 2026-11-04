@@ -154,8 +154,9 @@ pub fn stop_retry_for() -> Duration {
 #[derive(Debug, Clone)]
 pub struct StopRetry<'a> {
     pub retry_for: Duration,
-    /// The stop fence generation the carrier read at signal time. A lease
-    /// passes it; exec has nothing that could reattach, so it does not.
+    /// The stop fence generation the carrier owns (`lease::Owned`), never one
+    /// read at signal time. A lease always passes it; exec has nothing that
+    /// could reattach, so it does not.
     pub fence_gen: Option<u64>,
     /// `<job_file>.<id>.stop-failed`. Exec has no job file.
     pub failed_file: Option<&'a Path>,

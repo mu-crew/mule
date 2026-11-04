@@ -7,7 +7,8 @@
 - `mule rm <id> --retry-for SECS [--fence-gen N] [--failed-file F]`: a stop
   that waits for a missing master (a lock-free `-O check` every 5s, never
   opening one) and retries a failed `rm` after 5, 10, 20, then every 30s, until
-  a soft monotonic deadline. On giving up it writes one atomic 0600 line to `F`
+  a soft monotonic deadline (checked after every sleep: no attempt starts
+  past it; one in flight is not cut short). On giving up it writes one atomic 0600 line to `F`
   (`<id> on <host> not stopped: <reason> (gave up after <n> attempts, <s>s; at
   unix <t>)`, at most 512 bytes) and exits 3 (never saw a master) or 1. On
   success it removes `F`. `--fence-gen` makes it stand down (exit 0, nothing
@@ -21,7 +22,9 @@
   tmux restart hung up six lease panes. On the host whose master was down,
   each detached `rm` failed once into `/dev/null`, and the jobs kept running
   with nobody told. The stop child now passes `--retry-for 600 --fence-gen G
-  --failed-file <job_file>.<id>.stop-failed`; the path names the job, so an
+  --failed-file <job_file>.<id>.stop-failed`, where `G` is the fence
+  generation the lease read before its dispatch (an unreadable fence exits 1
+  with nothing launched), never one read when signalled; the path names the job, so an
   old child's late write or delete never touches a newer job's record. `exec`'s
   signal-path stop retries too (no fence, no record: it has no job file).
 

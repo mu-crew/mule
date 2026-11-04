@@ -442,12 +442,13 @@ pub const RECORD_MAX_BYTES: usize = 512;
 /// A retrying stop, as `rm --retry-for` runs it.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
-    /// Retry until this much monotonic time has passed. A soft deadline: it is
-    /// checked between attempts, and an attempt in flight has no bound (the
-    /// ticket wait is unbounded by design, SPEC § Contention).
+    /// Retry until this much monotonic time has passed. A soft deadline: no
+    /// attempt starts once it has passed, but an attempt in flight has no
+    /// bound (the ticket wait is unbounded by design, SPEC § Contention).
     pub retry_for: Duration,
-    /// The generation the carrier saw when it was signalled. `None` (exec's
-    /// stop) is unfenced: nothing reattaches to an exec job.
+    /// The generation the carrier owns (fixed before it owned the job, never
+    /// read when signalled). `None` (exec's stop) is unfenced: nothing
+    /// reattaches to an exec job.
     pub fence_gen: Option<u64>,
     /// Where to write the stop-failure record on giving up, and what to remove
     /// on success.
@@ -588,6 +589,14 @@ pub fn remove_with_retry(
             break;
         }
         clock.sleep(wait.min(deadline - now));
+        // Again after the sleep, immediately before the next attempt: the
+        // clamped last sleep lands on the deadline, and a sleep stretched by
+        // scheduling or SIGSTOP can wake far past it (review of mule_stop:
+        // asked for 1s, woke at 900s, and a new `rm` ran). The soft bound
+        // covers only an attempt already in flight, never a new one.
+        if clock.now() >= deadline {
+            break;
+        }
     }
 
     let code = if last_reason.is_none() {

@@ -181,27 +181,68 @@ fn random_u64() -> u64 {
     hasher.finish()
 }
 
-/// Name the job, then dispatch it as `run --tui` does.
+/// The job a carrier owns, and the stop fence generation it owns it at.
 ///
-/// The id is in `job_file` before the dispatch ssh starts; if that write fails
-/// nothing is dispatched. `on_dispatch` brackets the ssh call (true before,
-/// false after) so a signal path can wait for an in-flight dispatch rather than
-/// overtake it with an `rm` that would be a no-op.
+/// Fixed before the carrier can own the job, and the only generation its
+/// stop is ever fenced with: a lease reads it before its dispatch; an attach
+/// owns the number it bumped to. Never re-read at signal time -- a signal
+/// thread descheduled after its pane went could read an attach's new
+/// generation and kill the reattached job, and a read error there left the
+/// stop unfenced (review of mule_stop, both reproduced).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owned {
+    pub id: JobId,
+    pub fence_gen: u64,
+}
+
+/// The retrying stop a signalled carrier hands its detached `rm`: always
+/// fenced, with exactly the generation it owns, and recorded beside
+/// `failed_file`'s job.
+pub fn stop_retry<'a>(
+    owned: &Owned,
+    failed_file: &'a Path,
+    retry_for: Duration,
+) -> cleanup::StopRetry<'a> {
+    cleanup::StopRetry {
+        retry_for,
+        fence_gen: Some(owned.fence_gen),
+        failed_file: Some(failed_file),
+    }
+}
+
+/// Name the job, own its fence generation, then dispatch it as `run --tui`
+/// does.
+///
+/// The generation is read from `fences` (normally [`StopFence::dir`]) before
+/// anything is written or dispatched; an unreadable or invalid fence is an
+/// error with nothing launched, because the stop would have no generation to
+/// be fenced with. The id is in `job_file` before the dispatch ssh starts; if
+/// that write fails nothing is dispatched. `on_dispatch` brackets the ssh call
+/// (the owned job before, `None` after) so a signal path can wait for an
+/// in-flight dispatch rather than overtake it with an `rm` that would be a
+/// no-op.
 pub fn start(
     t: &dyn Transport,
     host: &Host,
     job_file: &Path,
+    fences: &Path,
     request: &Request,
-    on_dispatch: &dyn Fn(Option<&JobId>),
+    on_dispatch: &dyn Fn(Option<&Owned>),
     warnings: &mut dyn Write,
-) -> Result<JobId> {
+) -> Result<Owned> {
     let id: JobId = new_id().parse().expect("generated ids are valid");
+    // Almost always missing (0) for a fresh id; read anyway, since a reused
+    // id's leftover fence is exactly what the number must match.
+    let fence_gen = StopFence::in_dir(fences, &id)
+        .generation_unlocked()
+        .context("cannot own the job's stop fence; nothing was dispatched")?;
     write_job_file(job_file, &id)?;
-    on_dispatch(Some(&id));
+    let owned = Owned { id, fence_gen };
+    on_dispatch(Some(&owned));
     let dispatched = crate::run::dispatch_with_id(
         t,
         host,
-        id,
+        owned.id.clone(),
         request.cmd,
         request.cwd,
         request.max_secs,
@@ -210,7 +251,7 @@ pub fn start(
         warnings,
     );
     on_dispatch(None);
-    dispatched
+    dispatched.map(|_| owned)
 }
 
 /// The literal attach command, as `run --tui`'s hints print it. Printed, never
@@ -587,7 +628,7 @@ fn park() -> ! {
 
 struct RealSignalSteps {
     host: Host,
-    id: JobId,
+    owned: Owned,
     /// Where the stop-failure record goes, beside it.
     job_file: PathBuf,
     specs: Vec<Spec>,
@@ -618,21 +659,13 @@ impl SignalSteps for RealSignalSteps {
         // kills that ssh too, and its call returns at once.
         self.calls
             .stop(deadline.saturating_duration_since(Instant::now()));
-        // Unlocked: a stop attempt in flight for this id would make a locked
-        // read wait, and the exit must stay prompt. An unreadable fence gives
-        // an unfenced stop -- still retried and recorded -- never a guessed
-        // generation, which could make the child stand down without stopping.
-        let fence_gen = StopFence::for_job(&self.id).generation_unlocked().ok();
-        let failed_file = stop_failed_path(&self.job_file, &self.id);
-        let retry = cleanup::StopRetry {
-            retry_for: cleanup::stop_retry_for(),
-            fence_gen,
-            failed_file: Some(&failed_file),
-        };
+        // The generation this carrier owns, not one read now: see `Owned`.
+        let failed_file = stop_failed_path(&self.job_file, &self.owned.id);
+        let retry = stop_retry(&self.owned, &failed_file, cleanup::stop_retry_for());
         let _ = cleanup::spawn_rm(
             self.config.as_deref(),
             &self.host.name,
-            &self.id,
+            &self.owned.id,
             Some(&retry),
         );
     }
@@ -666,7 +699,7 @@ pub fn run_cli(
     let calls = ssh.stopper();
     // The id is known only once `start` has generated it; until then a signal
     // has nothing to stop (nothing was dispatched) and just exits.
-    let named: Arc<std::sync::Mutex<Option<JobId>>> = Arc::default();
+    let named: Arc<std::sync::Mutex<Option<Owned>>> = Arc::default();
     {
         let (host, specs, config) = (host.clone(), specs.clone(), config.clone());
         let job_file = job_file.to_path_buf();
@@ -677,15 +710,15 @@ pub fn run_cli(
             // same lock before the dispatch ssh, so a dispatch can never start
             // after this thread decided there was nothing to stop.
             let guard = named.lock();
-            let id = guard.as_ref().ok().and_then(|id| (*id).clone());
-            if id.is_some() {
+            let owned = guard.as_ref().ok().and_then(|owned| (*owned).clone());
+            if owned.is_some() {
                 drop(guard);
             }
-            let code = match id {
-                Some(id) => on_signal(
+            let code = match owned {
+                Some(owned) => on_signal(
                     &mut RealSignalSteps {
                         host,
-                        id,
+                        owned,
                         job_file,
                         specs,
                         config,
@@ -708,16 +741,17 @@ pub fn run_cli(
         &ssh,
         host,
         job_file,
+        &StopFence::dir(),
         request,
-        &|id| {
-            if let Some(id) = id {
+        &|owned| {
+            if let Some(owned) = owned {
                 // `dispatching` is set under the lock, before the id is
                 // visible: once the signal thread can see an id it also sees
                 // the dispatch as in flight, so its `rm` waits for it rather
                 // than overtaking it (a no-op `rm`, then a leaked job).
                 if let Ok(mut named) = named.lock() {
                     dispatching.store(true, Ordering::SeqCst);
-                    *named = Some(id.clone());
+                    *named = Some(owned.clone());
                 }
             } else {
                 dispatching.store(false, Ordering::SeqCst);
@@ -726,7 +760,7 @@ pub fn run_cli(
         &mut stderr,
     );
     let id = match started {
-        Ok(id) => id,
+        Ok(owned) => owned.id,
         Err(error) => {
             if signals.pending().is_some() {
                 park();
@@ -743,8 +777,8 @@ pub fn run_cli(
             // The dispatch may have landed before its reply was lost; the id is
             // in the job file either way, and `rm` of a never-made job is a
             // no-op. (A job-file write failure never gets here with an id.)
-            if let Ok(Some(id)) = named.lock().map(|id| id.clone()) {
-                let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
+            if let Ok(Some(owned)) = named.lock().map(|owned| owned.clone()) {
+                let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &owned.id, None);
             }
             return Err(error);
         }
