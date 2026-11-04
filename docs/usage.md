@@ -120,6 +120,22 @@ running jobs and orphans alone. Prefer `mule kill` when you want the exit code
 recorded as **137** without dropping state; use `kill --rm` to end and discard
 in one trip.
 
+`mule rm <id> --retry-for SECS` is the signal-path stop a lease or `exec`
+spawns. You rarely type it. It waits for a missing master (a `-O check` every
+5s; it never opens one), retries a failed `rm` after 5, 10, 20, then every 30s,
+and stops at a soft deadline: an attempt in flight is not cut short.
+`--failed-file F` writes one line there on giving up and removes it on success.
+`--fence-gen N` stands down (exit 0, nothing removed) once the job has been
+reattached. A lease's stop retries for 10 minutes and records to
+`<job_file>.<id>.stop-failed`:
+
+```text
+3a043f on dev1 not stopped: no control master (gave up after 0 attempts, 600s; at unix 1762270000)
+```
+
+That file means the job may still be running: open the master, then
+`mule ls --host dev1`, then `mule rm --host dev1 3a043f`.
+
 ## Forwarding a unix socket
 
 ```sh
@@ -179,7 +195,10 @@ in between: a probe per tick (1s settling to 5s) over mule's own connection.
   master is back. Exit 3 happens only at startup, before anything is dispatched.
 - **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143) through a detached
   `mule rm`, and cancel the forwards. Closing the pane is a SIGHUP. `kill -9`
-  cannot be handled: the job keeps running and `F` names it.
+  cannot be handled: the job keeps running and `F` names it. The detached stop
+  retries for up to 10 minutes (a down master included). If it still fails it
+  writes `F.<id>.stop-failed`, one line starting with the id, so a job that
+  could not be stopped is never silent.
 - **The pane shows** a status line (job, host, state, forwards, the
   `murmur pick --all  # select mule-<id>` attach command and the stop command)
   and mirrors the remote screen for 30s after the first forward, then only on
@@ -216,7 +235,7 @@ is the command's own.
 - **Exit 1** also covers a job mule could not remove (a session or state left
   on the host): the command's own code is never returned beside a leftover job.
 - **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143), through a detached `mule rm`
-  that queues like any caller. Give it a moment before you tear the machine
+  that queues like any caller and retries for up to 10 minutes. Give it a moment before you tear the machine
   down. `run --wait` is the opposite: its job continues.
 - **Exit 3** is still "no master: stop and ask a human".
 

@@ -77,7 +77,7 @@ The lock poll interval is **5ms**. With four callers, five rounds each, and **50
 
 ## Leases
 
-A lease is a per-job foreground waiter, like `run --wait`. It holds a forward listener, which is not a session. It re-arms forwards after drift. It never re-dispatches, retries, queues or places a job, and every ssh call it makes is sub-second. The carve-out from [Add a local scheduler or supervisor](#add-a-local-scheduler-or-supervisor) covers idempotent forward repair only.
+A lease is a per-job foreground waiter, like `run --wait`. It holds a forward listener, which is not a session. It re-arms forwards after drift. It never re-dispatches, retries, queues or places a job, and every ssh call it makes is sub-second. The carve-out from [Add a local scheduler or supervisor](#add-a-local-scheduler-or-supervisor) covers idempotent forward repair, plus the detached child's retry of a dead lease's own stop ([Detached cleanup](#detached-cleanup)).
 
 ### `mule run --lease`
 
@@ -251,6 +251,8 @@ So exit 3 has its own code, and the contract for a caller receiving it is to **s
 
 One tap unblocks every job for the life of the `ControlPersist` window, so the escalation is cheap and rare. An agent that improvises instead converts a ten-second interruption into a broken host.
 
+One caller waits for a master instead: the **detached stop child** a lease (or `exec`) spawns from its signal path (`rm --retry-for`, [Detached cleanup](#detached-cleanup)). It has no terminal, opens nothing and prompts for nothing. It polls `-O check`, which is lock-free and opens no session, every 5s, and gives up at a soft deadline. It waits for the human the dead pane already asked, and when it gives up it says so in a record.
+
 ## Commands and output
 
 ```text
@@ -260,7 +262,7 @@ mule wait <id> [--host H] [--timeout S]
 mule tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
 mule ls [--host H] [--all] [--json] [--full]
 mule kill <id> [--host H] [--rm]
-mule rm [<id> | --all] [--host H]
+mule rm [<id> [--retry-for S [--fence-gen N] [--failed-file F]] | --all] [--host H]
 mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>
 mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] --job-file F [--forward-unix L:R ...] -- <cmd>
 mule forward | unforward [--host H] --unix LOCAL:REMOTE ...
@@ -323,6 +325,15 @@ A foreground waiter cannot stop its own job from a signal path: `rm` queues on t
 
 The signal handler only sets a flag and writes to a self-pipe (`signal-hook`), so a sleep is interruptible; a thread acts on it. The first act is `dup2` of `/dev/null` onto fds 1 and 2, because after SIGHUP the pane's tty is gone and `print!`/`eprint!` panic on EIO. If the signal lands while the dispatch ssh is in flight, the child waits up to 3s for it first: an `rm` that overtook the dispatch would be a no-op and leak the job. This lives in `cleanup.rs`, reusable by the lease.
 
+**A signal-path stop retries, then records** (2026-11-04: a tmux restart hung up six lease panes. On the host whose master was down, each child's one `rm` failed in `require_master` into `/dev/null`, and the jobs ran on unseen). The child is `rm <id> --retry-for 600`. A lease adds `--fence-gen G --failed-file <job_file>.<id>.stop-failed`; exec has no job file and nothing reattaches to its job, so it passes only `--retry-for`.
+
+- **Master down:** no `rm`; `-O check` every 5s.
+- **Master up:** one whole `rm <id>` through the ticketed `run`. Exit 0 or "nothing to remove" ends it: the record is removed (best effort, and the path names only this id), and so is the fence. Any other error keeps its first line as the reason and backs off 5, 10, 20, then 30s, after the ticket is released, so the backoff holds no queue slot.
+- **Deadline:** monotonic and soft. It is checked between attempts and every sleep is clamped to it. An attempt in flight is not bounded (the ticket wait is unbounded by design, and session ssh is a plain `output()`), so the record can be late, or absent if an attempt blocks forever. Nothing cancels an in-flight ssh.
+- **Giving up:** one atomic 0600 line, `<id> on <host> not stopped: <reason> (gave up after <n> attempts, <s>s; at unix <t>)`, at most 512 bytes. The reason is cut first, on a UTF-8 boundary, so the id and counts survive. The reason is `no control master` if no master was ever seen. Exit 3 then, else 1; nobody reads it.
+
+**The stop fence** (`<state>/stopping/<id>`, one decimal generation, missing = 0) keeps an old child from stopping a job that was reattached since (`run --lease --attach`). The child holds the fence's `flock` for each whole attempt and for the record write. Under it, a generation other than `--fence-gen` means "reattached": it exits 0 with nothing removed, written or deleted. Attach takes the same lock and bumps the generation only after proving the job running, so a later stop by the attached carrier reads the new number and is never disarmed. A cancel marker was rejected: removed by attach, it re-arms a sleeping old child; left in place, it cancels the next carrier's stop. The fence file is unlinked only after an `rm` proved the job gone, never while the job may run: unlinking a live flock file lets two holders in.
+
 ## Listing, load, and cleanup
 
 `ls` does a bounded amount of work per host -- one `tmux list-sessions`, one batched `stat`, one `awk` -- rather than work proportional to the job count. The same stat batch reads the directory, `cmd`, and `rc` mtimes. Runtime is `now - cmd_mtime` while running and `rc_mtime - cmd_mtime` when finished; an orphan shows `-` because its end time is unknowable. The human table shows `RUNTIME` instead of the state-dependent `AGE`; JSON retains `age_secs` and adds `runtime_secs`. The listing runs inside the ticket lock, so its duration is a channel outage for everything else: a per-job version measured 14.1s at 300 jobs, fourteen times the one-second ceiling stated above, at a job count `keep_days` makes ordinary.
@@ -333,7 +344,7 @@ Its default filter is **time-based, not state-based**: everything from the last 
 
 `max_running` is advisory. Dispatch counts sessions in the same round trip and warns after starting a job when the count exceeds the configured cap. A preflight count would double the round trips for a warning that does not block work.
 
-`rm <id>` ends that job if it is still running, then removes its state directory, and **exit 0 is a proof of that**: neither `mule-<id>` nor `watch-<id>` exists and the state directory is gone after `rm -rf`. Absence must be *seen*, not inferred from a failed probe: `tmux has-session` exits 1 for a protocol mismatch or an unsafe socket directory just as it does for a missing session (it deleted the state of a live job), and `[ -d ]` is false behind an unsearchable parent. So the script lists sessions with `list-sessions` and counts tmux as absent only on `no server running` or a missing socket (`error connecting to … No such file or directory`), and probes the directory with `ls -d`, counting it gone only on `No such file or directory`. A tmux or state path that cannot be verified exits **1** with the tmux or `ls` error and keeps the state. A missing job (no sessions, no directory) passes the same checks and exits 0, so `rm` is idempotent. If a session survives `kill-session`, or the directory survives `rm -rf`, it exits **1** naming which, and keeps what is left: a surviving session is not killed again silently and its directory is not touched, and a directory is not half-removed by a second pass. It is still one round trip. The contract exists because a caller such as mu deletes its job handle and removes a worktree only after `rm <id>` succeeds; the previous script ended in an unconditional `exit 0` and let a still-running job lose its handle. `rm --all` is unchanged and removes every finished job while ignoring `keep_days`. `--all` never stops work: a running job is spared, and so is an orphan, since an orphan has no `rc` and is the one state that cannot be reconstructed. That is what makes `--all` safe without a confirmation prompt. `kill` records **137** and keeps state; `kill --rm` ends and discards in one round trip.
+`rm <id>` ends that job if it is still running, then removes its state directory, and **exit 0 is a proof of that**: neither `mule-<id>` nor `watch-<id>` exists and the state directory is gone after `rm -rf`. Absence must be *seen*, not inferred from a failed probe: `tmux has-session` exits 1 for a protocol mismatch or an unsafe socket directory just as it does for a missing session (it deleted the state of a live job), and `[ -d ]` is false behind an unsearchable parent. So the script lists sessions with `list-sessions` and counts tmux as absent only on `no server running` or a missing socket (`error connecting to … No such file or directory`), and probes the directory with `ls -d`, counting it gone only on `No such file or directory`. A tmux or state path that cannot be verified exits **1** with the tmux or `ls` error and keeps the state. A missing job (no sessions, no directory) passes the same checks and exits 0, so `rm` is idempotent. If a session survives `kill-session`, or the directory survives `rm -rf`, it exits **1** naming which, and keeps what is left: one `rm` never kills twice, its directory is not touched, and a directory is not half-removed by a second pass. A retrying stop (`--retry-for`, [Detached cleanup](#detached-cleanup)) repeats whole attempts and records its failure. It is still one round trip. The contract exists because a caller such as mu deletes its job handle and removes a worktree only after `rm <id>` succeeds; the previous script ended in an unconditional `exit 0` and let a still-running job lose its handle. `rm --all` is unchanged and removes every finished job while ignoring `keep_days`. `--all` never stops work: a running job is spared, and so is an orphan, since an orphan has no `rc` and is the one state that cannot be reconstructed. That is what makes `--all` safe without a confirmation prompt. `kill` records **137** and keeps state; `kill --rm` ends and discards in one round trip.
 
 `run` prunes in the round trip it is already making, over two horizons. Finished jobs go after `keep_days`, default **14**. Orphans go after four times that, because an orphan is evidence — the host rebooted, or something killed the session — and since `kill` writes rc 137 it means strictly "not mule's doing". Running jobs are never pruned.
 
@@ -517,6 +528,8 @@ Unix control-socket forwards (`mule forward`) are the one exemption, because the
 ### Add a local scheduler or supervisor
 
 Detached tmux and durable artifacts provide survival and completion without a daemon. Reconnect logic, retries, and placement policy would turn a dispatcher into an orchestrator. The one carve-out is idempotent forward repair (see [Leases](#leases)): a lease is a foreground waiter for one job, it re-arms that job's forwards after drift, and it never re-dispatches, retries, queues or places a job. It is not a daemon -- it is the pane's process and dies with the pane.
+
+The second carve-out is a dead lease's own stop, retried for at most `--retry-for` (10 minutes) by its detached child. It is fenced against reattach, never re-dispatches, and ends with a proof or a record. It is one job's stop, not a scheduler: nothing else is retried, and nothing outlives the bound.
 
 ## Deferred choices
 

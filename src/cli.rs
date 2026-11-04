@@ -189,7 +189,8 @@ pub enum Commands {
         /// if orphaned; 3 only at startup (no master). A master that goes away
         /// later does NOT end the lease: it prints the command a human must run
         /// and keeps holding. SIGHUP/SIGINT/SIGTERM stop the job through a
-        /// detached `mule rm` and exit 129/130/143.
+        /// detached `mule rm` and exit 129/130/143. That stop retries for up
+        /// to 10 minutes; if it gives up it writes F.<id>.stop-failed.
         #[arg(long, requires = "job_file", conflicts_with_all = ["wait", "no_tail"])]
         lease: bool,
         /// With --lease: file the job id is written to before dispatch
@@ -328,6 +329,28 @@ pub enum Commands {
         /// to end a named job.
         #[arg(long, conflicts_with = "id")]
         all: bool,
+        /// Retry for up to SECS (monotonic) until the job is proven gone
+        ///
+        /// For a lease's detached signal-path stop. A missing master is waited
+        /// for (lock-free `-O check` every 5s, never opened); a failed `rm` is
+        /// retried after 5, 10, 20, then every 30s. The deadline is soft: an
+        /// attempt in flight is not cut short. Without it, one attempt.
+        #[arg(long, value_name = "SECS", conflicts_with = "all")]
+        retry_for: Option<u64>,
+        /// Stop only while the job's stop fence is at generation N
+        ///
+        /// A different generation means the job was reattached since this
+        /// stop began: exit 0 at once, with nothing removed or recorded.
+        #[arg(long, value_name = "N", requires = "retry_for", conflicts_with = "all")]
+        fence_gen: Option<u64>,
+        /// On giving up, write a one-line record here; on success, remove it
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "retry_for",
+            conflicts_with = "all"
+        )]
+        failed_file: Option<std::path::PathBuf>,
         #[command(flatten)]
         host: HostArg,
     },
@@ -1063,8 +1086,43 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Commands::Rm { id, all, host } => {
+        Commands::Rm {
+            id,
+            all,
+            retry_for,
+            fence_gen,
+            failed_file,
+            host,
+        } => {
             let host = cfg.host(host.host.as_deref())?;
+            if let Some(secs) = retry_for {
+                let id = id.ok_or_else(|| anyhow::anyhow!("--retry-for needs a job id"))?;
+                let policy = crate::jobs::RetryPolicy {
+                    retry_for: std::time::Duration::from_secs(secs),
+                    fence_gen,
+                    failed_file,
+                };
+                let fence = crate::stopfence::StopFence::for_job(&id);
+                let outcome = crate::jobs::remove_with_retry(
+                    &Ssh,
+                    host,
+                    &id,
+                    &policy,
+                    &crate::jobs::RealClock::new(),
+                    &fence,
+                )?;
+                match &outcome {
+                    crate::jobs::StopOutcome::Removed(removed) => match removed.first() {
+                        Some(id) => println!("{id}"),
+                        None => eprintln!("mule: nothing to remove"),
+                    },
+                    crate::jobs::StopOutcome::Fenced => {
+                        eprintln!("mule: job {id} was reattached; this stop stands down");
+                    }
+                    crate::jobs::StopOutcome::GaveUp { line, .. } => eprintln!("mule: {line}"),
+                }
+                return Ok(outcome.exit_code());
+            }
             let target = match (id, all) {
                 (Some(id), _) => crate::jobs::Target::One(id),
                 (None, true) => crate::jobs::Target::AllDone,

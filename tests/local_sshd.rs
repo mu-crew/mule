@@ -2461,6 +2461,17 @@ impl Lease {
         specs: &[String],
         cmd: &[&str],
     ) -> Self {
+        Self::start_env(sshd, config, tag, specs, cmd, &[])
+    }
+
+    fn start_env(
+        sshd: &Sshd,
+        config: &std::path::Path,
+        tag: &str,
+        specs: &[String],
+        cmd: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let job_file = sshd.dir.join(format!("{tag}.job"));
         let out = sshd.dir.join(format!("{tag}.out"));
         let mut args = vec![
@@ -2476,6 +2487,7 @@ impl Lease {
         args.push("--");
         args.extend(cmd);
         let mut command = mule_command(sshd, config, &args, &[]);
+        command.envs(env.iter().copied());
         command.stdout(std::fs::File::create(&out).unwrap());
         let child = command.spawn().expect("mule failed to spawn");
         Self {
@@ -3255,5 +3267,117 @@ fn a_signal_mid_probe_frees_the_session_before_exec_exits() {
     );
     wait_until("the job to be removed", Duration::from_secs(20), || {
         job_ids(&sshd).is_empty() && !sessions(&sshd, &tmux.name).contains("mule-")
+    });
+}
+
+// -- a lease's signal-path stop on a down master (2026-11-04 aiv-blog) ---------
+
+/// A lease holding `sleep 120`, then its master taken away and the lease TERMed
+/// once it has said so: the detached stop child starts on a down master.
+/// `retry_for` is the stop's bound, through the carrier's test seam.
+fn lease_termed_on_a_down_master(
+    sshd: &Sshd,
+    config: &std::path::Path,
+    tag: &str,
+    retry_for: &str,
+) -> (String, PathBuf) {
+    let master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let lease = Lease::start_env(
+        sshd,
+        config,
+        tag,
+        &[],
+        &["sleep 120"],
+        &[("MULE_STOP_RETRY_FOR", retry_for)],
+    );
+    let id = lease.id();
+    wait_until("the job to run", Duration::from_secs(30), || {
+        stdout(&sshd.mule(config, &["poll", &id])) == "running"
+    });
+    drop(master);
+    wait_until("the hand-back line", Duration::from_secs(15), || {
+        lease.output().contains("is gone; a human must")
+    });
+    signal(&lease.child, "TERM");
+    let record = PathBuf::from(format!("{}.{id}.stop-failed", lease.job_file.display()));
+    let (code, _) = lease.exit();
+    assert_eq!(code, Some(143));
+    (id, record)
+}
+
+#[test]
+fn a_signal_stop_that_never_sees_a_master_is_recorded_and_the_job_is_listable_later() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "stop-record");
+    let config = sshd.write_config(&tmux.name);
+
+    let (id, record) = lease_termed_on_a_down_master(&sshd, &config, "rec", "6");
+
+    // Not silent: within the bound plus one 5s master check and margin.
+    wait_until("the stop-failure record", Duration::from_secs(30), || {
+        std::fs::read_to_string(&record).is_ok_and(|line| line.ends_with('\n'))
+    });
+    let line = std::fs::read_to_string(&record).unwrap();
+    assert!(
+        line.starts_with(&format!(
+            "{id} on live not stopped: no control master (gave up after 0 attempts,"
+        )),
+        "{line}"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        job_state_dir(&sshd, &id).exists(),
+        "the job was not stopped"
+    );
+
+    // While the master is down nothing can list it; once it is back, `ls`
+    // does, and the record is what told the human to look.
+    let down = sshd.mule(&config, &["ls"]);
+    assert!(!stdout(&down).contains(&id), "{}", stdout(&down));
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let up = sshd.mule(&config, &["ls"]);
+    assert!(stdout(&up).contains(&id), "{}", stdout(&up));
+    assert!(stdout(&up).contains("running"), "{}", stdout(&up));
+
+    let out = sshd.mule(&config, &["rm", &id]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_master_back_within_the_bound_lets_the_signal_stop_finish_with_no_record() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "stop-retry");
+    let config = sshd.write_config(&tmux.name);
+
+    let (id, record) = lease_termed_on_a_down_master(&sshd, &config, "ret", "120");
+
+    // The stop child is now polling `-O check`; the job is still there.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(job_state_dir(&sshd, &id).exists());
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+
+    // One 5s check interval, then the ticketed `rm`.
+    wait_until(
+        "the retried stop to remove the job",
+        Duration::from_secs(30),
+        || {
+            !job_state_dir(&sshd, &id).exists()
+                && !sessions(&sshd, &tmux.name).contains(&format!("mule-{id}"))
+        },
+    );
+    assert!(!record.exists(), "a stop that succeeded leaves no record");
+    let fence = sshd.state_root.join("mule/stopping").join(&id);
+    wait_until("the fence to go", Duration::from_secs(5), || {
+        !fence.exists()
     });
 }

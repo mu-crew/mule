@@ -16,6 +16,7 @@ pub mod lease;
 pub mod lock;
 pub mod probe;
 pub mod run;
+pub mod stopfence;
 pub mod tail;
 pub mod transport;
 pub mod wrapper;

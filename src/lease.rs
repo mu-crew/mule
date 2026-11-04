@@ -36,6 +36,7 @@ use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_ORPHAN, MuleError};
 use crate::forward::{self, Spec};
 use crate::probe::{From as ProbeFrom, State, probe};
+use crate::stopfence::StopFence;
 use crate::transport::{InFlight, Ssh, Stopper, Transport};
 use crate::wrapper::{JobId, JobMetadata, JobMode, new_id};
 
@@ -76,12 +77,19 @@ pub struct Request<'a> {
 /// a bound turns that into an error instead of a spin.
 const TEMP_ATTEMPTS: u32 = 16;
 
-/// Write `id` to `path` atomically: a fresh temp file in the same directory
-/// (one line, fsynced), then a rename, then an fsync of the directory.
+/// Write `id` to `path` as the job file: [`write_line_file`] with the id.
+pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
+    write_line_file(path, id.as_str())
+        .with_context(|| format!("cannot write job file {}", path.display()))
+}
+
+/// Write one `line` to `path` atomically: a fresh temp file in the same
+/// directory (the line plus `\n`, fsynced), then a rename, then an fsync of
+/// the directory. The job file and the stop-failure record share it.
 ///
-/// Atomic because mu polls for this file and parses its one line: a reader
-/// must never see a half-written handle. Durable because the file is the only
-/// pointer to the job if the lease is SIGKILLed a moment later.
+/// Atomic because mu polls for these files and parses their one line: a
+/// reader must never see a half-written handle. Durable because the job file
+/// is the only pointer to the job if the lease is SIGKILLed a moment later.
 ///
 /// The temp is created exclusively (`O_CREAT|O_EXCL`) and never through a
 /// symlink (`O_NOFOLLOW`), under a random name, then `fchmod`ed to 0600. The
@@ -91,22 +99,23 @@ const TEMP_ATTEMPTS: u32 = 16;
 /// a planted 0644 file lend its mode to F (both reproduced, review round 1).
 /// An existing path is never opened, truncated or followed: a name that is
 /// taken is skipped for another.
-pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
+pub fn write_line_file(path: &Path, line: &str) -> Result<()> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
     };
     let name = path
         .file_name()
-        .with_context(|| format!("job file {} has no file name", path.display()))?;
-    let (tmp, mut file) = create_temp(&dir, name)
-        .with_context(|| format!("cannot write job file {}", path.display()))?;
+        .with_context(|| format!("{} has no file name", path.display()))?;
+    // Callers add the context (which file, and what it is for); one layer
+    // here would print the path twice.
+    let (tmp, mut file) = create_temp(&dir, name)?;
     let written = (|| -> std::io::Result<()> {
         // `mode` applies only at creation and is masked by the umask; the
         // explicit fchmod makes 0600 the mode whatever the umask.
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(format!("{id}\n").as_bytes())?;
+        file.write_all(format!("{line}\n").as_bytes())?;
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, path)?;
@@ -118,7 +127,18 @@ pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
         // else's file.
         let _ = std::fs::remove_file(&tmp);
     }
-    written.with_context(|| format!("cannot write job file {}", path.display()))
+    Ok(written?)
+}
+
+/// The stop-failure record beside `job_file`: `<job_file>.<id>.stop-failed`.
+///
+/// The path names the job, so a late write by an old stop child can never
+/// overwrite -- or a late success delete -- a newer job's record under the
+/// same name (cross-repo contract § 2).
+pub fn stop_failed_path(job_file: &Path, id: &JobId) -> PathBuf {
+    let mut path = job_file.as_os_str().to_os_string();
+    path.push(format!(".{id}.stop-failed"));
+    PathBuf::from(path)
 }
 
 /// Create a new, empty, private temp file beside the job file, under a name
@@ -568,6 +588,8 @@ fn park() -> ! {
 struct RealSignalSteps {
     host: Host,
     id: JobId,
+    /// Where the stop-failure record goes, beside it.
+    job_file: PathBuf,
     specs: Vec<Spec>,
     config: Option<PathBuf>,
     dispatching: Arc<AtomicBool>,
@@ -596,7 +618,23 @@ impl SignalSteps for RealSignalSteps {
         // kills that ssh too, and its call returns at once.
         self.calls
             .stop(deadline.saturating_duration_since(Instant::now()));
-        let _ = cleanup::spawn_rm(self.config.as_deref(), &self.host.name, &self.id);
+        // Unlocked: a stop attempt in flight for this id would make a locked
+        // read wait, and the exit must stay prompt. An unreadable fence gives
+        // an unfenced stop -- still retried and recorded -- never a guessed
+        // generation, which could make the child stand down without stopping.
+        let fence_gen = StopFence::for_job(&self.id).generation_unlocked().ok();
+        let failed_file = stop_failed_path(&self.job_file, &self.id);
+        let retry = cleanup::StopRetry {
+            retry_for: cleanup::stop_retry_for(),
+            fence_gen,
+            failed_file: Some(&failed_file),
+        };
+        let _ = cleanup::spawn_rm(
+            self.config.as_deref(),
+            &self.host.name,
+            &self.id,
+            Some(&retry),
+        );
     }
 
     fn unforward(&mut self) {
@@ -631,6 +669,7 @@ pub fn run_cli(
     let named: Arc<std::sync::Mutex<Option<JobId>>> = Arc::default();
     {
         let (host, specs, config) = (host.clone(), specs.clone(), config.clone());
+        let job_file = job_file.to_path_buf();
         let (dispatching, named) = (Arc::clone(&dispatching), Arc::clone(&named));
         let calls = calls.clone();
         signals.on_signal(move |signal| {
@@ -647,6 +686,7 @@ pub fn run_cli(
                     &mut RealSignalSteps {
                         host,
                         id,
+                        job_file,
                         specs,
                         config,
                         dispatching,
@@ -704,7 +744,7 @@ pub fn run_cli(
             // in the job file either way, and `rm` of a never-made job is a
             // no-op. (A job-file write failure never gets here with an id.)
             if let Ok(Some(id)) = named.lock().map(|id| id.clone()) {
-                let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id);
+                let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
             }
             return Err(error);
         }
