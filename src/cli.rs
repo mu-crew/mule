@@ -333,8 +333,8 @@ pub enum Commands {
         ///
         /// For a lease's detached signal-path stop. A missing master is waited
         /// for (lock-free `-O check` every 5s, never opened); a failed `rm` is
-        /// retried after 5, 10, 20, then every 30s. The deadline is soft: an
-        /// attempt in flight is not cut short. Without it, one attempt.
+        /// retried after 5, 10, 20, then every 30s. The deadline is soft: no
+        /// attempt starts after it, but one in flight is not cut short. Without it, one attempt.
         #[arg(long, value_name = "SECS", conflicts_with = "all")]
         retry_for: Option<u64>,
         /// Stop only while the job's stop fence is at generation N

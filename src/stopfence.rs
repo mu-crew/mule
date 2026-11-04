@@ -8,13 +8,23 @@
 //! cancels the next carrier's stop of the same id (2026-11-04 lease-adopt
 //! spec, review item mule 2). A generation can.
 //!
-//! - The stop child is told the generation its carrier saw (`--fence-gen`) and
-//!   holds the fence's `flock` for each whole `rm` attempt. A different
-//!   generation under the lock means the job was reattached: it stops nothing.
+//! - Each carrier **owns** one generation, fixed before it can own the job and
+//!   never re-read at signal time: a lease reads it before its dispatch, an
+//!   attach owns the number it bumped to. Its stop child is told exactly that
+//!   (`--fence-gen`) and holds the fence's `flock` for each whole `rm`
+//!   attempt. A different generation under the lock means the job was
+//!   reattached: it stops nothing.
 //! - Attach takes the same lock (waiting out an attempt in flight) and bumps
-//!   the generation only once it has proven the job running. A later stop by
-//!   the attached carrier reads the bumped number, so the fence never disarms
+//!   the generation only once it has proven the job running. The attached
+//!   carrier's own stop carries the bumped number, so the fence never disarms
 //!   a future stop.
+//!
+//! Why owned rather than read when signalled (review of mule_stop, two
+//! executed repros): a dying carrier's signal thread descheduled after its
+//! pane went could read the generation an attach had just bumped to, and its
+//! child then matched and killed the reattached job; and a read error there
+//! dropped `--fence-gen` altogether, arming an unfenced stop that no bump
+//! could cancel.
 //! - The file is unlinked only after an `rm` proved the job gone. Unlinking a
 //!   live flock file lets two holders in (the trap `forward.rs` notes), so it
 //!   is never done while the job may run.
@@ -38,7 +48,18 @@ pub struct StopFence {
 impl StopFence {
     /// `<state_dir>/stopping/<id>`.
     pub fn for_job(id: &JobId) -> Self {
-        Self::at(crate::lock::state_dir().join("stopping").join(id.as_str()))
+        Self::in_dir(&Self::dir(), id)
+    }
+
+    /// `<state_dir>/stopping`: where every fence lives.
+    pub fn dir() -> PathBuf {
+        crate::lock::state_dir().join("stopping")
+    }
+
+    /// `id`'s fence under `dir`, so a caller that picks the id itself (the
+    /// lease) can be pointed at a test directory.
+    pub fn in_dir(dir: &Path, id: &JobId) -> Self {
+        Self::at(dir.join(id.as_str()))
     }
 
     /// A fence at an explicit path, so a test can hold or bump the fence of a
@@ -66,13 +87,13 @@ impl StopFence {
         self.flock(false)
     }
 
-    /// The generation without the lock, for a signal path that must not wait
-    /// on a stop attempt in flight. Missing is 0.
+    /// The generation without the lock. Missing is 0. A lease reads the
+    /// generation it owns this way, before its dispatch: a locked read would
+    /// create a fence file for every job, and nothing else can know a fresh
+    /// id yet. Never call it from a signal path (see the module docs).
     ///
     /// Safe to read unlocked because a bump only ever lengthens or rewrites
-    /// the digits in place (see [`FenceLock::bump`]), and the one writer that
-    /// matters -- attach -- bumps before the carrier can be signalled into a
-    /// stop at all.
+    /// the digits in place (see [`FenceLock::bump`]).
     pub fn generation_unlocked(&self) -> Result<u64> {
         match File::open(&self.path) {
             Ok(mut file) => read_generation(&mut file, &self.path),

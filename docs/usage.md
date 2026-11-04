@@ -123,10 +123,11 @@ in one trip.
 `mule rm <id> --retry-for SECS` is the signal-path stop a lease or `exec`
 spawns. You rarely type it. It waits for a missing master (a `-O check` every
 5s; it never opens one), retries a failed `rm` after 5, 10, 20, then every 30s,
-and stops at a soft deadline: an attempt in flight is not cut short.
+and stops at a soft deadline: no attempt starts after it, but one in flight is
+not cut short.
 `--failed-file F` writes one line there on giving up and removes it on success.
 `--fence-gen N` stands down (exit 0, nothing removed) once the job has been
-reattached. A lease's stop retries for 10 minutes and records to
+reattached; a lease always passes the generation it owned at dispatch. A lease's stop retries for 10 minutes and records to
 `<job_file>.<id>.stop-failed`:
 
 ```text

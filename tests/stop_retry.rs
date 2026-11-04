@@ -236,8 +236,77 @@ fn the_backoff_caps_at_thirty_seconds_and_sleeps_are_clamped_to_the_deadline() {
     // 5 + 10 + 20 + 30 = 65, then 30 more is 95, then the last 5 left.
     assert_eq!(clock.sleeps(), secs(&[5, 10, 20, 30, 30, 5]));
     assert_eq!(clock.now(), Duration::from_secs(100));
-    assert_eq!(fake.scripts().len(), 7);
+    // One attempt before each of the six sleeps, none after the last: the
+    // clamped sleep wakes on the deadline, and no attempt starts there.
+    assert_eq!(fake.scripts().len(), 6);
     assert_eq!(outcome.exit_code(), 1);
+    let line = record(&policy).unwrap();
+    assert!(line.contains("gave up after 6 attempts, 100s;"), "{line}");
+}
+
+/// A sleep that wakes `late` after it was due: scheduling delay, or a SIGSTOP
+/// held across it.
+fn oversleeps(clock: &VClock, late: Duration) {
+    let extra = clock.clone();
+    clock.on_sleep(move |_| extra.advance(late));
+}
+
+#[test]
+fn a_sleep_that_wakes_past_the_deadline_starts_no_new_attempt() {
+    // The reviewer's repro: budget 1s, the backoff clamped to 1s, the sleep
+    // resumes at 900s. A new rm then would kill the job long after the
+    // window, where its failure record belongs instead.
+    let (dir, fake, clock) = (scratch(), Fake::new(), VClock::default());
+    let fence = fence_at(&dir, 0);
+    let mut policy = policy(&dir, 0);
+    policy.retry_for = Duration::from_secs(1);
+    oversleeps(&clock, Duration::from_secs(899));
+    fake.push(rm_failed("cannot verify session state: boom"))
+        .push(Output::ok("a1b2c3\n"));
+
+    let outcome = remove_with_retry(&fake, &host(), &id(), &policy, &clock, &fence).unwrap();
+
+    assert_eq!(clock.sleeps(), secs(&[1]));
+    assert_eq!(fake.scripts().len(), 1, "no rm after the deadline");
+    assert!(
+        matches!(outcome, StopOutcome::GaveUp { code: 1, .. }),
+        "{outcome:?}"
+    );
+    let line = record(&policy).unwrap();
+    assert!(line.contains("gave up after 1 attempts, 900s;"), "{line}");
+    assert!(
+        fence.path().exists(),
+        "the job may still run: the fence stays"
+    );
+}
+
+#[test]
+fn a_master_back_only_after_an_overslept_poll_gets_no_rm() {
+    // The incident's path: master down, the 5s poll wakes late, the master is
+    // up by then. Past the deadline that is a record, not a late kill.
+    let (dir, fake, clock) = (scratch(), Arc::new(Fake::no_master()), VClock::default());
+    let fence = fence_at(&dir, 0);
+    let mut policy = policy(&dir, 0);
+    policy.retry_for = Duration::from_secs(5);
+    {
+        let (fake, extra) = (Arc::clone(&fake), clock.clone());
+        clock.on_sleep(move |_| {
+            extra.advance(Duration::from_secs(600));
+            fake.set_master(Some(1));
+        });
+    }
+
+    let outcome = remove_with_retry(&*fake, &host(), &id(), &policy, &clock, &fence).unwrap();
+
+    assert!(fake.scripts().is_empty(), "no rm after the deadline");
+    assert_eq!(outcome.exit_code(), 3, "no master was seen in the window");
+    let line = record(&policy).unwrap();
+    assert!(
+        line.starts_with(
+            "a1b2c3 on stop not stopped: no control master (gave up after 0 attempts,"
+        ),
+        "{line}"
+    );
 }
 
 #[test]
@@ -616,4 +685,147 @@ fn rm_retry_flags_need_an_id_and_refuse_all() {
         !ok(&["mule", "rm", "a1b2c3", "--failed-file", "/x"]),
         "requires --retry-for"
     );
+}
+
+// -- the generation a carrier owns (review of mule_stop, findings 1 and 2) ----
+
+fn lease_request() -> mule::lease::Request<'static> {
+    mule::lease::Request {
+        cmd: "pi",
+        cwd: None,
+        max_secs: None,
+        metadata: mule::wrapper::JobMetadata::Human,
+    }
+}
+
+/// `lease::start` with its job file in `dir` and the fences where production
+/// keeps them (this test process's isolated state dir), so a stop that read
+/// the fence again would see what an attach did to it.
+fn lease_start(fake: &Fake, dir: &Path) -> anyhow::Result<mule::lease::Owned> {
+    fake.push(Output::ok("1\n"));
+    let host = host();
+    mule::lease::start(
+        fake,
+        &host,
+        &dir.join("w.job"),
+        &StopFence::dir(),
+        &lease_request(),
+        &|_| {},
+        &mut std::io::sink(),
+    )
+}
+
+#[test]
+fn an_attach_after_the_old_carrier_let_go_is_not_stopped_by_its_late_stop() {
+    // The reviewer's race: the old carrier's pane is gone and its probe and
+    // ticket released; an attach proves the job running and bumps the fence;
+    // only then does the old signal thread build its stop. Read at that
+    // moment, the generation was attach's own, and the child killed the
+    // reattached job. Owned at dispatch, it is the old one, and stands down.
+    let (dir, fake, clock) = (scratch(), Fake::new(), VClock::default());
+    let owned = lease_start(&fake, &dir).unwrap();
+    assert_eq!(owned.fence_gen, 0, "a fresh id has no fence: generation 0");
+    let fence = StopFence::for_job(&owned.id);
+    assert_eq!(fence.lock().unwrap().bump().unwrap(), 1, "the attach");
+
+    let failed = stop_failed_path(&dir.join("w.job"), &owned.id);
+    let retry = mule::lease::stop_retry(&owned, &failed, Duration::from_secs(600));
+    assert_eq!(
+        retry.fence_gen,
+        Some(0),
+        "the owned generation, not attach's"
+    );
+    let policy = RetryPolicy {
+        retry_for: retry.retry_for,
+        fence_gen: retry.fence_gen,
+        failed_file: retry.failed_file.map(Path::to_path_buf),
+    };
+    let dispatched = fake.scripts().len();
+
+    let outcome = remove_with_retry(&fake, &host(), &owned.id, &policy, &clock, &fence).unwrap();
+
+    assert_eq!(outcome, StopOutcome::Fenced);
+    assert_eq!(
+        fake.scripts().len(),
+        dispatched,
+        "no rm of the reattached job"
+    );
+    assert!(!failed.exists(), "and no record calling it lost");
+}
+
+#[test]
+fn a_lease_stop_always_carries_the_owned_generation() {
+    // The old fallback dropped --fence-gen on any read error, arming a stop
+    // no bump could cancel. Nothing is read at signal time now, so even a
+    // fence wrecked after dispatch (a directory, as in the repro) cannot
+    // change the argv.
+    let dir = scratch();
+    let owned = mule::lease::Owned {
+        id: id(),
+        fence_gen: 7,
+    };
+    std::fs::create_dir_all(dir.join("stopping").join(id().as_str())).unwrap();
+    let failed = stop_failed_path(&dir.join("w.job"), &id());
+
+    let retry = mule::lease::stop_retry(&owned, &failed, Duration::from_secs(600));
+    let command = mule::cleanup::rm_command(Path::new("/m"), None, "stop", &id(), Some(&retry));
+
+    let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+    let at = args
+        .iter()
+        .position(|a| *a == "--fence-gen")
+        .expect("fenced");
+    assert_eq!(args[at + 1], "7");
+}
+
+#[test]
+fn an_unreadable_fence_at_start_launches_nothing() {
+    // `stopping` is a file, so the fence cannot be read (ENOTDIR). Without a
+    // generation the stop could not be fenced, so the lease refuses before
+    // any job exists.
+    let (dir, fake) = (scratch(), Fake::new());
+    std::fs::write(dir.join("stopping"), "not a directory").unwrap();
+
+    let error = mule::lease::start(
+        &fake,
+        &host(),
+        &dir.join("w.job"),
+        &dir.join("stopping"),
+        &lease_request(),
+        &|_| panic!("nothing may be dispatched"),
+        &mut std::io::sink(),
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("stop fence"), "{error:#}");
+    assert_eq!(mule::errors::exit_code(&error), 1);
+    assert!(fake.scripts().is_empty(), "no dispatch");
+    assert!(fake.mux_ops().is_empty(), "not even a master check");
+}
+
+#[test]
+fn an_invalid_fence_is_an_error_not_a_guess() {
+    let fence = StopFence::at(scratch().join("stopping/a1b2c3"));
+    std::fs::create_dir_all(fence.path().parent().unwrap()).unwrap();
+    std::fs::write(fence.path(), "garbage").unwrap();
+    let error = fence.generation_unlocked().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("invalid stop fence"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_fenced_child_whose_fence_breaks_runs_no_rm() {
+    // Fail closed: a generation that cannot be checked under the lock is
+    // never treated as a match.
+    let (dir, fake, clock) = (scratch(), Fake::new(), VClock::default());
+    let fence = StopFence::at(dir.join("stopping").join(id().as_str()));
+    std::fs::create_dir_all(fence.path()).unwrap();
+    let policy = policy(&dir, 0);
+
+    let result = remove_with_retry(&fake, &host(), &id(), &policy, &clock, &fence);
+
+    assert!(result.is_err(), "{result:?}");
+    assert!(fake.scripts().is_empty(), "no rm without a checked fence");
 }

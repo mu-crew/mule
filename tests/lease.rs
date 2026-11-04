@@ -151,11 +151,13 @@ fn the_job_file_names_the_job_before_the_dispatch_runs() {
         &t,
         &host(),
         &file,
+        &scratch(),
         &request(),
         &|_| {},
         &mut std::io::sink(),
     )
-    .unwrap();
+    .unwrap()
+    .id;
 
     let seen = t.seen.lock().unwrap().clone();
     assert_eq!(
@@ -186,6 +188,7 @@ fn a_job_file_that_cannot_be_written_dispatches_nothing() {
         &fake,
         &host(),
         &file,
+        &scratch(),
         &request(),
         &|_| panic!("nothing may be dispatched"),
         &mut std::io::sink(),
@@ -207,6 +210,7 @@ fn no_master_at_startup_is_exit_three_with_the_job_named_but_never_dispatched() 
         &fake,
         &host(),
         &file,
+        &scratch(),
         &request(),
         &|_| {},
         &mut std::io::sink(),
