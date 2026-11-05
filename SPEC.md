@@ -103,6 +103,23 @@ The process mu runs as a remote worker's pane: it lives exactly as long as its j
 
 **Cost:** one locked call per tick, 1s settling to 5s, with the capture folded in during the mirror window. Four leases at 5s are 0.8 calls/s, roughly 3-8 % channel occupancy at 30-100ms each, fair through the ticket lock.
 
+### `mule run --lease --attach <id>`
+
+```text
+mule run --lease --attach <id> [--host H] --job-file F [--forward-unix LOCAL:REMOTE ...]
+```
+
+A new carrier for a job that is already running, after its lease's pane died (2026-11-04 aiv-blog: reconcile reaped six lease agents whose jobs ran on, and nothing could put a pane back on them; mu's `agent reattach` runs this). `--attach` requires `--lease` and `--job-file` and conflicts with `--cwd`, `--max-secs`, `--human` and a command. **Attach is not a re-dispatch**: it is the same process as a lease minus step 1 and 2 -- nothing is started, so it stays inside the supervisor carve-out. It lives in `lease.rs` (`attach`, `attach_cli`).
+
+1. **No master**: exit 3 with nothing written.
+2. **Lock the stop fence** for `<id>` (below, [Detached cleanup](#detached-cleanup)), waiting out a stop attempt in flight: after the wait the probe sees what that attempt left.
+3. **Probe once**, state only. Anything but Running (done, orphan, missing) or a probe error exits 1, with the job file untouched and the generation unchanged.
+4. **Publish `F` without replacing anything.** Missing: a temp file (as in step 1 of a lease), then `link(temp, F)`, which fails with EEXIST instead of replacing a file that appeared since the read; the re-read then decides. Naming this id: kept. Another id, empty, invalid or unreadable: exit 1, untouched. `rename` is the wrong primitive here: it replaces whatever won the race, and `F` is mu's only handle to the job.
+5. **Bump the generation and own it**: the bumped number is stored with the id where the signal path reads it, under the same mutex, before the fence is released. An old carrier's stop child that wakes after that locks, sees a generation that is not its own and exits with no `rm`; this carrier's own stop is fenced with the new number and still kills the job. A signal before the id is stored stops nothing (if it lands after the bump, the job runs on and mu keeps its reservation).
+6. **Hold** exactly as a lease does (steps 3-7 above), with the same exit codes. It may wait on the ticket queue and on the fence, so no startup time bound is promised.
+
+**Forward repair needs no new code.** The hold's first `forward` runs cancel, unlink, forward, verify. That repairs a dead carrier's stale listener for an identical spec, a LOCAL unlinked while the master's entry survives, a replaced master, and a changed REMOTE whose record still names the same master (the first three driven through an attach in `tests/local_sshd.rs`; the last is `forward`'s record path). It cannot repair a wedged forwarding table, or a different surviving REMOTE whose record is lost: the hold reports that, keeps holding, and mu's ctl handshake fails.
+
 ### Forwards
 
 `mule forward --unix LOCAL:REMOTE` and `mule unforward` carry control-sized unix sockets over mule's master. OpenSSH's answers cannot be trusted, so each was measured on a loopback `MaxSessions 1` sshd (OpenSSH_10.3p1):

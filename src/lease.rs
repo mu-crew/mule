@@ -12,6 +12,9 @@
 //!    forward verified for the job's life;
 //! 4. it exits when the job ends, and ends the job when told to exit.
 //!
+//! `--attach <id>` is the same process for a job already running, minus 1 and
+//! 2 (see [`attach`]): a new pane for a job whose carrier died.
+//!
 //! It is a per-job foreground waiter, like `run --wait` (SPEC § Leases). It
 //! never re-dispatches, retries, queues or places a job; the only repair it
 //! does is idempotent forward repair. Every ssh it makes is a sub-second
@@ -100,6 +103,22 @@ pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
 /// An existing path is never opened, truncated or followed: a name that is
 /// taken is skipped for another.
 pub fn write_line_file(path: &Path, line: &str) -> Result<()> {
+    // Callers add the context (which file, and what it is for); one layer
+    // here would print the path twice.
+    let (dir, tmp) = write_temp(path, line)?;
+    let renamed = std::fs::rename(&tmp, path)
+        // The rename is only durable once the directory entry is.
+        .and_then(|()| std::fs::File::open(&dir)?.sync_all());
+    if renamed.is_err() {
+        // Ours: created exclusively, so removing it removes nobody else's file.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(renamed?)
+}
+
+/// `line` plus `\n` in a fresh, fsynced, 0600 temp file beside `path`.
+/// Returns the directory and the temp's path; the caller renames or links it.
+fn write_temp(path: &Path, line: &str) -> Result<(PathBuf, PathBuf)> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         _ => PathBuf::from("."),
@@ -107,8 +126,6 @@ pub fn write_line_file(path: &Path, line: &str) -> Result<()> {
     let name = path
         .file_name()
         .with_context(|| format!("{} has no file name", path.display()))?;
-    // Callers add the context (which file, and what it is for); one layer
-    // here would print the path twice.
     let (tmp, mut file) = create_temp(&dir, name)?;
     let written = (|| -> std::io::Result<()> {
         // `mode` applies only at creation and is masked by the umask; the
@@ -116,18 +133,106 @@ pub fn write_line_file(path: &Path, line: &str) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         file.write_all(format!("{line}\n").as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp, path)?;
-        // The rename is only durable once the directory entry is.
-        std::fs::File::open(&dir)?.sync_all()
+        file.sync_all()
     })();
-    if written.is_err() {
-        // Ours: created exclusively above, so removing it removes nobody
-        // else's file.
+    if let Err(error) = written {
         let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
     }
-    Ok(written?)
+    Ok((dir, tmp))
+}
+
+/// What [`publish_job_file`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// There was no job file; this call created it.
+    Written,
+    /// The job file already named this job, and was left alone.
+    Kept,
+}
+
+/// How many times [`publish_job_file`] goes round read, then link. Each lap
+/// means another process created the file and someone removed it again before
+/// the re-read; a bound turns a fight over the path into an error.
+const PUBLISH_ATTEMPTS: u32 = 4;
+
+/// Publish `id` as the job file for an attach, never replacing anything.
+///
+/// The file is mu's handle to the job, and a reattach must not quietly retarget
+/// it (spec 2026-11-04-lease-adopt § mule_attach step 4, review item mule 4):
+///
+/// - missing: write a temp, then `link(temp, path)`, which fails with EEXIST
+///   rather than replace a file that appeared since the read. On EEXIST the
+///   file is read again and that read decides;
+/// - naming this id: kept as it is;
+/// - naming another id, empty, invalid or unreadable: an error, file untouched.
+///
+/// `rename` would be the wrong primitive: it replaces whatever won the race.
+pub fn publish_job_file(path: &Path, id: &JobId) -> Result<Published> {
+    publish_job_file_with(path, id, &mut || {})
+}
+
+/// [`publish_job_file`] with a hook between the read that found no file and
+/// the link, so a test can plant a racing writer exactly there.
+#[doc(hidden)]
+pub fn publish_job_file_with(
+    path: &Path,
+    id: &JobId,
+    before_link: &mut dyn FnMut(),
+) -> Result<Published> {
+    let refuse = |why: String| {
+        anyhow::anyhow!(
+            "job file {} {why}; refusing to attach job {id} over it",
+            path.display()
+        )
+    };
+    for _ in 0..PUBLISH_ATTEMPTS {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let named = text.trim();
+                if named.is_empty() {
+                    return Err(refuse("is empty".to_string()));
+                }
+                return match named.parse::<JobId>() {
+                    Ok(other) if other == *id => Ok(Published::Kept),
+                    Ok(other) => Err(refuse(format!("names another job, {other}"))),
+                    Err(_) => Err(refuse(format!("holds no job id: {named:?}"))),
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot read job file {}; refusing to attach job {id}",
+                        path.display()
+                    )
+                });
+            }
+        }
+        before_link();
+        let (dir, tmp) = write_temp(path, id.as_str())
+            .with_context(|| format!("cannot write job file {}", path.display()))?;
+        let linked = std::fs::hard_link(&tmp, path);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => {
+                std::fs::File::open(&dir)
+                    .and_then(|dir| dir.sync_all())
+                    .with_context(|| format!("cannot write job file {}", path.display()))?;
+                return Ok(Published::Written);
+            }
+            // Somebody else published first: their file decides, on the
+            // next read.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot write job file {}", path.display()));
+            }
+        }
+    }
+    Err(refuse(
+        "keeps appearing and disappearing under another writer".to_string(),
+    ))
 }
 
 /// The stop-failure record beside `job_file`: `<job_file>.<id>.stop-failed`.
@@ -252,6 +357,61 @@ pub fn start(
     );
     on_dispatch(None);
     dispatched.map(|_| owned)
+}
+
+/// Own a job that is already running: `run --lease --attach`, steps 1-5 of
+/// spec 2026-11-04-lease-adopt § mule_attach. [`hold`] is the rest, unchanged.
+///
+/// 1. No master: [`MuleError::NoMaster`] (exit 3), with nothing written.
+/// 2. Take `fence`'s lock, waiting out a stop attempt in flight: an old
+///    carrier's detached `rm` holds it for each whole attempt, so after the
+///    wait the probe sees what that attempt left.
+/// 3. Probe once, state only. Anything but `Running`, or a probe error, is an
+///    error (exit 1) with the job file untouched and the generation unchanged
+///    (taking the lock may create the fence file, empty: generation 0, which
+///    is what a missing one means).
+/// 4. Publish the job file without replacing anything ([`publish_job_file`]).
+/// 5. Bump the fence, hand the new generation to `on_owned` (the CLI stores
+///    it where its signal path reads it), and only then release the lock.
+///
+/// The bump is what retires an old carrier's stop: its child wakes, locks,
+/// sees a generation that is not its own and exits with no `rm`. The bumped
+/// number is this carrier's own, so its signal-path stop is fenced with it
+/// and still kills the job.
+pub fn attach(
+    t: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    job_file: &Path,
+    fence: &StopFence,
+    on_owned: &dyn Fn(&Owned),
+) -> Result<Owned> {
+    crate::errors::require_master(t, host)?;
+    let mut lock = fence.lock()?;
+    // Flattened to text: a probe that fails is exit 1 for an attach whatever
+    // the cause (spec step 3), not the code its error would map to elsewhere.
+    let state = probe(t, host, id, ProbeFrom::StateOnly)
+        .map_err(|error| anyhow::anyhow!("cannot probe job {id}: {error:#}"))?
+        .state;
+    let state = match state {
+        State::Running => None,
+        State::Done(code) => Some(format!("done {code}")),
+        State::Orphan => Some("orphan".to_string()),
+        State::Missing => Some("missing".to_string()),
+    };
+    if let Some(state) = state {
+        anyhow::bail!("job {id} is not running ({state})");
+    }
+    publish_job_file(job_file, id)?;
+    let owned = Owned {
+        id: id.clone(),
+        fence_gen: lock.bump()?,
+    };
+    // Before the lock goes: once it is released an old stop child may run its
+    // next attempt, and it must already find the new generation.
+    on_owned(&owned);
+    drop(lock);
+    Ok(owned)
 }
 
 /// The literal attach command, as `run --tui`'s hints print it. Printed, never
@@ -683,6 +843,14 @@ impl SignalSteps for RealSignalSteps {
     }
 }
 
+/// How a carrier comes to own its job.
+enum Begin<'a> {
+    /// `run --lease`: name and dispatch a new one.
+    Start(&'a Request<'a>),
+    /// `run --lease --attach <id>`: take over one that is running.
+    Attach(&'a JobId),
+}
+
 /// `mule run --lease` as the binary runs it: real ssh, real signals.
 ///
 /// `config` is the effective `--config`, handed to the detached cleanup child.
@@ -692,6 +860,29 @@ pub fn run_cli(
     job_file: &Path,
     specs: Vec<Spec>,
     request: &Request,
+) -> Result<i32> {
+    carrier_cli(host, config, job_file, specs, Begin::Start(request))
+}
+
+/// `mule run --lease --attach <id>`: [`attach`], then the same hold and signal
+/// path as a lease. Not a re-dispatch: nothing is started, `dispatching` stays
+/// false, and the exit codes are the lease's.
+pub fn attach_cli(
+    host: &Host,
+    config: Option<PathBuf>,
+    job_file: &Path,
+    specs: Vec<Spec>,
+    id: &JobId,
+) -> Result<i32> {
+    carrier_cli(host, config, job_file, specs, Begin::Attach(id))
+}
+
+fn carrier_cli(
+    host: &Host,
+    config: Option<PathBuf>,
+    job_file: &Path,
+    specs: Vec<Spec>,
+    begin: Begin,
 ) -> Result<i32> {
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
     let dispatching = Arc::new(AtomicBool::new(false));
@@ -737,28 +928,49 @@ pub fn run_cli(
     }
 
     let mut stderr = std::io::stderr();
-    let started = start(
-        &ssh,
-        host,
-        job_file,
-        &StopFence::dir(),
-        request,
-        &|owned| {
-            if let Some(owned) = owned {
-                // `dispatching` is set under the lock, before the id is
-                // visible: once the signal thread can see an id it also sees
-                // the dispatch as in flight, so its `rm` waits for it rather
-                // than overtaking it (a no-op `rm`, then a leaked job).
+    let started = match begin {
+        Begin::Start(request) => start(
+            &ssh,
+            host,
+            job_file,
+            &StopFence::dir(),
+            request,
+            &|owned| {
+                if let Some(owned) = owned {
+                    // `dispatching` is set under the lock, before the id is
+                    // visible: once the signal thread can see an id it also
+                    // sees the dispatch as in flight, so its `rm` waits for it
+                    // rather than overtaking it (a no-op `rm`, then a leaked
+                    // job).
+                    if let Ok(mut named) = named.lock() {
+                        dispatching.store(true, Ordering::SeqCst);
+                        *named = Some(owned.clone());
+                    }
+                } else {
+                    dispatching.store(false, Ordering::SeqCst);
+                }
+            },
+            &mut stderr,
+        ),
+        // An attach that fails owns nothing (`named` is set only on success),
+        // so the error path below spawns no stop for it.
+        Begin::Attach(id) => attach(
+            &ssh,
+            host,
+            id,
+            job_file,
+            &StopFence::for_job(id),
+            // Under the mutex the signal thread reads. A signal that took it
+            // first holds it to the exit and stops nothing: if that lands
+            // after the bump, the job runs on and mu keeps its reservation
+            // (spec step 5).
+            &|owned| {
                 if let Ok(mut named) = named.lock() {
-                    dispatching.store(true, Ordering::SeqCst);
                     *named = Some(owned.clone());
                 }
-            } else {
-                dispatching.store(false, Ordering::SeqCst);
-            }
-        },
-        &mut stderr,
-    );
+            },
+        ),
+    };
     let id = match started {
         Ok(owned) => owned.id,
         Err(error) => {
@@ -770,7 +982,8 @@ pub fn run_cli(
                 Some(MuleError::NoMaster { .. })
             ) {
                 // The lease's only exit 3. The id in the job file was never
-                // dispatched, so the stop template is a no-op on it.
+                // dispatched, so the stop template is a no-op on it. (An
+                // attach checks the master before touching anything.)
                 let _ = writeln!(stderr, "mule: {error}");
                 return Ok(EXIT_NO_MASTER);
             }

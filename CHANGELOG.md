@@ -14,6 +14,17 @@
   success it removes `F`. `--fence-gen` makes it stand down (exit 0, nothing
   removed or recorded) once the job's local stop fence has moved, i.e. the job
   was reattached. Plain `rm` and `rm --all` are unchanged.
+- `mule run --lease --attach <id> --job-file F [--forward-unix ...]`: a new
+  carrier for a job that is still running after its lease's pane died. In the
+  2026-11-04 aiv-blog incident six lease panes were hung up, mu reaped their
+  agents, and the jobs on the host with a down master ran on with nothing able
+  to put a pane back on them; mu's `agent reattach` runs this. It exits 3 with
+  no master and 1 if the job is not running or `F` names another job (or is
+  empty or unreadable), before holding or changing anything. `F` is written
+  only if missing (`link`, never a replacing rename) and kept if it names the
+  job. It waits out a stop attempt in flight, bumps the job's stop fence so an
+  old carrier's retrying stop stands down, owns the new generation for its own
+  signal stop, then holds exactly like a lease. Nothing is dispatched.
 
 ### Changed
 

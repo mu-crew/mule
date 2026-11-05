@@ -211,6 +211,39 @@ mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
   --forward-unix /tmp/w1.sock:/home/me/.mu/w1.sock -- env K=v sh -c 'pi'
 ```
 
+### Reattaching to a running job
+
+```sh
+mule run --lease --attach <id> [--host H] --job-file F [--forward-unix LOCAL:REMOTE ...]
+```
+
+Puts a new carrier pane on a job whose lease died while the job ran on (a
+`kill -9`, or a hangup whose stop could not reach the host). mu's `agent
+reattach` runs it from the host's `attach` template. Nothing is dispatched:
+it is a lease minus the start.
+
+- **Refuses before holding or changing anything.** Exit 3 with no master.
+  Exit 1 if the job is not running (`mule: job <id> is not running (done 0 |
+  orphan | missing)`) or the probe fails.
+- **`F` is never replaced.** Missing, it is written (0600, atomic, never over
+  a file that appeared meanwhile). Naming `<id>`, it is kept. Naming another
+  job, empty, or unreadable: exit 1, `F` untouched.
+- **An old stop is fenced off.** If the dead lease left a stop retrying (for
+  instance waiting for a master), the attach waits out an attempt in flight,
+  then moves the job's stop fence; that old stop then exits without touching
+  the job, even once its master returns. The attach's own signal stop still
+  works.
+- **Then it holds exactly like a lease**: same pane output, exit codes and
+  signal stop.
+
+The first forward replaces what the dead carrier left: a stale listener for
+the same spec, a LOCAL file that was deleted while the master still holds the
+forward, or forwards lost with a replaced master. It cannot repair a wedged
+forwarding table (only `ssh -O exit` and a new master do), nor a surviving
+forward to a different REMOTE whose record is gone. Then the pane prints the
+error and keeps holding, and whatever connects to LOCAL (mu's ctl handshake)
+fails; restart the master and attach again.
+
 ## Running a command and waiting: `exec`
 
 ```sh

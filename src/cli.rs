@@ -196,6 +196,21 @@ pub enum Commands {
         /// With --lease: file the job id is written to before dispatch
         #[arg(long, value_name = "F", requires = "lease")]
         job_file: Option<std::path::PathBuf>,
+        /// With --lease: hold a job that is already running instead of starting one
+        ///
+        /// For a new carrier pane after the old one died (mu's `agent
+        /// reattach`). Exits 3 with no master, 1 if the job is not running or
+        /// --job-file names another job, before holding or changing anything.
+        /// The job file is written only if missing, never replaced. Then it
+        /// holds exactly like a lease, and a signal stops the job. A stop an
+        /// old carrier left retrying is fenced off and stops nothing.
+        #[arg(
+            long,
+            value_name = "ID",
+            requires_all = ["lease", "job_file"],
+            conflicts_with_all = ["cwd", "max_secs", "human", "cmd"]
+        )]
+        attach: Option<crate::wrapper::JobId>,
         /// With --lease: LOCAL:REMOTE unix sockets to forward; repeatable
         #[arg(long, value_name = "LOCAL:REMOTE", requires = "lease")]
         forward_unix: Vec<String>,
@@ -225,7 +240,7 @@ pub enum Commands {
         /// `set -o pipefail` keeps a genuine pipeline honest; it is not
         /// portable POSIX, so mule does not add it for you -- the command is
         /// yours.
-        #[arg(trailing_var_arg = true, required = true)]
+        #[arg(trailing_var_arg = true, required_unless_present = "attach")]
         cmd: Vec<String>,
     },
     /// Print state, but no job output; prints nothing from the job; use mule tail <id>
@@ -819,6 +834,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             tui,
             lease,
             job_file,
+            attach,
             forward_unix,
             wait,
             no_tail,
@@ -827,6 +843,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             let host = cfg.host(host.host.as_deref())?;
             if lease {
                 let specs = crate::forward::Spec::parse_all(&forward_unix)?;
+                let job_file = job_file
+                    .as_deref()
+                    .expect("clap requires --job-file with --lease");
+                if let Some(id) = attach {
+                    return crate::lease::attach_cli(
+                        host,
+                        cli.config.clone(),
+                        job_file,
+                        specs,
+                        &id,
+                    );
+                }
                 let command = command_from_args(&cmd);
                 let workstream = (!human)
                     .then(|| std::env::var("MU_WORKSTREAM").ok())
@@ -840,9 +868,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 return crate::lease::run_cli(
                     host,
                     cli.config.clone(),
-                    job_file
-                        .as_deref()
-                        .expect("clap requires --job-file with --lease"),
+                    job_file,
                     specs,
                     &crate::lease::Request {
                         cmd: &command,
@@ -1555,6 +1581,47 @@ mod tests {
         assert!(
             !ok(&["mule", "run", "--forward-unix", "/l:/r", "pi"]),
             "only with --lease"
+        );
+    }
+
+    #[test]
+    fn attach_needs_a_lease_and_a_job_file_and_takes_no_command() {
+        let ok = |args: &[&str]| Cli::try_parse_from(args).is_ok();
+        let lease = ["mule", "run", "--lease", "--job-file", "/f"];
+        let with = |extra: &[&'static str]| {
+            let mut args = lease.to_vec();
+            args.extend_from_slice(extra);
+            args
+        };
+        assert!(ok(&with(&["--attach", "abc123"])));
+        assert!(ok(&with(&[
+            "--attach",
+            "abc123",
+            "--forward-unix",
+            "/l:/r"
+        ])));
+        assert!(!ok(&with(&[])), "a lease without --attach needs a command");
+        assert!(
+            !ok(&["mule", "run", "--job-file", "/f", "--attach", "abc123"]),
+            "no --lease"
+        );
+        assert!(
+            !ok(&["mule", "run", "--lease", "--attach", "abc123"]),
+            "no --job-file"
+        );
+        assert!(!ok(&with(&["--attach", "abc123", "pi"])), "a command given");
+        assert!(
+            !ok(&with(&["--attach", "abc123", "--", "pi"])),
+            "a command given after --"
+        );
+        for flag in [&["--cwd", "/w"][..], &["--max-secs", "9"], &["--human"]] {
+            let mut args = with(&["--attach", "abc123"]);
+            args.extend_from_slice(flag);
+            assert!(!ok(&args), "{flag:?} belongs to the dispatch attach skips");
+        }
+        assert!(
+            !ok(&with(&["--attach", "not/an id"])),
+            "a job id is validated"
         );
     }
 
