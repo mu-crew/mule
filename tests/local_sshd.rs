@@ -2472,20 +2472,38 @@ impl Lease {
         cmd: &[&str],
         env: &[(&str, &str)],
     ) -> Self {
+        let mut args = vec!["--human", "--"];
+        args.extend(cmd);
+        Self::spawn(sshd, config, tag, specs, &args, env)
+    }
+
+    /// `run --lease --attach <id>`: a new carrier for a running job, with
+    /// `<tag>.job` as its job file.
+    fn attach(
+        sshd: &Sshd,
+        config: &std::path::Path,
+        tag: &str,
+        id: &str,
+        specs: &[String],
+    ) -> Self {
+        Self::spawn(sshd, config, tag, specs, &["--attach", id], &[])
+    }
+
+    fn spawn(
+        sshd: &Sshd,
+        config: &std::path::Path,
+        tag: &str,
+        specs: &[String],
+        tail: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
         let job_file = sshd.dir.join(format!("{tag}.job"));
         let out = sshd.dir.join(format!("{tag}.out"));
-        let mut args = vec![
-            "run",
-            "--lease",
-            "--human",
-            "--job-file",
-            job_file.to_str().unwrap(),
-        ];
+        let mut args = vec!["run", "--lease", "--job-file", job_file.to_str().unwrap()];
         for spec in specs {
             args.extend(["--forward-unix", spec.as_str()]);
         }
-        args.push("--");
-        args.extend(cmd);
+        args.extend(tail);
         let mut command = mule_command(sshd, config, &args, &[]);
         command.envs(env.iter().copied());
         command.stdout(std::fs::File::create(&out).unwrap());
@@ -3380,4 +3398,229 @@ fn a_master_back_within_the_bound_lets_the_signal_stop_finish_with_no_record() {
     wait_until("the fence to go", Duration::from_secs(5), || {
         !fence.exists()
     });
+}
+
+// -- mule run --lease --attach (2026-11-04 aiv-blog; spec lease-adopt) ----------
+
+/// What a dead carrier left of a forward before the attach.
+enum Damage {
+    /// Nothing more: LOCAL's listener and its record are intact.
+    None,
+    /// LOCAL unlinked; the master still has the forward entry.
+    UnlinkLocal,
+    /// The master replaced: every old forward entry gone, the record naming a
+    /// dead pid.
+    ReplaceMaster,
+}
+
+/// A SIGKILLed lease (no stop runs: the job keeps going), then `damage`, then
+/// `run --lease --attach` with a new job file. The attach must make the
+/// forward carry real traffic to the job's socket, not merely accept a
+/// `connect`, and its TERM must stop the job with its own generation.
+fn attach_after_a_killed_lease(tag: &str, damage: Damage) {
+    let sshd = Sshd::start();
+    let mut master = Some(sshd.open_master_with(&sshd.socket, &MASTER_OPTS));
+    let tmux = Tmux::new(&sshd, tag);
+    let config = sshd.write_config(&tmux.name);
+    let (local, remote) = (sshd.dir.join("l.sock"), sshd.dir.join("r.sock"));
+    let _serve = Serve::start(remote.clone(), "from-the-job");
+    let spec = unix_spec(&local, &remote);
+
+    let mut dead = Lease::start(
+        &sshd,
+        &config,
+        "dead",
+        std::slice::from_ref(&spec),
+        &["sleep 120"],
+    );
+    let id = dead.id();
+    wait_forwarded(&sshd, &local);
+    dead.child.kill().unwrap();
+    dead.child.wait().unwrap();
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+    assert_eq!(records(&sshd), 1, "the dead carrier's record is left");
+    match damage {
+        Damage::None => {}
+        Damage::UnlinkLocal => std::fs::remove_file(&local).unwrap(),
+        Damage::ReplaceMaster => {
+            drop(master.take());
+            master = Some(sshd.open_master_with(&sshd.socket, &MASTER_OPTS));
+            assert_eq!(
+                through_once(&local),
+                "",
+                "the old forward went with its master"
+            );
+        }
+    }
+
+    let mut attached = Lease::attach(&sshd, &config, "new", &id, std::slice::from_ref(&spec));
+    assert_eq!(attached.id(), id, "the new job file names the attached job");
+    wait_until("the attach's first probe", Duration::from_secs(30), || {
+        attached
+            .output()
+            .contains(&format!("mule lease {id} on live: running"))
+    });
+    assert_eq!(through(&local), "from-the-job");
+    assert_eq!(records(&sshd), 1);
+    let fence = sshd.state_root.join("mule/stopping").join(&id);
+    assert_eq!(std::fs::read_to_string(&fence).unwrap(), "1", "bumped once");
+    assert!(attached.alive());
+    assert_eq!(job_ids(&sshd), vec![id.clone()], "nothing was dispatched");
+
+    signal(&attached.child, "TERM");
+    let (code, stderr) = attached.exit();
+    assert_eq!(code, Some(143), "{stderr}");
+    wait_until(
+        "the attached job to be stopped",
+        Duration::from_secs(15),
+        || !job_state_dir(&sshd, &id).exists() && !sessions(&sshd, &tmux.name).contains("mule-"),
+    );
+    assert!(!local.exists(), "the forward is cancelled");
+    drop(master);
+}
+
+#[test]
+fn attach_after_a_killed_lease_carries_traffic_and_its_term_stops_the_job() {
+    require_sshd!();
+    attach_after_a_killed_lease("attach-intact", Damage::None);
+}
+
+#[test]
+fn attach_repairs_an_unlinked_local_whose_forward_entry_survives() {
+    require_sshd!();
+    attach_after_a_killed_lease("attach-unlinked", Damage::UnlinkLocal);
+}
+
+#[test]
+fn attach_re_forwards_over_a_replaced_master() {
+    require_sshd!();
+    attach_after_a_killed_lease("attach-remaster", Damage::ReplaceMaster);
+}
+
+#[test]
+fn attach_refuses_a_job_that_is_not_running_and_one_whose_job_file_names_another() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "attach-refuse");
+    let config = sshd.write_config(&tmux.name);
+    let job_file = sshd.dir.join("refuse.job");
+    let fence_dir = sshd.state_root.join("mule/stopping");
+    let attach = |id: &str| {
+        sshd.mule(
+            &config,
+            &[
+                "run",
+                "--lease",
+                "--attach",
+                id,
+                "--job-file",
+                job_file.to_str().unwrap(),
+            ],
+        )
+    };
+
+    // No master: exit 3 with nothing written.
+    let out = attach("abc123");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ssh -MNf"));
+    assert!(!job_file.exists());
+
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    let out = attach("abc123");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("job abc123 is not running (missing)"),
+        "{stderr}"
+    );
+    assert!(!job_file.exists());
+    assert_eq!(
+        std::fs::read_to_string(fence_dir.join("abc123")).unwrap_or_default(),
+        ""
+    );
+
+    let id = stdout(&sshd.mule(&config, &["run", "--tui", "--human", "sleep 60"]));
+    std::fs::write(&job_file, "ffff00\n").unwrap();
+    let out = attach(&id);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("names another job, ffff00"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&job_file).unwrap(), "ffff00\n");
+    assert_eq!(
+        std::fs::read_to_string(fence_dir.join(&id)).unwrap_or_default(),
+        ""
+    );
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+    let _ = sshd.mule(&config, &["rm", &id]);
+}
+
+/// Detached `rm --retry-for` children for `id`, by their argv.
+fn stop_children(id: &str) -> usize {
+    let out = std::process::Command::new("ps")
+        .args(["-ax", "-o", "args="])
+        .output()
+        .unwrap();
+    let needle = format!("rm --host live {id} --retry-for");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.contains(&needle))
+        .count()
+}
+
+#[test]
+fn an_old_stop_child_waiting_on_a_down_master_stands_down_for_an_attach() {
+    // The aiv-blog shape: a carrier TERMed while its master was down leaves a
+    // stop child polling for that master. An attach (here over a second
+    // master, so it can run while the first is still down) bumps the fence;
+    // once the first master returns, the old child wakes, sees a generation
+    // that is not its own, and exits without an `rm`.
+    require_sshd!();
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "attach-fence");
+    let config = sshd.write_config(&tmux.name);
+    let (id, record) = lease_termed_on_a_down_master(&sshd, &config, "old", "120");
+    wait_until("the old stop child", Duration::from_secs(10), || {
+        stop_children(&id) == 1
+    });
+
+    let other_socket = sshd.dir.join("other.sock");
+    let other_config = sshd.dir.join("other.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let text = text.replace(
+        &sshd.socket.display().to_string(),
+        &other_socket.display().to_string(),
+    );
+    std::fs::write(&other_config, text).unwrap();
+    let _other = sshd.open_master_with(&other_socket, &MASTER_OPTS);
+    let mut attached = Lease::attach(&sshd, &other_config, "new", &id, &[]);
+    wait_until("the attach's first probe", Duration::from_secs(30), || {
+        attached
+            .output()
+            .contains(&format!("mule lease {id} on live: running"))
+    });
+    let fence = sshd.state_root.join("mule/stopping").join(&id);
+    assert_eq!(std::fs::read_to_string(&fence).unwrap(), "1");
+
+    let _master = sshd.open_master_with(&sshd.socket, &MASTER_OPTS);
+    wait_until(
+        "the old stop child to stand down",
+        Duration::from_secs(30),
+        || stop_children(&id) == 0,
+    );
+    assert_eq!(stdout(&sshd.mule(&config, &["poll", &id])), "running");
+    assert!(!record.exists(), "a reattached job is not recorded as lost");
+    assert!(attached.alive());
+
+    signal(&attached.child, "TERM");
+    assert_eq!(attached.exit().0, Some(143));
+    wait_until(
+        "the attached job to be stopped",
+        Duration::from_secs(15),
+        || !job_state_dir(&sshd, &id).exists(),
+    );
 }
