@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::config::Host;
+use crate::errors::MuleError;
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
 
@@ -85,11 +86,43 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     // job ending `exit 7` read as exit 5; `rc` held 7 a moment later), since
     // a loaded tmux client widens the gap. `list_script` reads the live set
     // first for the same reason.
+    // Absence is *seen*, not inferred, exactly as `rm <id>` proves it
+    // ([`crate::jobs::remove_one_script`]): `[ -d ]` is false behind an
+    // unsearchable parent, and `has-session` exits 1 for a tmux protocol
+    // mismatch or an unsafe socket directory as it does for a missing
+    // session. Each answer that rests on an absence -- `missing`, `orphan` --
+    // is therefore checked a second way, and a check that cannot tell prints
+    // `?` and a `why=` line. The second look costs a process only on those
+    // paths: a running job passes `has-session`, a finished one has `rc`.
+    // `missing` also needs `watch-<id>` gone, as `rm`'s proof does: a live
+    // watchdog means the job's state is not all gone.
     let script = format!(
-        "d={dir}; [ -d $d ] && exists=1 || exists=0; printf 'exists=%s\\n' \"$exists\"; \
-         alive=$(tmux -L {} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
+        "d={dir}; why=; watch=0; \
+         if [ -d $d ]; then exists=1; else \
+           e=$(LC_ALL=C ls -d \"$d\" 2>&1); \
+           case $?:$e in \
+             0:*) exists='?'; why=\"state path $d is not a directory\";; \
+             *'No such file or directory'*) exists=0;; \
+             *) exists='?'; why=\"cannot verify state dir $d: $e\";; \
+           esac; \
+         fi; printf 'exists=%s\\n' \"$exists\"; \
+         alive=$(tmux -L {socket} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
          rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
-         printf 'alive=%s\\n' \"$alive\"; \
+         if [ \"$alive\" = 0 ] && [ -z \"$rc\" ]; then \
+           out=$(tmux -L {socket} list-sessions -F '#{{session_name}}' 2>&1); \
+           if [ $? -eq 0 ]; then \
+             if printf '%s\\n' \"$out\" | grep -Fxq mule-{id}; then \
+               alive='?'; why=\"has-session and list-sessions disagree about mule-{id}\"; fi; \
+             if printf '%s\\n' \"$out\" | grep -Fxq watch-{id}; then watch=1; fi; \
+           else \
+             case \"$out\" in \
+               {no_server}) ;; \
+               *) alive='?'; why=\"cannot verify session state: $out\";; \
+             esac; \
+           fi; \
+         fi; \
+         printf 'alive=%s\\n' \"$alive\"; printf 'watch=%s\\n' \"$watch\"; \
+         printf 'why=%s\\n' \"$(printf %s \"$why\" | tr '\\n' ' ')\"; \
          cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
          if [ -n \"$rc\" ]; then end_mtime=$(stat -c %Y $d/rc 2>/dev/null || stat -f %m $d/rc 2>/dev/null); \
          elif [ \"$alive\" = 1 ]; then end_mtime=$(date +%s); else end_mtime=; fi; \
@@ -97,9 +130,10 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
            [ \"$runtime\" -lt 0 ] && runtime=0; else runtime=; fi; \
          printf 'runtime=%s\\n' \"$runtime\"; \
          printf 'size=%s\\n' \"$(wc -c < $d/log 2>/dev/null || echo 0)\"; \
-         printf 'bytes:\\n'; {}",
-        host.tmux_socket,
-        from.bytes_command(&host.tmux_socket, id)
+         printf 'bytes:\\n'; {bytes}",
+        socket = host.tmux_socket,
+        no_server = crate::jobs::NO_TMUX_SERVER,
+        bytes = from.bytes_command(&host.tmux_socket, id)
     );
     let mut output = t.run(host, &script)?;
     if output.code != 0 {
@@ -118,17 +152,23 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let mut exists = None;
     let mut rc = None;
     let mut alive = None;
+    let mut watch = false;
+    let mut why = String::new();
     let mut runtime_secs = None;
     let mut log_size = None;
     for line in output.text().lines() {
         if let Some(value) = line.strip_prefix("exists=") {
-            exists = Some(value == "1");
+            exists = Some(Seen::parse(value));
         } else if let Some(value) = line.strip_prefix("rc=") {
             if !value.is_empty() {
                 rc = Some(value.parse::<i32>().context("invalid rc in probe reply")?);
             }
         } else if let Some(value) = line.strip_prefix("alive=") {
-            alive = Some(value == "1");
+            alive = Some(Seen::parse(value));
+        } else if let Some(value) = line.strip_prefix("watch=") {
+            watch = value == "1";
+        } else if let Some(value) = line.strip_prefix("why=") {
+            why = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("runtime=") {
             if !value.is_empty() {
                 runtime_secs = Some(value.parse().context("invalid runtime in probe reply")?);
@@ -143,12 +183,35 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         }
     }
 
-    let alive_now = alive.unwrap_or(false);
-    let state = match (exists.context("invalid probe reply: missing exists")?, rc) {
-        (false, _) => State::Missing,
-        (true, Some(code)) => State::Done(code),
-        (true, None) if alive.context("invalid probe reply: missing alive")? => State::Running,
-        (true, None) => State::Orphan,
+    let exists = exists.context("invalid probe reply: missing exists")?;
+    let unverifiable = |fallback: &str| -> anyhow::Error {
+        let why = if why.is_empty() { fallback } else { &why };
+        MuleError::Unverifiable {
+            id: id.to_string(),
+            why: why.to_string(),
+        }
+        .into()
+    };
+    // A job with `rc` is `Done` whatever its session looks like; only it can
+    // leave `alive` unknown, and then the session is assumed to live on, so
+    // `exec` waits out the drain rather than read a log still being written.
+    let alive_now = matches!(alive, Some(Seen::Yes | Seen::Unknown));
+    let state = match (exists, rc) {
+        (Seen::Unknown, _) => return Err(unverifiable("the state dir could not be checked")),
+        (Seen::No, _) => {
+            if alive != Some(Seen::No) || watch {
+                return Err(unverifiable(
+                    "the state dir is gone but a session for the job is not proven gone",
+                ));
+            }
+            State::Missing
+        }
+        (Seen::Yes, Some(code)) => State::Done(code),
+        (Seen::Yes, None) => match alive.context("invalid probe reply: missing alive")? {
+            Seen::Yes => State::Running,
+            Seen::No => State::Orphan,
+            Seen::Unknown => return Err(unverifiable("the session could not be checked")),
+        },
     };
     Ok(Probe {
         state,
@@ -157,6 +220,26 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         log_size: log_size.context("invalid probe reply: missing size")?,
         bytes,
     })
+}
+
+/// One fact as the probe script saw it: `1`, `0`, or `?` for "could not
+/// tell". Anything unexpected is `?`: a reply that says neither cannot prove
+/// either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Seen {
+    fn parse(value: &str) -> Self {
+        match value {
+            "1" => Self::Yes,
+            "0" => Self::No,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 pub fn next_interval(current: Duration, new_bytes: bool) -> Duration {

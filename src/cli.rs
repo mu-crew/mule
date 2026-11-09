@@ -53,14 +53,28 @@ struct JobJson<'a> {
     age_secs: u64,
     runtime_secs: Option<u64>,
     cmd: &'a str,
+    /// The caller key (`run --key`). Absent, not null, for a job dispatched
+    /// without one, so an unkeyed row is byte-identical to what it was before
+    /// keys existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<&'a str>,
 }
 
+/// `poll --json`: one of five states, always exit 0 (no master is still 3).
+///
+/// `missing` is proven the way `rm` proves a stop (no state dir, no session);
+/// `unknown` is everything that could not be proven, with `reason`. A caller
+/// that must never mistake "cannot tell" for "gone" -- mu reconciling a job
+/// after a crash -- gets each as an answer to switch on, instead of exit 1,
+/// which also meant a refused session or a dropped probe.
 #[derive(Serialize)]
 struct PollJson {
     state: &'static str,
     rc: Option<i32>,
     runtime_secs: Option<u64>,
-    log_size: u64,
+    log_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -116,7 +130,8 @@ Operational facts:
     shapes the output for you: `mule tail <id> -n 3` instead of `| tail -3`.
 
 Exit status:
-  0   mule operation or job succeeded
+  0   mule operation or job succeeded; poll --json answers every job state,
+      unknown and missing included, with 0
   3   no ssh control master
   4   timed out waiting
   5   orphaned job (run --lease too)
@@ -211,6 +226,18 @@ pub enum Commands {
             conflicts_with_all = ["cwd", "max_secs", "human", "cmd"]
         )]
         attach: Option<crate::wrapper::JobId>,
+        /// Idempotency key: if a job with key K exists, print its id and start nothing
+        ///
+        /// For a caller that must survive its own crash without starting a
+        /// job twice. K is stored as the job's `key` file and listed by
+        /// `ls --json` (`--key-prefix` finds it); the id is still generated.
+        /// The check and the start are one locked round trip. A job keeps its
+        /// key until `rm`, at any state: a finished job's key returns that
+        /// job, not a new one. With --lease, a job found by its key is held
+        /// as `--attach` would hold it, whatever its state, and --job-file
+        /// names it. K is 1-128 characters of A-Z a-z 0-9 . _ -.
+        #[arg(long, value_name = "K", conflicts_with = "attach")]
+        key: Option<crate::key::JobKey>,
         /// With --lease: LOCAL:REMOTE unix sockets to forward; repeatable
         #[arg(long, value_name = "LOCAL:REMOTE", requires = "lease")]
         forward_unix: Vec<String>,
@@ -252,6 +279,10 @@ pub enum Commands {
         id: crate::wrapper::JobId,
         #[command(flatten)]
         host: HostArg,
+        /// One JSON object, exit 0 for every state: running, done, orphan,
+        /// missing (no state and no session, proven) or unknown (with a
+        /// reason: mule could not tell; never read it as gone). Exit 3 is
+        /// still no master.
         #[arg(long)]
         json: bool,
     },
@@ -319,6 +350,14 @@ pub enum Commands {
         /// scanning; `--json` remains the machine surface.
         #[arg(long, conflicts_with = "json")]
         full: bool,
+        /// Only jobs whose key (`run --key`) starts with P, at any age
+        ///
+        /// For a caller looking up the jobs it started: the 24-hour window
+        /// does not apply, because a lookup that missed an old finished job
+        /// would start it again. A host listed under `unreachable` was not
+        /// searched, so "not found" there means "cannot tell".
+        #[arg(long, value_name = "P")]
+        key_prefix: Option<crate::key::KeyPrefix>,
     },
     /// Kill a running job
     Kill {
@@ -395,6 +434,17 @@ pub enum Commands {
         /// Kill the remote command after S seconds (0 means unbounded); exits 124
         #[arg(long, value_name = "S")]
         max_secs: Option<u64>,
+        /// On a signal, stop the job from this process, never a detached child
+        ///
+        /// For a caller that cancels by signalling exec's process group and
+        /// then kills the group after a grace: everything mule starts stays in
+        /// that group, so nothing outlives the kill. One `rm` attempt runs
+        /// in-process before the exit; it can outlast the caller's grace (it
+        /// queues on the ticket lock), so a killed exec leaves the job's fate
+        /// unknown, and the caller must treat it so. Without this flag the
+        /// stop is a detached, retrying `rm` that survives the group.
+        #[arg(long)]
+        no_detach: bool,
         /// The command: one shell string, or an argv (quoted for you)
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
@@ -755,22 +805,19 @@ fn poll_with_hint(
     // session channel and the ticket lock. That is invariant 3 violated by the
     // cheapest verb in the tool.
     crate::errors::require_master(t, host)?;
-    let result = probe(t, host, id, crate::probe::From::StateOnly)?;
+    let probed = probe(t, host, id, crate::probe::From::StateOnly);
+    if json {
+        return poll_json_verdict(id, probed, quiet);
+    }
+    let result = probed?;
     if result.state == State::Missing {
         return Err(crate::errors::MuleError::MissingJob { id: id.to_string() }.into());
     }
-    if json {
-        println!(
-            "{}",
-            poll_json(&result.state, result.runtime_secs, result.log_size)
-        );
-    } else {
-        match result.state {
-            State::Running => println!("running"),
-            State::Done(code) => println!("{code}"),
-            State::Orphan => println!("orphan"),
-            State::Missing => unreachable!("missing jobs return before output"),
-        }
+    match result.state {
+        State::Running => println!("running"),
+        State::Done(code) => println!("{code}"),
+        State::Orphan => println!("orphan"),
+        State::Missing => unreachable!("missing jobs return before output"),
     }
     if !quiet {
         match result.state {
@@ -796,20 +843,70 @@ fn poll_with_hint(
     Ok(0)
 }
 
+/// `poll --json`'s answer for one probe: one of five states, exit 0.
+///
+/// Every probe failure is `unknown`, not just the unverifiable checks: a
+/// refused session, a dropped ssh or a malformed reply all leave the job's
+/// state unproven, and a caller reconciling after a crash must not read any
+/// of them as `missing`. The one exception, exit 3, is taken before the probe.
+fn poll_json_verdict(
+    id: &crate::wrapper::JobId,
+    probed: Result<crate::probe::Probe>,
+    quiet: bool,
+) -> Result<i32> {
+    let json = match &probed {
+        Ok(result) => poll_json(&result.state, result.runtime_secs, result.log_size),
+        Err(error) => poll_json_unknown(&format!("{error:#}")),
+    };
+    println!("{json}");
+    if !quiet {
+        match &probed {
+            Ok(result) if result.state == State::Missing => {
+                eprintln!("job {id} not found: no state dir and no session")
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("mule: {error:#}"),
+        }
+    }
+    Ok(0)
+}
+
 fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String {
     let (state, rc) = match state {
         State::Running => ("running", None),
         State::Done(code) => ("done", Some(*code)),
         State::Orphan => ("orphan", None),
-        State::Missing => ("missing", None),
+        // Nothing to measure: no log, no runtime.
+        State::Missing => {
+            return serde_json::to_string(&PollJson {
+                state: "missing",
+                rc: None,
+                runtime_secs: None,
+                log_size: None,
+                reason: None,
+            })
+            .expect("poll json is numbers and static strings");
+        }
     };
     serde_json::to_string(&PollJson {
         state,
         rc,
         runtime_secs,
-        log_size,
+        log_size: Some(log_size),
+        reason: None,
     })
     .expect("poll json is numbers and static strings")
+}
+
+fn poll_json_unknown(reason: &str) -> String {
+    serde_json::to_string(&PollJson {
+        state: "unknown",
+        rc: None,
+        runtime_secs: None,
+        log_size: None,
+        reason: Some(reason.to_string()),
+    })
+    .expect("poll json is numbers and strings")
 }
 
 pub fn wait(
@@ -835,6 +932,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             lease,
             job_file,
             attach,
+            key,
             forward_unix,
             wait,
             no_tail,
@@ -865,7 +963,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 } else {
                     crate::wrapper::JobMetadata::Managed { workstream }
                 };
-                return crate::lease::run_cli(
+                return crate::lease::run_cli_keyed(
                     host,
                     cli.config.clone(),
                     job_file,
@@ -876,6 +974,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         max_secs,
                         metadata,
                     },
+                    key.as_ref(),
                 );
             }
             // `--` is the caller saying "everything after this is the
@@ -902,18 +1001,44 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             } else {
                 crate::wrapper::JobMode::Pipe
             };
-            match crate::run::dispatch(
-                &Ssh,
-                host,
-                &command,
-                cwd.as_deref(),
-                max_secs,
-                metadata,
-                mode,
-            ) {
-                Ok(id) => {
+            let dispatched = match &key {
+                None => crate::run::dispatch(
+                    &Ssh,
+                    host,
+                    &command,
+                    cwd.as_deref(),
+                    max_secs,
+                    metadata,
+                    mode,
+                )
+                .map(crate::run::Dispatched::New),
+                Some(key) => crate::run::dispatch_keyed(
+                    &Ssh,
+                    host,
+                    crate::wrapper::new_id()
+                        .parse()
+                        .expect("generated ids are valid"),
+                    Some(key),
+                    &command,
+                    cwd.as_deref(),
+                    max_secs,
+                    metadata,
+                    mode,
+                    &mut std::io::stderr(),
+                ),
+            };
+            match dispatched {
+                Ok(dispatched) => {
+                    let existing = matches!(dispatched, crate::run::Dispatched::Existing(_));
+                    let id = dispatched.into_id();
                     println!("{id}");
                     std::io::stdout().flush()?;
+                    // Not gated on `quiet`: the caller asked for a start and
+                    // got an old job, which is a fact about the answer, not a
+                    // hint.
+                    if existing && let Some(key) = &key {
+                        eprintln!("mule: key {key} already names job {id}; nothing was dispatched");
+                    }
                     // Warn AFTER dispatch, so the advice can name the job it
                     // is about. Warning first meant printing a literal
                     // `mule tail <id>` at the one moment a real id did not
@@ -973,17 +1098,23 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             host,
             cwd,
             max_secs,
+            no_detach,
             cmd,
         } => {
             let host = cfg.host(host.host.as_deref())?;
             let command = command_from_args(&cmd);
-            crate::exec::run_cli(
+            crate::exec::run_cli_with(
                 host,
                 cli.config.clone(),
                 &crate::exec::Request {
                     cmd: &command,
                     cwd: cwd.as_deref(),
                     max_secs,
+                },
+                if no_detach {
+                    crate::exec::Cancel::InProcess
+                } else {
+                    crate::exec::Cancel::Detach
                 },
             )
         }
@@ -1071,11 +1202,22 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             running,
             json,
             full,
+            key_prefix,
         } => {
-            let (mut rows, unreachable, hidden) =
-                crate::jobs::list_with_hidden(&cfg, &Ssh, host.host.as_deref(), all)?;
+            // A key lookup ignores the 24-hour window: missing an old
+            // finished job would make its caller start the effect again.
+            let (mut rows, unreachable, mut hidden) = crate::jobs::list_with_hidden(
+                &cfg,
+                &Ssh,
+                host.host.as_deref(),
+                all || key_prefix.is_some(),
+            )?;
             if running {
                 rows.retain(|row| matches!(row.state, State::Running));
+            }
+            if let Some(prefix) = &key_prefix {
+                rows.retain(|row| prefix.matches(row.key.as_deref()));
+                hidden = 0;
             }
             print_jobs(
                 &rows,
@@ -1283,6 +1425,7 @@ fn print_jobs(
                     age_secs: row.age_secs,
                     runtime_secs: row.runtime_secs,
                     cmd: &row.cmd,
+                    key: row.key.as_deref(),
                 }
             })
             .collect();

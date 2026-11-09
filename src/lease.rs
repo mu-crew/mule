@@ -38,7 +38,9 @@ use crate::cleanup::{self, Signals};
 use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_ORPHAN, MuleError};
 use crate::forward::{self, Spec};
+use crate::key::JobKey;
 use crate::probe::{From as ProbeFrom, State, probe};
+use crate::run::Dispatched;
 use crate::stopfence::StopFence;
 use crate::transport::{InFlight, Ssh, Stopper, Transport};
 use crate::wrapper::{JobId, JobMetadata, JobMode, new_id};
@@ -335,6 +337,65 @@ pub fn start(
     on_dispatch: &dyn Fn(Option<&Owned>),
     warnings: &mut dyn Write,
 ) -> Result<Owned> {
+    start_keyed(
+        t,
+        host,
+        job_file,
+        fences,
+        request,
+        None,
+        on_dispatch,
+        warnings,
+    )
+}
+
+/// [`start`] with a caller key (`run --lease --key K`): a job that already
+/// holds `key` is held instead of a new one started.
+///
+/// The job file must name the job before any dispatch, so the key is looked
+/// up first, in its own locked round trip:
+///
+/// - **found:** that job is owned as [`attach`] owns one -- the fence lock, a
+///   probe, the job file published without replacing anything, the fence
+///   bumped -- except that any state is accepted. A finished job is the
+///   answer to "start the effect with key K": the hold then reports its end
+///   (final screen, its code) as it would have for the first carrier.
+///   `on_dispatch` is called with the owned job and then `None` inside the
+///   fence lock, bracketing no dispatch: it only names the job for the
+///   signal path, before an old carrier's stop can run again.
+/// - **not found:** exactly [`start`], with the dispatch re-checking the key
+///   in its own round trip. If the key appeared in between (another client
+///   started it), nothing is dispatched and this is an error: the job file
+///   already names this lease's fresh id, and retargeting a handle mu may
+///   have read is worse than failing. That id was never dispatched, so its
+///   stop is a no-op, and a lookup by key finds the job that won.
+#[allow(clippy::too_many_arguments)] // `start`'s seam, plus the key.
+pub fn start_keyed(
+    t: &dyn Transport,
+    host: &Host,
+    job_file: &Path,
+    fences: &Path,
+    request: &Request,
+    key: Option<&JobKey>,
+    on_dispatch: &dyn Fn(Option<&Owned>),
+    warnings: &mut dyn Write,
+) -> Result<Owned> {
+    if let Some(key) = key
+        && let Some(existing) = crate::run::lookup(t, host, key)?
+    {
+        return own_existing(
+            t,
+            host,
+            &existing,
+            job_file,
+            &StopFence::in_dir(fences, &existing),
+            &|owned| {
+                on_dispatch(Some(owned));
+                on_dispatch(None);
+            },
+            Require::AnyState,
+        );
+    }
     let id: JobId = new_id().parse().expect("generated ids are valid");
     // Almost always missing (0) for a fresh id; read anyway, since a reused
     // id's leftover fence is exactly what the number must match.
@@ -344,10 +405,11 @@ pub fn start(
     write_job_file(job_file, &id)?;
     let owned = Owned { id, fence_gen };
     on_dispatch(Some(&owned));
-    let dispatched = crate::run::dispatch_with_id(
+    let dispatched = crate::run::dispatch_keyed(
         t,
         host,
         owned.id.clone(),
+        key,
         request.cmd,
         request.cwd,
         request.max_secs,
@@ -356,7 +418,26 @@ pub fn start(
         warnings,
     );
     on_dispatch(None);
-    dispatched.map(|_| owned)
+    match dispatched? {
+        Dispatched::New(_) => Ok(owned),
+        Dispatched::Existing(other) => anyhow::bail!(
+            "key {} was taken by job {other} while this lease started; \
+             job {} in {} was never dispatched",
+            key.map(JobKey::as_str).unwrap_or_default(),
+            owned.id,
+            job_file.display()
+        ),
+    }
+}
+
+/// Which states [`own_existing`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Require {
+    /// `--attach`: a new carrier for a job that is running.
+    Running,
+    /// A keyed lease that found its key: the job is the answer, whatever its
+    /// state, and the hold reports how it ended.
+    AnyState,
 }
 
 /// Own a job that is already running: `run --lease --attach`, steps 1-5 of
@@ -386,6 +467,19 @@ pub fn attach(
     fence: &StopFence,
     on_owned: &dyn Fn(&Owned),
 ) -> Result<Owned> {
+    own_existing(t, host, id, job_file, fence, on_owned, Require::Running)
+}
+
+/// [`attach`]'s steps, with the state check as a parameter.
+fn own_existing(
+    t: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    job_file: &Path,
+    fence: &StopFence,
+    on_owned: &dyn Fn(&Owned),
+    require: Require,
+) -> Result<Owned> {
     crate::errors::require_master(t, host)?;
     let mut lock = fence.lock()?;
     // Flattened to text: a probe that fails is exit 1 for an attach whatever
@@ -395,6 +489,7 @@ pub fn attach(
         .state;
     let state = match state {
         State::Running => None,
+        _ if require == Require::AnyState => None,
         State::Done(code) => Some(format!("done {code}")),
         State::Orphan => Some("orphan".to_string()),
         State::Missing => Some("missing".to_string()),
@@ -845,8 +940,9 @@ impl SignalSteps for RealSignalSteps {
 
 /// How a carrier comes to own its job.
 enum Begin<'a> {
-    /// `run --lease`: name and dispatch a new one.
-    Start(&'a Request<'a>),
+    /// `run --lease [--key K]`: name and dispatch a new one, or hold the one
+    /// holding K.
+    Start(&'a Request<'a>, Option<&'a JobKey>),
     /// `run --lease --attach <id>`: take over one that is running.
     Attach(&'a JobId),
 }
@@ -861,7 +957,19 @@ pub fn run_cli(
     specs: Vec<Spec>,
     request: &Request,
 ) -> Result<i32> {
-    carrier_cli(host, config, job_file, specs, Begin::Start(request))
+    run_cli_keyed(host, config, job_file, specs, request, None)
+}
+
+/// `mule run --lease --key K`: [`run_cli`] through [`start_keyed`].
+pub fn run_cli_keyed(
+    host: &Host,
+    config: Option<PathBuf>,
+    job_file: &Path,
+    specs: Vec<Spec>,
+    request: &Request,
+    key: Option<&JobKey>,
+) -> Result<i32> {
+    carrier_cli(host, config, job_file, specs, Begin::Start(request, key))
 }
 
 /// `mule run --lease --attach <id>`: [`attach`], then the same hold and signal
@@ -929,12 +1037,13 @@ fn carrier_cli(
 
     let mut stderr = std::io::stderr();
     let started = match begin {
-        Begin::Start(request) => start(
+        Begin::Start(request, key) => start_keyed(
             &ssh,
             host,
             job_file,
             &StopFence::dir(),
             request,
+            key,
             &|owned| {
                 if let Some(owned) = owned {
                     // `dispatching` is set under the lock, before the id is

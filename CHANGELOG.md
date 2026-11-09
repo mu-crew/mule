@@ -2,11 +2,56 @@
 
 ## Unreleased
 
+The surface mu's mule plugin needs (mu plugins spec, D15): a status a caller
+can trust after its own crash, a caller key with dispatch dedupe, a listing by
+key, and a cancel that stays inside the caller's process group.
+
+### Added
+
+- `mule run --key K`: an idempotency key, stored as the job's `key` file
+  before the job starts. A dispatch whose key exists starts nothing and prints
+  that job's id (stderr says so, even under `--quiet`), whatever its state.
+  The id stays generated. The check and the start are one locked round trip,
+  so five concurrent dispatches of one key over a `MaxSessions 1` connection
+  make one job. A key file that cannot be read refuses the dispatch; two jobs
+  under one key (two clients) are an error naming both. With `--lease`, a key
+  that names a job is held as `--attach` holds one, in any state, and
+  `--job-file` names it; a key taken between the lookup and the dispatch exits
+  1 with nothing dispatched. Keys are 1-128 characters of `A-Z a-z 0-9 . _ -`.
+- `mule ls --key-prefix P`: only keyed jobs whose key starts with `P`, at any
+  age. `ls --json` rows carry `key` for a keyed job; an unkeyed row has no
+  `key` field and is byte-identical to before.
+- `mule exec --no-detach`: on a signal, one `rm` from exec itself before the
+  exit, never a detached child, so a caller that kills exec's process group
+  after a grace leaves nothing running outside it. The stop is not retried and
+  can outlast the grace.
+
 ### Changed
 
 - Release binaries are built with fat LTO, one codegen unit and stripped
   symbols, about a third smaller (macOS arm64: 2.10 -> 1.33 MB). A panic
   backtrace from a release binary no longer names functions.
+- **`poll --json` answers five states and exits 0 for all of them**:
+  `running`, `done`, `orphan`, `missing` and `unknown` (with `reason`). It was
+  exit 1 for a missing job, the same code as a refused session. Exit 3 (no
+  master) is unchanged, and so is plain `poll`. `log_size` is null for
+  `missing` and `unknown`.
+- **The probe proves absence instead of inferring it**, as `rm` does. `[ -d ]`
+  is false behind an unsearchable parent and `tmux has-session` exits 1 for a
+  protocol mismatch, so a live job could read `missing` or `orphan`. The
+  directory is now checked with `ls -d` and the sessions with `list-sessions`
+  whenever the answer rests on an absence; `missing` also needs `watch-<id>`
+  gone, and a state dir removed under a live session is not `missing`. A check
+  that cannot tell is `unknown` for `poll --json` and the probe error it always
+  was everywhere else (exit 1, `wait`'s lost contact, a lease that holds on).
+- `ls` fails (exit 1) when its jobs root or the tmux session list cannot be
+  checked, instead of listing no jobs or calling every running job an orphan.
+
+### Fixed
+
+- `mule ls` on a macOS host with two or more live jobs failed with `awk:
+  newline in string`: BSD awk refuses a `-v` value holding a newline. The
+  session list now reaches awk through `ENVIRON`.
 
 ## 0.4.0 — 2026-11-05
 

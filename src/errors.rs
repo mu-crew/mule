@@ -70,6 +70,12 @@ pub enum MuleError {
     Orphan { id: String },
     #[error("job {id} not found")]
     MissingJob { id: String },
+    /// The probe could not prove the job's state: a check that would make it
+    /// `missing` or `orphan` failed for a reason other than absence (an
+    /// unsearchable parent, a tmux protocol mismatch). `poll --json` reports
+    /// it as `unknown`; every other verb fails, exit 1, as before.
+    #[error("cannot tell the state of job {id}: {why}")]
+    Unverifiable { id: String, why: String },
     #[error("lost contact while waiting; the job continues\n  resume: mule tail {id}")]
     Dropped { id: String },
 }
@@ -163,6 +169,7 @@ pub fn exit_code(error: &AnyhowError) -> i32 {
         Some(MuleError::Dropped { .. }) => EXIT_DROPPED,
         Some(
             MuleError::MissingJob { .. }
+            | MuleError::Unverifiable { .. }
             | MuleError::SessionChannelBusy
             | MuleError::MuxRefusedPreExec
             | MuleError::SshAgentUnreachable

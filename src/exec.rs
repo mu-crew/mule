@@ -287,11 +287,67 @@ fn park_if_signalled(signals: &Signals) {
     }
 }
 
+/// How exec stops its job when it cannot finish normally: a signal, a failed
+/// dispatch, a failed wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cancel {
+    /// A detached child (`setsid`), retrying for up to ten minutes. It
+    /// survives the hangup that killed the pane, which is what a terminal
+    /// caller needs (SPEC § Detached cleanup).
+    Detach,
+    /// `--no-detach`: one `rm` attempt from this process, before the exit.
+    ///
+    /// For a caller that cancels by signalling exec's process group and
+    /// kills the group after a grace -- a plugin host does exactly that, and
+    /// counts anything that outlives the group as a leak. A detached child is
+    /// such a leak by design: `setsid` takes it out of the group. Here every
+    /// process mule starts, the `rm`'s ssh included, stays in the group, so
+    /// the kill ends all of it. The cost is that the stop is not retried and
+    /// can be cut short: `rm` queues on the ticket lock, whose wait is
+    /// unbounded, so it can outlast any grace. A caller must read a killed
+    /// exec as "the remote job may still run", never as "stopped".
+    InProcess,
+}
+
+/// Stop `id` the way `cancel` says. Errors are dropped: on the signal path
+/// stdio is already `/dev/null`, and on the others the caller is returning
+/// its own error.
+fn stop(cancel: Cancel, config: Option<&std::path::Path>, host: &Host, id: &JobId, retry: bool) {
+    match cancel {
+        Cancel::Detach => {
+            // Retried like a lease's stop, but unfenced and unrecorded:
+            // nothing reattaches to an exec job, and there is no job file to
+            // put a record beside.
+            let retry = retry.then(|| cleanup::StopRetry {
+                retry_for: cleanup::stop_retry_for(),
+                fence_gen: None,
+                failed_file: None,
+            });
+            let _ = cleanup::spawn_rm(config, &host.name, id, retry.as_ref());
+        }
+        // A fresh `Ssh`, not the gated one: the gate is closed by now, and
+        // this call is the one the signal path exists to make.
+        Cancel::InProcess => {
+            let _ = crate::jobs::remove(&Ssh, host, &crate::jobs::Target::One(id.clone()));
+        }
+    }
+}
+
 /// `mule exec` as the binary runs it: real ssh, real signals.
 ///
 /// `config` is the effective `--config`, handed to the detached cleanup child so
 /// it reads the same file.
 pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Result<i32> {
+    run_cli_with(host, config, request, Cancel::Detach)
+}
+
+/// [`run_cli`] with the cancel mode chosen (`exec --no-detach`).
+pub fn run_cli_with(
+    host: &Host,
+    config: Option<PathBuf>,
+    request: &Request,
+    cancel: Cancel,
+) -> Result<i32> {
     // Exec's stderr belongs to the command; see `lock::set_quiet`.
     crate::lock::set_quiet(true);
 
@@ -306,7 +362,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     let calls = ssh.stopper();
     {
         let dispatching = Arc::clone(&dispatching);
-        let host_name = host.name.clone();
+        let host = host.clone();
         let id = id.clone();
         let config = config.clone();
         signals.on_signal(move |signal| {
@@ -323,15 +379,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
             // the collect) gets the rest of the same bound. A group signal
             // kills its ssh too, and the call returns at once.
             calls.stop(deadline.saturating_duration_since(Instant::now()));
-            // Retried like a lease's stop, but unfenced and unrecorded: nothing
-            // reattaches to an exec job, and there is no job file to put a
-            // record beside.
-            let retry = cleanup::StopRetry {
-                retry_for: cleanup::stop_retry_for(),
-                fence_gen: None,
-                failed_file: None,
-            };
-            let _ = cleanup::spawn_rm(config.as_deref(), &host_name, &id, Some(&retry));
+            stop(cancel, config.as_deref(), &host, &id, true);
             std::process::exit(cleanup::exit_status_for(signal));
         });
     }
@@ -349,7 +397,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
             return Ok(EXIT_NO_MASTER);
         }
         // The dispatch may have landed before the reply was lost.
-        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
+        stop(cancel, config.as_deref(), host, &id, false);
         return Err(error);
     }
 
@@ -371,7 +419,7 @@ pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Resul
     if result.is_err() {
         park_if_signalled(&signals);
         // No id was ever printed, so nobody else can remove this job.
-        let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &id, None);
+        stop(cancel, config.as_deref(), host, &id, false);
     }
     result
 }

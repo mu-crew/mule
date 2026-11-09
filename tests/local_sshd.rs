@@ -1327,12 +1327,9 @@ fn removed_jobs_are_missing_not_orphaned() {
     let removed = sshd.mule(&config, &["kill", "--rm", &id]);
     assert!(removed.status.success());
 
-    for args in [
-        vec!["poll", &id],
-        vec!["poll", &id, "--json"],
-        vec!["wait", &id],
-        vec!["tail", &id],
-    ] {
+    // `poll --json` is not here: since the five-state poll (mu plugins spec
+    // D15) it answers `missing` with exit 0, asserted just below.
+    for args in [vec!["poll", &id], vec!["wait", &id], vec!["tail", &id]] {
         let out = sshd.mule(&config, &args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?}: {:?}", out.stdout);
@@ -1343,6 +1340,13 @@ fn removed_jobs_are_missing_not_orphaned() {
         );
         assert!(!stderr.contains("orphan"), "{args:?}: {stderr}");
     }
+    let out = sshd.mule(&config, &["poll", &id, "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        stdout(&out).starts_with("{\"state\":\"missing\""),
+        "{}",
+        stdout(&out)
+    );
 }
 
 #[test]

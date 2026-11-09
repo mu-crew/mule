@@ -25,6 +25,8 @@ pub struct Row {
     pub age_secs: u64,
     pub runtime_secs: Option<u64>,
     pub cmd: String,
+    /// The caller key the job was dispatched with (`run --key`), if any.
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,15 +115,32 @@ pub fn list_with_hidden(
 /// existing awk process avoids restoring the per-job `base64` forks that made
 /// listing take 14.1s. The same batched stat includes `cmd` and `rc`: spawning
 /// one stat per artifact would undo that improvement.
+///
+/// The live session names reach awk through its environment, not `-v`:
+/// BSD awk (macOS) refuses a `-v` value holding a newline (`awk: newline in
+/// string`), so with two live jobs on a macOS host every `ls` failed.
+/// `ENVIRON` is POSIX and takes the value as it is.
 fn list_script(host: &Host) -> String {
     format!(
-        "root={JOBS_ROOT}; [ -d \"$root\" ] || exit 0; \
-         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | sed 's/^mule-//'); \
+        "root={JOBS_ROOT}; \
+         if [ ! -d \"$root\" ]; then \
+           e=$(LC_ALL=C ls -d \"$root\" 2>&1); \
+           case $?:$e in \
+             0:*) echo \"jobs root $root is not a directory\" >&2; exit 1;; \
+             *'No such file or directory'*) exit 0;; \
+             *) echo \"cannot verify jobs root $root: $e\" >&2; exit 1;; \
+           esac; \
+         fi; \
+         out=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>&1) || case \"$out\" in \
+           {NO_TMUX_SERVER}) out=;; \
+           *) echo \"cannot verify session state: $out\" >&2; exit 1;; \
+         esac; \
+         live=$(printf '%s\\n' \"$out\" | sed 's/^mule-//'); \
          {{ find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -c '%Y %n' {{}} + 2>/dev/null \
             || find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -f '%m %N' {{}} + ; }} \
-         | awk -v now=\"$(date +%s)\" -v live=\"$live\" '\
+         | live=\"$live\" awk -v now=\"$(date +%s)\" '\
              BEGIN {{ \
-               n = split(live, L, \"\\n\"); \
+               n = split(ENVIRON[\"live\"], L, \"\\n\"); \
                for (i = 1; i <= n; i++) if (L[i] != \"\") alive[L[i]] = 1; \
                alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\"; \
                for (i = 0; i < 256; i++) ord[sprintf(\"%c\", i)] = i; \
@@ -158,14 +177,16 @@ fn list_script(host: &Host) -> String {
                  cmd = \"\"; \
                  while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
                  close(dir \"/cmd\"); \
+                 key = \"\"; if ((getline l < (dir \"/key\")) > 0) key = l; \
+                 close(dir \"/key\"); \
                  runtime = \"\"; \
                  if (rc != \"\" && (id in cmd_mtime) && (id in rc_mtime)) \
                    runtime = rc_mtime[id] - cmd_mtime[id]; \
                  else if (rc == \"\" && (id in alive) && (id in cmd_mtime)) \
                    runtime = now - cmd_mtime[id]; \
                  if (runtime != \"\" && runtime < 0) runtime = 0; \
-                 printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", \
-                   id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd); \
+                 printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", \
+                   id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd), b64(key); \
                }} \
              }}'",
         host.tmux_socket
@@ -175,7 +196,7 @@ fn list_script(host: &Host) -> String {
 fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Result<usize> {
     let mut hidden = 0;
     for line in reply.lines() {
-        let mut fields = line.splitn(6, '\t');
+        let mut fields = line.splitn(7, '\t');
         let id = fields.next().context("invalid ls reply: missing id")?;
         let age_secs = fields
             .next()
@@ -198,6 +219,18 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             fields.next().context("invalid ls reply: missing cmd")?,
         )?)
         .into_owned();
+        // Last and optional: a reply from before keys existed has six fields.
+        // Base64 in transit, like `cmd`, so a hand-edited `key` holding a tab
+        // cannot shift a column.
+        let key = match fields.next() {
+            Some(encoded) if !encoded.is_empty() => Some(
+                String::from_utf8_lossy(&decode_command(encoded)?)
+                    .trim_end()
+                    .to_string(),
+            ),
+            _ => None,
+        }
+        .filter(|key| !key.is_empty());
         let rc = if rc_text.is_empty() {
             None
         } else {
@@ -232,6 +265,7 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
                 age_secs,
                 runtime_secs,
                 cmd,
+                key,
             });
         } else {
             hidden += 1;
@@ -279,6 +313,15 @@ pub enum Target {
     AllDone,
 }
 
+/// The `case` patterns for a failed `tmux list-sessions` that prove there is
+/// no server, and so no session: `no server running` (the socket file is left
+/// behind), or a missing socket (`error connecting to ... (No such file or
+/// directory)`). Every other failure -- a protocol mismatch, an unsafe socket
+/// directory -- proves nothing. Shared by `rm`'s proof, the probe and `ls`, so
+/// "gone" means the same thing in all three.
+pub const NO_TMUX_SERVER: &str =
+    "*'no server running'*|*'error connecting to'*'No such file or directory'*";
+
 /// The remote script behind `rm <id>`, exposed so layer 2 can drive it against
 /// a private tmux server.
 ///
@@ -325,7 +368,7 @@ pub fn remove_one_script(host: &Host, id: &JobId) -> String {
            done; \
          else \
            case \"$out\" in \
-             *'no server running'*|*'error connecting to'*'No such file or directory'*) ;; \
+             {NO_TMUX_SERVER}) ;; \
              *) echo \"cannot verify session state: $out (state dir kept)\" >&2; exit 1;; \
            esac; \
          fi; \

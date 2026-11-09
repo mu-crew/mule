@@ -137,6 +137,47 @@ reattached; a lease always passes the generation it owned at dispatch. A lease's
 That file means the job may still be running: open the master, then
 `mule ls --host dev1`, then `mule rm --host dev1 3a043f`.
 
+## Status for a program: `poll --json`
+
+`mule poll <id> --json` prints one object and exits 0 for every state:
+
+| `state` | Meaning |
+| --- | --- |
+| `running` | the session exists and there is no `rc` |
+| `done` | `rc` exists; it is in `rc` |
+| `orphan` | the state is there, the session is gone, and no `rc` will come |
+| `missing` | no state directory and no session: proven, as `rm` proves a stop |
+| `unknown` | mule could not tell; `reason` says why |
+
+```json
+{"state":"running","rc":null,"runtime_secs":12,"log_size":0}
+{"state":"missing","rc":null,"runtime_secs":null,"log_size":null}
+{"state":"unknown","rc":null,"runtime_secs":null,"log_size":null,"reason":"cannot tell the state of job 3a043f: cannot verify state dir ...: Permission denied"}
+```
+
+`unknown` covers every probe that did not complete: a state path behind an
+unsearchable directory, a tmux that cannot be queried, a refused or dropped
+session. Never read it as "gone". Exit 3 still means no master. Plain `poll`
+is unchanged: a missing job is exit 1, `job <id> not found`.
+
+## Idempotent dispatch: `run --key`
+
+```sh
+mule run --key mu.3f2c9a1e-7b4d-4e8f-9a0b-1c2d3e4f5a6b -- make test
+```
+
+If a job with that key already exists, in any state, mule prints its id,
+says `key K already names job <id>; nothing was dispatched` on stderr, and
+starts nothing. Otherwise it dispatches as usual and stores the key with the
+job. The id is still generated. The key is 1-128 characters of `A-Z a-z 0-9
+. _ -`, and stays with the job until `mule rm`. It works with `--wait`,
+`--tui` and `--lease`.
+
+`mule ls --json --key-prefix P` lists the keyed jobs whose key starts with
+`P`, at any age (the 24-hour window does not apply), each with its `key`. A
+host under `unreachable` was not searched. In plain `ls --json`, a keyed row
+has a `key` field and an unkeyed row has none.
+
 ## Forwarding a unix socket
 
 ```sh
@@ -211,6 +252,12 @@ mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
   --forward-unix /tmp/w1.sock:/home/me/.mu/w1.sock -- env K=v sh -c 'pi'
 ```
 
+With `--key K`, a lease whose key already names a job holds that job instead
+of starting one: `F` names it, and the lease ends with its code (at once, for
+a finished one). If another client starts `K` between the lease's lookup and
+its dispatch, the lease exits 1 and `F` keeps its own id, which was never
+dispatched.
+
 ### Reattaching to a running job
 
 ```sh
@@ -272,6 +319,11 @@ is the command's own.
   that queues like any caller and retries for up to 10 minutes. Give it a moment before you tear the machine
   down. `run --wait` is the opposite: its job continues.
 - **Exit 3** is still "no master: stop and ask a human".
+- **`--no-detach`** stops the job from exec itself on a signal: one `mule rm`
+  attempt, then the exit, with every process left in exec's process group.
+  For a caller that kills the group after a grace (a plugin host), where a
+  detached child would be a leak. The stop is not retried and can outlast
+  that grace, so a killed exec means the job may still run.
 
 ```sh
 mule exec --cwd ~/repo -- git rev-parse HEAD

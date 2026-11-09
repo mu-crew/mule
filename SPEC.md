@@ -154,6 +154,7 @@ log     merged stdout and stderr, or a raw TUI transcript
 rc      exit code, written only after completion
 mode    `tui` for explicit terminal jobs; absent for ordinary jobs
 screen  final visible screen for a completed TUI job
+key     the caller's key, one line, for a job dispatched with `run --key`
 ```
 
 The remote artifact is the only source of truth. There is no local job index. The `rc` file is durable across dropped connections and distinguishes these states:
@@ -163,9 +164,24 @@ The remote artifact is the only source of truth. There is no local job index. Th
 | `running` | The tmux session exists and `rc` does not. |
 | `done` | `rc` exists. |
 | `orphan` | The state directory exists, but the session is gone and `rc` does not exist. |
-| `missing` | The state directory does not exist. |
+| `missing` | The state directory does not exist, and neither `mule-<id>` nor `watch-<id>` does. |
+| `unknown` | One of the checks above could not be made. `poll --json` only. |
 
-A missing job is an ordinary error (exit 1), including for `poll --json`; it is not a poll result. `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that mule did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
+Absence is seen, never inferred, as `rm`'s proof sees it ([Listing, load, and cleanup](#listing-load-and-cleanup)). `[ -d ]` is false behind an unsearchable parent, and `tmux has-session` exits 1 for a client/server protocol mismatch as it does for a missing session, so the probe used to read both as "gone": a live job behind an unreadable parent was `missing`, and a running job under a mismatched tmux was an `orphan`. Now every answer that rests on an absence is checked a second way: the directory with `ls -d`, gone only on `No such file or directory`, and the sessions with `list-sessions`, gone only on tmux's own "no server" errors. The second look costs a process only on those paths (a running job passes `has-session`, a finished one has `rc`). A check that cannot tell makes the job `unknown`, with the reason. A state directory gone under a live session is `unknown` too: something of the job still runs.
+
+`poll --json` answers all five states with exit 0, and no master is still exit 3. Every probe failure is `unknown` there, not only a check that could not tell: a refused session, a dropped ssh or a malformed reply all leave the state unproven. A caller recovering from its own crash (mu, reconciling a job it may have started) must never read "cannot tell" as "gone", and when `missing` was exit 1 it shared that code with every failure. Everywhere else a missing job is an ordinary error (exit 1), and an `unknown` one is the probe error it was (exit 1 for `poll`, `wait`'s lost contact, the lease holding on). `kill` writes `137` if `rc` is absent before destroying the session. An orphan therefore means that mule did not stop the job normally. `rm` destroys the session if needed, then removes the state directory.
+
+### Caller keys
+
+`run --key K` stores `K` as the job's `key` file, written before `new-session`, so no job runs without the key that names it. A dispatch whose key exists starts nothing and returns that job's id, whatever its state: a finished job is the effect that already happened. The id stays generated. A key stays with its job until `rm` (or prune) removes the state directory, so it can be reused only after the job is gone.
+
+The check and the start are one remote script, one `grep -Flx` over every `key` file (bounded processes, like `ls`). It holds the ticket lock for its round trip, so two mule calls on one client cannot both pass it: measured, five concurrent `run --key` of one key over a `MaxSessions 1` connection made one job and printed one id. Callers on two clients are not serialised, and two jobs under one key are then an error naming both, never a silent pick. A key file that cannot be read (grep's exit 2) refuses the dispatch: "no hit" there would start the effect a second time.
+
+`K` is 1-128 characters of `A-Z a-z 0-9 . _ -`, not starting with `-`, parsed at the boundary like an id. Nothing in it is syntax for any layer it crosses, and it fits one line of `key`, so `grep -Fx` matches it exactly. mu's keys are UUIDs.
+
+`run --lease --key K` must name its job in `--job-file` before the dispatch, so it first looks the key up in its own locked round trip. Found: it owns that job as `--attach` does (fence lock, one probe, the job file published without replacing anything, the fence bumped), except that any state is accepted; the hold then ends with the job's own code. Not found: an ordinary lease, whose dispatch re-checks the key. If the key appeared in between (another client), nothing is dispatched and the lease exits 1. Its job file already names its fresh, never-dispatched id, and retargeting a handle mu may have read is worse than failing; a lookup by key finds the job that won.
+
+`ls --json --key-prefix P` lists only keyed jobs whose key starts with `P`, with a `key` field, at any age: the 24-hour window would hide an old finished job, and a lookup that missed it would start the effect again. A host under `unreachable` was not searched, so "not found" there means "cannot tell". Every keyed row in `ls --json` carries `key`; an unkeyed row has no `key` field, byte-identical to the rows before keys existed.
 
 A job wrapper has this shape. The log is capped at `max_log_bytes`; `-f /dev/null` stops a personal `~/.tmux.conf` from inflating dispatch:
 
@@ -273,21 +289,21 @@ One caller waits for a master instead: the **detached stop child** a lease (or `
 ## Commands and output
 
 ```text
-mule run [--host H] [--cwd D] [--max-secs S] [--human] [--tui | --wait [--no-tail]] <cmd>
+mule run [--host H] [--cwd D] [--max-secs S] [--human] [--key K] [--tui | --wait [--no-tail]] <cmd>
 mule poll <id> [--host H] [--json]
 mule wait <id> [--host H] [--timeout S]
 mule tail <id> [--host H] [-f | --transcript] [--all | -n LINES]
-mule ls [--host H] [--all] [--json] [--full]
+mule ls [--host H] [--all] [--json] [--full] [--key-prefix P]
 mule kill <id> [--host H] [--rm]
 mule rm [<id> [--retry-for S [--fence-gen N] [--failed-file F]] | --all] [--host H]
-mule exec [--host H] [--cwd D] [--max-secs S] -- <cmd>
-mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] --job-file F [--forward-unix L:R ...] -- <cmd>
+mule exec [--host H] [--cwd D] [--max-secs S] [--no-detach] -- <cmd>
+mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] [--key K] --job-file F [--forward-unix L:R ...] -- <cmd>
 mule forward | unforward [--host H] --unix LOCAL:REMOTE ...
 mule host list [--json]
 mule host info [--host H] [--json]
 ```
 
-`poll` prints `running`, `orphan`, or the exit code; for a running job its stderr hint includes elapsed runtime. `poll --json` includes `runtime_secs`. `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
+`poll` prints `running`, `orphan`, or the exit code; for a running job its stderr hint includes elapsed runtime. `poll --json` prints `{state, rc, runtime_secs, log_size}`, plus `reason` for `unknown`, and exits 0 for all five states ([Job identity and remote state](#job-identity-and-remote-state)). `wait` prints no job output and exits with the job's code. `run --wait` prints the ID first, follows the log, and exits with the job's code. Printing the ID first preserves the recovery handle if a later read fails.
 
 `run --max-secs S` overrides the host's `max_job_secs` for that job; zero means unbounded. A portable watchdog runs in a separate private tmux session, so it needs no `timeout(1)` (absent on stock macOS), does not hold SSH, and cannot leave its `sleep` keeping a fast job alive. At the cap it writes **124**, GNU `timeout`'s established code, then destroys the job session and its process tree. Normal completion destroys the watchdog and preserves the command's own rc. This remote runtime bound is deliberately distinct from `wait --timeout`, which only stops the local caller waiting and leaves the job running.
 
@@ -325,11 +341,17 @@ It is an ordinary detached job with a foreground waiter, so invariant 3 holds: n
 - **Quiet stderr.** No id line and no hints. mule's non-fatal diagnostics (the lock-wait notice, `max_running`, dispatch-pattern warnings) are suppressed, so stderr is the command's plus mule's fatal errors. A caller reads "why" from stderr's first line.
 - **Fast poll.** The interval starts at **100ms** and doubles to a **1s** cap, not the 5s a detached job settles at, because the caller is blocked on it. A 30s command costs about 30 probes.
 - **Exit status.** exec exits with the command's code and removes the job in the same round trip that reads it. If the log reached `max_log_bytes` (or the err file did, which has no wrapper-side cap and is bounded on read), it exits **7**: partial output delivered, never mistaken for complete. So does a command that leaves a process holding its stdout (`sleep 30 &`): the log pipeline, and so the job's session, never ends, the log cannot be known complete, and exec prints `output incomplete: a process still holds the command's stdout` instead of returning the job's code beside a possibly-empty log. The job is still removed. Removal is proved, not hoped for: the collect script ends with `rm <id>`'s own proof script (both sessions and the state directory seen gone), and if that fails exec delivers what it read and then exits **1** naming the leftover -- never the command's code, since a caller such as mu acts on success by deleting its handle. exec is for control-sized output. No master is exit 3, unchanged.
-- **Signals.** On SIGHUP, SIGINT or SIGTERM exec stops the job through [detached cleanup](#detached-cleanup) and exits 129, 130 or 143. This is the difference from `run --wait`, where the job continues. Once a signal is pending the main thread never turns a failure into its own exit: a group signal kills the in-flight `ssh` too, and that probe error is the signal's fallout, so the main thread parks and the signal thread gives the exit.
+- **Signals.** On SIGHUP, SIGINT or SIGTERM exec stops the job through [detached cleanup](#detached-cleanup) and exits 129, 130 or 143. This is the difference from `run --wait`, where the job continues. `--no-detach` stops it in-process instead ([below](#cancelling-inside-the-callers-group)). Once a signal is pending the main thread never turns a failure into its own exit: a group signal kills the in-flight `ssh` too, and that probe error is the signal's fallout, so the main thread parks and the signal thread gives the exit.
 
 No locked call waits. `rc` is written by the left end of the log pipeline and the log by the right end, so `rc` can land while the last bytes and the `truncated` marker are still in flight; the session ends only when the whole pipeline has. exec waits for that in the *unlocked* poll loop -- each probe reports whether `mule-<id>` is alive, spaced 100ms, bounded at **5s of wall clock** (an `Instant` taken before the first probe that saw `rc`, so probe round trips count, not just the requested pauses) -- and only then makes the one collect round trip, which reports `live=` (read before the log) and never sleeps. A 5s sleep inside the collect held the ticket about 14s when a background child kept the session open, starving every other caller. No exec call, locked or not, exceeds about a second.
 
 Cost: about 125ms to dispatch plus at least 100ms of polling, against 33ms for a bare ssh. A profile has one `exec` template, so the sub-second calls become jobs too, and a refused `git rev-parse` reading as an empty answer is exactly what [What belongs in a job](#what-belongs-in-a-job) warns about.
+
+### Cancelling inside the caller's group
+
+`exec --no-detach` is for a caller that cancels by signalling exec's process group and kills the group after a grace: a plugin host does exactly that, and counts anything outliving the group as a leak. A detached stop is such a leak by design (`setsid` takes it out of the group, so a pane hangup cannot take the stop with it). Under `--no-detach` the signal path makes one `rm <id>` from the signal thread, through the ticketed `run`, after the same dispatch and in-flight grace as below, then exits 129, 130 or 143. The failure paths that would spawn a detached `rm` (a failed dispatch, a failed wait) run it in-process too. Every process mule starts, that `rm`'s ssh included, stays in the group, so the kill ends all of it; measured on the loopback sshd, a group SIGTERM left no state, no session and no process by the time exec exited.
+
+The cost is that the stop is neither retried nor bounded: it queues on the ticket lock, whose wait is unbounded, so it can outlast the caller's grace. A killed `--no-detach` exec therefore means "the remote job may still run", never "stopped", and its caller must say so (mu's plugin declares `remoteOnTimeout: "unknown"`). Without the flag nothing changes.
 
 ### Detached cleanup
 
@@ -356,6 +378,8 @@ The signal handler only sets a flag and writes to a self-pipe (`signal-hook`), s
 ## Listing, load, and cleanup
 
 `ls` does a bounded amount of work per host -- one `tmux list-sessions`, one batched `stat`, one `awk` -- rather than work proportional to the job count. The same stat batch reads the directory, `cmd`, and `rc` mtimes. Runtime is `now - cmd_mtime` while running and `rc_mtime - cmd_mtime` when finished; an orphan shows `-` because its end time is unknowable. The human table shows `RUNTIME` instead of the state-dependent `AGE`; JSON retains `age_secs` and adds `runtime_secs`. The listing runs inside the ticket lock, so its duration is a channel outage for everything else: a per-job version measured 14.1s at 300 jobs, fourteen times the one-second ceiling stated above, at a job count `keep_days` makes ordinary.
+
+The listing reads each job's `key` beside `cmd`, in the same awk pass, and ships both base64-encoded so a hand-edited value cannot shift a column. The live session names reach awk through `ENVIRON`, not `-v`: BSD awk refuses a `-v` value holding a newline (`awk: newline in string`), so on a macOS host every `ls` with two live jobs failed. A jobs root or a session list that cannot be checked fails the listing (exit 1) instead of reading as "no jobs" or "no sessions", with the same proofs as the probe.
 
 `ls` checks configured hosts sequentially because every host call takes its own lock. It reports unreachable hosts instead of silently omitting them.
 
@@ -385,7 +409,7 @@ Truncation is recorded in a marker file and reported on stderr by `tail`, becaus
 - A missing master exits **3** and prints the command that opens it.
 - A timeout exits **4** while the remote job continues.
 - An orphan exits **5** because no `rc` can arrive.
-- A missing job exits **1** with `job <id> not found`.
+- A missing job exits **1** with `job <id> not found`, except for `poll --json`, which answers `missing` (or `unknown`) with exit 0.
 - A dropped connection during `wait` exits **6** while the remote job continues.
 - `exec` output past `max_log_bytes` exits **7** in place of the command's code, so a stdout parser never mistakes a prefix for the whole answer.
 - A refused channel is retried on a fresh ticket for up to 12s when ssh's own log proves the script never started, then reports a busy or down master rather than raw SSH authentication text.
@@ -451,8 +475,10 @@ The design separates four kinds of evidence:
 | --- | --- | --- |
 | 1 | Logic through a fake `Transport`: config, IDs, scripts, state mapping, and lock ordering | None |
 | 2 | The generated wrapper (including `exec`'s split-stream mode) against `tmux -L mule-test-<pid> -f /dev/null` | `tmux` |
-| 3 | Channel isolation, gated concurrency, dispatch latency, bounded wait, `exec`'s signal cleanup (private config, no `mule` on PATH, queued behind a held ticket), and the lease (traffic during a hold, drift and master-restart re-forward, `tmux kill-pane` mid-print and mid-probe, `kill -9`) | Local `sshd` recipe above |
+| 3 | Channel isolation, gated concurrency, dispatch latency, bounded wait, `exec`'s signal cleanup (private config, no `mule` on PATH, queued behind a held ticket), the lease (traffic during a hold, drift and master-restart re-forward, `tmux kill-pane` mid-print and mid-probe, `kill -9`), and the plugin surface (one job for five concurrent dispatches of a key, five-state `poll --json`, a keyed lease, `exec --no-detach` under a group signal) | Local `sshd` recipe above |
 | 3b | The 2FA-specific error text and network latency | A capped host and a live master |
+
+Layer 2 also runs whole verbs: the binary with an `ssh` on `PATH` that answers mux ops as a live master and runs each script under a local `sh` (`tests/common/local.rs`). That reaches the CLI and exit codes of the real scripts without an sshd.
 
 Layer 2 uses a private tmux socket and no personal config. It catches quoting, `rc` writes, kill status **137**, and shell exit-code propagation that a fake transport cannot test. Layer 3 reproduces the channel cap without privileged setup. Layer 3b is the only layer that needs a token tap.
 
@@ -518,11 +544,15 @@ Each parser adds another opportunity for expansion or injection. Base64 makes th
 
 Duplicate tmux session names can report success from an outer wrapper even when no new job starts. Reused names can also inherit stale `rc` files. Generated IDs avoid both failures.
 
+**Amended (2026-11-09, mu plugins spec D15/D18.6): a caller key is not a name.** `run --key K` stores `K` as data in the job's `key` file and never as a tmux name, a path or a target; the id stays generated, so neither failure above can happen through a key. What a key adds is idempotency: a caller that must survive its own crash (mu writes a key for every effect before the effect) can ask whether the job already exists instead of starting it twice. See [Caller keys](#caller-keys).
+
 ### Store a local job index
 
 A local index would duplicate remote identity and become stale after disconnects or use from another client. The remote directory remains the sole record; removing a host from config makes its jobs unreachable until the host is configured again.
 
 A forward record is not a job index. It exists only because OpenSSH cannot list a master's forwards, and it names no job.
+
+**Amended (2026-11-09, mu plugins spec D15/D18.6): listing a caller's jobs needs no index.** `ls --json --key-prefix P` answers "which of my jobs exist" from the remote artifacts, the same bounded listing as `ls`, reading each job's `key` file in the existing awk pass. Nothing is stored locally, so nothing goes stale.
 
 ### Store jobs in `/tmp`
 
