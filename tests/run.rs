@@ -93,9 +93,25 @@ fn zero_running_sessions_is_a_successful_dispatch_reply() {
         )
         .is_ok()
     );
+    // The count is advisory: one it cannot take is `?` and no warning, never
+    // a failed dispatch of a job that has started.
     assert!(
-        fake.scripts()[0].contains("grep -c '^mule-' || true"),
-        "grep reports no matches with status 1; the combined dispatch must normalize it"
+        fake.scripts()[0].contains("|| echo '?'"),
+        "an untaken count must not fail the dispatch"
+    );
+    let fake = Fake::new();
+    fake.push(Output::ok("?\n"));
+    assert!(
+        mule::run::dispatch(
+            &fake,
+            &host(),
+            "true",
+            None,
+            None,
+            JobMetadata::Human,
+            mule::wrapper::JobMode::Pipe,
+        )
+        .is_ok()
     );
 }
 

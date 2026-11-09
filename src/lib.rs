@@ -16,6 +16,7 @@ pub mod key;
 pub mod lease;
 pub mod lock;
 pub mod probe;
+pub mod remote;
 pub mod run;
 pub mod stopfence;
 pub mod tail;

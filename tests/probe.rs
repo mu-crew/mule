@@ -239,8 +239,9 @@ fn a_job_that_ends_between_the_reads_is_done_not_orphaned() {
     // that exited 7 as orphan (exit 5) in 3 of 3 runs, with rc=7 on disk a
     // moment later.
     //
-    // The shim makes that interleaving certain: its `has-session` is the
-    // instant the job ends -- it writes `rc`, then reports the session gone.
+    // The shim makes that interleaving certain: its session read
+    // (`list-sessions`, the probe's one look at tmux) is the instant the job
+    // ends -- it writes `rc`, then reports the server gone.
     isolate_state();
     let root = std::env::temp_dir().join(format!("mule-probe-race-{}", std::process::id()));
     let state = root.join("state");
@@ -254,7 +255,7 @@ fn a_job_that_ends_between_the_reads_is_done_not_orphaned() {
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\ncase \"$*\" in *has-session*) echo 7 > '{}'; exit 1;; esac\nexit 1\n",
+            "#!/bin/sh\ncase \"$*\" in *list-sessions*) echo 7 > '{}'; echo 'no server running on /tmp/x' >&2; exit 1;; esac\nexit 1\n",
             job.join("rc").display()
         ),
     )

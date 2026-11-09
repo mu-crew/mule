@@ -127,28 +127,25 @@ pub fn list_with_hidden(
 /// `ENVIRON` is POSIX and takes the value as it is.
 fn list_script(host: &Host) -> String {
     format!(
-        "root={JOBS_ROOT}; \
-         if [ ! -d \"$root\" ]; then \
-           e=$(LC_ALL=C ls -d \"$root\" 2>&1); \
-           case $?:$e in \
-             0:*) echo \"jobs root $root is not a directory\" >&2; exit 1;; \
-             *'No such file or directory'*) exit 0;; \
-             *) echo \"cannot verify jobs root $root: $e\" >&2; exit 1;; \
-           esac; \
-         fi; \
-         out=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>&1) || case \"$out\" in \
-           {NO_TMUX_SERVER}) out=;; \
-           *) echo \"cannot verify session state: $out\" >&2; exit 1;; \
-         esac; \
-         live=$(printf '%s\\n' \"$out\" | sed 's/^mule-//') \
-           || {{ echo \"cannot read the session list\" >&2; exit 1; }}; \
-         if stat -c %Y \"$root\" >/dev/null 2>&1; then sf=-c; sfmt='%Y %n'; else sf=-f; sfmt='%m %N'; fi; \
-         listing=$(find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc -o -name key \\) \\) \\) -exec stat $sf \"$sfmt\" {{}} +) \
-           || {{ echo \"cannot list the jobs under $root\" >&2; exit 1; }}; \
-         printf '%s\\n' \"$listing\" | live=\"$live\" awk -v now=\"$(date +%s)\" '\
+        "{prelude}mule_socket={socket}; root={JOBS_ROOT}; \
+         if mule_absent \"$root\" \"jobs root\"; then exit 0; fi; \
+         [ -d \"$root\" ] || mule_u \"jobs root $root is not a directory\"; \
+         mule_sessions; mule_now; now=$REPLY; \
+         mule_stat_flavor; \
+         listing=$(find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc -o -name key \\) \\) \\) -exec stat $mule_sf \"$mule_sfmt\" {{}} +) \
+           || mule_u \"cannot list the jobs under $root\"; \
+         odd=$(find \"$root\" -mindepth 2 -maxdepth 2 \\( -name rc -o -name key \\) ! -type f) \
+           || mule_u \"cannot list the jobs under $root\"; \
+         printf '%s\\n' \"$listing\" | live=\"$SESSIONS\" odd=\"$odd\" awk -v now=\"$now\" '\
              BEGIN {{ \
                n = split(ENVIRON[\"live\"], L, \"\\n\"); \
-               for (i = 1; i <= n; i++) if (L[i] != \"\") alive[L[i]] = 1; \
+               for (i = 1; i <= n; i++) if (sub(/^mule-/, \"\", L[i])) alive[L[i]] = 1; \
+               n = split(ENVIRON[\"odd\"], O, \"\\n\"); \
+               for (i = 1; i <= n; i++) if (O[i] != \"\") {{ \
+                 p = O[i]; oid = p; sub(/\\/[^\\/]*$/, \"\", oid); sub(/.*\\//, \"\", oid); \
+                 odd_why[oid] = p \" is not a regular file\"; \
+                 if (p ~ /\\/key$/) odd_key[oid] = 1; \
+               }} \
                alphabet = \"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\"; \
                for (i = 0; i < 256; i++) ord[sprintf(\"%c\", i)] = i; \
              }} \
@@ -182,7 +179,7 @@ fn list_script(host: &Host) -> String {
              END {{ \
                for (id in dirs) {{ \
                  dir = dirs[id]; \
-                 bad = \"\"; \
+                 bad = (id in odd_why) ? odd_why[id] : \"\"; \
                  rc = \"\"; \
                  if (id in rc_mtime) {{ \
                    l = \"\"; if ((getline l < (dir \"/rc\")) > 0 && l != \"\") rc = l; \
@@ -192,7 +189,7 @@ fn list_script(host: &Host) -> String {
                  cmd = \"\"; \
                  while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
                  close(dir \"/cmd\"); \
-                 key = \"\"; keyok = 1; \
+                 key = \"\"; keyok = (id in odd_key) ? 0 : 1; \
                  if (id in key_mtime) {{ \
                    l = \"\"; if ((getline l < (dir \"/key\")) > 0 && l != \"\") key = l; \
                    else {{ keyok = 0; bad = \"cannot read \" dir \"/key\"; }} \
@@ -210,8 +207,9 @@ fn list_script(host: &Host) -> String {
                    id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd), \
                    keyok ? b64(key) : \"?\", b64(bad); \
                }} \
-             }}'",
-        host.tmux_socket
+             }}' || mule_u \"cannot list the jobs under $root\"",
+        prelude = crate::remote::PRELUDE,
+        socket = host.tmux_socket,
     )
 }
 
@@ -354,15 +352,6 @@ pub enum Target {
     AllDone,
 }
 
-/// The `case` patterns for a failed `tmux list-sessions` that prove there is
-/// no server, and so no session: `no server running` (the socket file is left
-/// behind), or a missing socket (`error connecting to ... (No such file or
-/// directory)`). Every other failure -- a protocol mismatch, an unsafe socket
-/// directory -- proves nothing. Shared by `rm`'s proof, the probe and `ls`, so
-/// "gone" means the same thing in all three.
-pub const NO_TMUX_SERVER: &str =
-    "*'no server running'*|*'error connecting to'*'No such file or directory'*";
-
 /// The remote script behind `rm <id>`, exposed so layer 2 can drive it against
 /// a private tmux server.
 ///
@@ -397,42 +386,40 @@ pub const NO_TMUX_SERVER: &str =
 pub fn remove_one_script(host: &Host, id: &JobId) -> String {
     let dir = state_dir(id);
     let socket = &host.tmux_socket;
+    // On the fail-closed prelude ([`crate::remote`]), with its stop status
+    // set to 1, `rm`'s documented "not proven" exit. Each `kill-session`
+    // must kill its session or prove it was not there; the sessions are
+    // then seen gone in one list (a `case`, not a `grep` whose exit 2 once
+    // read as "not listed"); the dir is seen gone with `ls -d` before and
+    // after `rm -rf`.
     format!(
-        "d={dir}; \
-         tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
-         tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
-         out=$(tmux -L {socket} list-sessions -F '#{{session_name}}' 2>&1); rc=$?; \
-         alive=; \
-         if [ \"$rc\" -eq 0 ]; then \
-           for s in mule-{id} watch-{id}; do \
-             printf '%s\\n' \"$out\" | grep -Fxq \"$s\"; \
-             case $? in \
-               0) alive=\"$alive $s\";; \
-               1) ;; \
-               *) echo \"cannot search the session list for $s (state dir kept)\" >&2; exit 1;; \
-             esac; \
-           done; \
-         else \
-           case \"$out\" in \
-             {NO_TMUX_SERVER}) ;; \
-             *) echo \"cannot verify session state: $out (state dir kept)\" >&2; exit 1;; \
-           esac; \
-         fi; \
+        "{prelude}mule_u_code=1; mule_socket={socket}; d={dir}; \
+         {kill_mule}{kill_watch}\
+         mule_sessions; alive=; \
+         if mule_has mule-{id}; then alive=\"$alive mule-{id}\"; fi; \
+         if mule_has watch-{id}; then alive=\"$alive watch-{id}\"; fi; \
          if [ -n \"$alive\" ]; then \
            echo \"session still alive after kill-session:$alive (state dir kept)\" >&2; exit 1; \
          fi; \
-         probe() {{ \
-           e=$(LC_ALL=C ls -d \"$d\" 2>&1) && return 0; \
-           case \"$e\" in \
-             *'No such file or directory'*) return 1;; \
-           esac; \
-           echo \"cannot verify state dir $d: $e (kept)\" >&2; exit 1; \
-         }}; \
-         if probe; then \
-           rm -rf \"$d\" 2>/dev/null; \
-           if probe; then echo \"state dir $d could not be removed (kept)\" >&2; exit 1; fi; \
-           echo {id}; \
-         fi; exit 0"
+         if mule_absent \"$d\" \"state dir\"; then exit 0; fi; \
+         rm -rf \"$d\" 2>/dev/null || {{ echo \"state dir $d could not be removed (kept)\" >&2; exit 1; }}; \
+         if mule_absent \"$d\" \"state dir\"; then echo {id}; exit 0; fi; \
+         echo \"state dir $d could not be removed (kept)\" >&2; exit 1",
+        prelude = crate::remote::PRELUDE,
+        kill_mule = kill_session_proven(socket, &format!("mule-{id}")),
+        kill_watch = kill_session_proven(socket, &format!("watch-{id}")),
+    )
+}
+
+/// `kill-session` of `name`, which must kill it or prove it was not there
+/// (`can't find session`, or tmux's own "no server"); anything else stops
+/// the script, cannot tell.
+fn kill_session_proven(socket: &str, name: &str) -> String {
+    format!(
+        "e=$(tmux -L {socket} kill-session -t {name} 2>&1) || case $e in \
+           *\"can't find session\"*|*'no server running'*|*'error connecting to'*'No such file or directory'*) ;; \
+           *) mule_u \"cannot verify session state: cannot kill {name}: $e\";; \
+         esac; "
     )
 }
 
@@ -482,37 +469,48 @@ const ORPHAN_KEEP_MULTIPLIER: u32 = 4;
 
 pub fn prune(host: &Host) -> String {
     let orphan_days = host.keep_days.saturating_mul(ORPHAN_KEEP_MULTIPLIER);
-    // Two passes, because the two states have different horizons and `find`
-    // cannot express "has rc OR is much older" in one predicate without
-    // becoming unreadable.
+    // Two passes, because the two states have different horizons.
     //
     // A `running` job has no `rc`, so the orphan pass would match it by age
     // alone. Skip live `mule-{id}` sessions: keep_days can be 1, which makes
     // the orphan horizon four days, and a multi-day job is legitimate work.
     //
-    // Deleting is the one act here that cannot be undone, so it needs proof:
-    // a session list tmux could not give (anything but "no server") skips the
-    // orphan pass, and a `grep` that fails (exit 2, not 1) spares the dir.
-    // Read as "not live", either deleted a running job's state.
-    //
-    // A job with a `key` is never pruned, at any age: a dispatch with that
-    // key must keep returning it (`run --key`), and a pruned key would run
-    // its effect again. It goes when its caller runs `rm`.
+    // Deleting is the one act here that cannot be undone, so every delete
+    // needs a proof and anything less stops the whole prune, deleting
+    // nothing more ([`crate::remote`]): a dir goes only with its `key` seen
+    // not to exist (a keyed job is never pruned: its key must keep returning
+    // it), and either an `rc` read as a regular file (done) or, for an
+    // orphan, `rc` seen absent, `cmd` present and neither session in a list
+    // tmux gave. A `find -exec test` that failed used to read as "no key"
+    // and delete a keyed job (review of P7a, round 2). Runs in a subshell, so
+    // a stop ends the prune and never the dispatch it rides in.
     format!(
-        "root={JOBS_ROOT}; [ ! -d \"$root\" ] || {{ \
-         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>&1) && liveok=1 || \
-           case \"$live\" in {NO_TMUX_SERVER}) live=; liveok=1;; *) liveok=0;; esac; \
-         find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{} \
-           -exec test -f '{{}}/rc' \\; ! -exec test -e '{{}}/key' \\; -exec rm -rf '{{}}' + ; \
-         [ \"$liveok\" = 1 ] && \
-         find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days} \
-           -exec test ! -f '{{}}/rc' \\; ! -exec test -e '{{}}/key' \\; -print | while IFS= read -r d; do \
+        "( {prelude}mule_socket={socket}; root={JOBS_ROOT}; \
+           if mule_absent \"$root\" \"jobs root\"; then exit 0; fi; \
+           old=$(find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{keep}) \
+             || mule_u \"cannot list old jobs\"; \
+           printf '%s\\n' \"$old\" | while IFS= read -r d; do \
+             [ -n \"$d\" ] || continue; \
+             mule_absent \"$d/key\" key || continue; \
+             mule_regular \"$d/rc\" rc || continue; \
+             rm -rf \"$d\" || mule_u \"cannot remove $d\"; \
+           done || exit 0; \
+           old=$(find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days}) \
+             || mule_u \"cannot list old jobs\"; \
+           [ -n \"$old\" ] || exit 0; \
+           mule_sessions; \
+           printf '%s\\n' \"$old\" | while IFS= read -r d; do \
+             [ -n \"$d\" ] || continue; \
              id=\"${{d##*/}}\"; \
-             printf '%s\\n' \"$live\" | grep -qx \"mule-$id\"; \
-             [ $? -eq 1 ] || continue; \
-             rm -rf \"$d\"; \
-           done; }}",
-        host.tmux_socket, host.keep_days
+             mule_absent \"$d/key\" key || continue; \
+             mule_regular \"$d/rc\" rc && continue; \
+             mule_regular \"$d/cmd\" cmd || continue; \
+             if mule_has \"mule-$id\" || mule_has \"watch-$id\"; then continue; fi; \
+             rm -rf \"$d\" || mule_u \"cannot remove $d\"; \
+           done ) 2>/dev/null",
+        prelude = crate::remote::PRELUDE,
+        socket = host.tmux_socket,
+        keep = host.keep_days,
     )
 }
 

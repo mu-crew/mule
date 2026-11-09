@@ -1216,9 +1216,6 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 host.host.as_deref(),
                 all || key_prefix.is_some(),
             )?;
-            if running {
-                rows.retain(|row| row.unknown.is_none() && matches!(row.state, State::Running));
-            }
             if let Some(prefix) = &key_prefix {
                 // A key that would not read may be the one asked for: "no
                 // match" there is not an answer, and a caller acting on it
@@ -1235,6 +1232,13 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 }
                 rows.retain(|row| prefix.matches(row.key.as_deref()));
                 hidden = 0;
+            }
+            // Filters narrow an answer; they run after the guards that decide
+            // whether there is one. `--running` first dropped the job whose key
+            // would not read, and the guard above then saw nothing to refuse
+            // (review of P7a, round 2).
+            if running {
+                rows.retain(|row| row.unknown.is_none() && matches!(row.state, State::Running));
             }
             print_jobs(
                 &rows,

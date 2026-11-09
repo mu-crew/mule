@@ -61,13 +61,24 @@ impl From {
     fn bytes_command(self, socket: &str, id: &JobId) -> String {
         match self {
             // Never the transcript as a fallback: raw redraw bytes are not a
-            // readable screen (TUI-jobs spec, `mule tail` contract).
+            // readable screen (TUI-jobs spec, `mule tail` contract). A live
+            // pane is captured; a pane that went between the session read
+            // and the capture leaves its saved screen, which is read only as
+            // a regular file. Anything else cannot tell.
             From::Screen => format!(
-                "tmux -L {socket} capture-pane -p -J -t mule-{id} 2>/dev/null || \
-                 cat $d/screen 2>/dev/null || true"
+                "if [ \"$alive\" = 1 ]; then \
+                   tmux -L {socket} capture-pane -p -J -t mule-{id} 2>/dev/null \
+                   || {{ mule_regular $d/screen screen && {{ cat $d/screen || mule_u \"cannot read $d/screen\"; }}; }} \
+                   || mule_u \"cannot capture mule-{id}\"; \
+                 elif mule_regular $d/screen screen; then \
+                   cat $d/screen || mule_u \"cannot read $d/screen\"; \
+                 fi"
             ),
             other => match other.tail_arg() {
-                Some(n) => format!("tail -c +{n} $d/log 2>/dev/null"),
+                Some(n) => format!(
+                    "if mule_regular $d/log log; then \
+                       tail -c +{n} $d/log || mule_u \"cannot read $d/log\"; fi"
+                ),
                 None => "true".to_string(),
             },
         }
@@ -86,77 +97,69 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     // job ending `exit 7` read as exit 5; `rc` held 7 a moment later), since
     // a loaded tmux client widens the gap. `list_script` reads the live set
     // first for the same reason.
-    // Absence is *seen*, not inferred, exactly as `rm <id>` proves it
-    // ([`crate::jobs::remove_one_script`]): `[ -d ]` is false behind an
-    // unsearchable parent, and `has-session` exits 1 for a tmux protocol
-    // mismatch or an unsafe socket directory as it does for a missing
-    // session. Each answer that rests on an absence -- `missing`, `orphan` --
-    // is therefore checked a second way, and a check that cannot tell prints
-    // `?` and a `why=` line. The second look costs a process only on those
-    // paths: a running job passes `has-session`, a finished one has `rc`.
-    // `missing` also needs `watch-<id>` gone, as `rm`'s proof does: a live
-    // watchdog means the job's state is not all gone.
+    // Fail closed (SPEC § Remote snippets fail closed, [`crate::remote`]):
+    // every external command's status is checked, and only a proof makes an
+    // absence. `missing` is `rm`'s proof -- the state dir seen not to exist,
+    // and neither `mule-<id>` nor `watch-<id>` in a session list tmux gave.
+    // `orphan` is a dir, no session, an `rc` seen not to exist and a `cmd`
+    // that does (a dir with no `cmd` is a keyed lease's claim not yet
+    // started). `done` is an `rc` read as a regular file whose whole content
+    // is a number. Everything else stops the script with `CANNOT_TELL`.
     //
-    // Every tool's own failure counts as "cannot tell", never as a no:
-    // `grep -Fxq` exits 1 for no match and 2 for an error, and reading the
-    // 2 as "not listed" called a job missing while its watchdog lived (review
-    // of P7a, an injected grep exit 2). An `rc` that exists but reads empty
-    // or not at all is unknown too, never an absent one: that made a
-    // finished job behind an unreadable `rc` an orphan. A state dir with no
-    // `cmd` is a keyed lease's claim whose dispatch has not run (or never
-    // will): no job is proven to exist or not, so that is unknown as well.
+    // One `list-sessions`, read before `rc` (see above), answers both
+    // session questions; `has-session` exits 1 for a protocol mismatch as
+    // for a missing session, so it was never a proof.
     let script = format!(
-        "d={dir}; why=; watch=0; rcread=1; \
-         if [ -d $d ]; then exists=1; else \
-           e=$(LC_ALL=C ls -d \"$d\" 2>&1); \
-           case $?:$e in \
-             0:*) exists='?'; why=\"state path $d is not a directory\";; \
-             *'No such file or directory'*) exists=0;; \
-             *) exists='?'; why=\"cannot verify state dir $d: $e\";; \
-           esac; \
-         fi; printf 'exists=%s\\n' \"$exists\"; \
-         alive=$(tmux -L {socket} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
-         rc=$(cat $d/rc 2>/dev/null); \
-         if [ -z \"$rc\" ] && [ -e $d/rc ]; then rcread=0; why=\"cannot read $d/rc\"; fi; \
-         printf 'rc=%s\\n' \"$rc\"; printf 'rcread=%s\\n' \"$rcread\"; \
-         if [ -e $d/cmd ]; then cmd=1; else cmd=0; fi; printf 'cmd=%s\\n' \"$cmd\"; \
-         if [ \"$alive\" = 0 ] && [ -z \"$rc\" ]; then \
-           out=$(tmux -L {socket} list-sessions -F '#{{session_name}}' 2>&1); \
-           if [ $? -eq 0 ]; then \
-             printf '%s\\n' \"$out\" | grep -Fxq mule-{id}; \
-             case $? in \
-               0) alive='?'; why=\"has-session and list-sessions disagree about mule-{id}\";; \
-               1) ;; \
-               *) alive='?'; why=\"cannot search the session list for mule-{id}\";; \
-             esac; \
-             printf '%s\\n' \"$out\" | grep -Fxq watch-{id}; \
-             case $? in \
-               0) watch=1;; \
-               1) ;; \
-               *) watch='?'; why=\"cannot search the session list for watch-{id}\";; \
-             esac; \
-           else \
-             case \"$out\" in \
-               {no_server}) ;; \
-               *) alive='?'; why=\"cannot verify session state: $out\";; \
-             esac; \
-           fi; \
+        "{prelude}\
+         mule_socket={socket}; d={dir}; \
+         if mule_absent $d \"state dir\"; then \
+           mule_sessions; \
+           if mule_has mule-{id} || mule_has watch-{id}; then \
+             mule_u \"the state dir is gone but a session for the job is not proven gone\"; fi; \
+           printf 'exists=0\\nrc=\\nalive=0\\nwatch=0\\nwhy=\\nruntime=\\nsize=0\\nbytes:\\n'; exit 0; \
          fi; \
-         printf 'alive=%s\\n' \"$alive\"; printf 'watch=%s\\n' \"$watch\"; \
-         printf 'why=%s\\n' \"$(printf %s \"$why\" | tr '\\n' ' ')\"; \
-         cmd_mtime=$(stat -c %Y $d/cmd 2>/dev/null || stat -f %m $d/cmd 2>/dev/null); \
-         if [ -n \"$rc\" ]; then end_mtime=$(stat -c %Y $d/rc 2>/dev/null || stat -f %m $d/rc 2>/dev/null); \
-         elif [ \"$alive\" = 1 ]; then end_mtime=$(date +%s); else end_mtime=; fi; \
-         if [ -n \"$cmd_mtime\" ] && [ -n \"$end_mtime\" ]; then runtime=$((end_mtime - cmd_mtime)); \
-           [ \"$runtime\" -lt 0 ] && runtime=0; else runtime=; fi; \
+         [ -d $d ] || mule_u \"state path $d is not a directory\"; \
+         printf 'exists=1\\n'; \
+         mule_sessions; alive=0; watch=0; \
+         if mule_has mule-{id}; then alive=1; fi; \
+         if mule_has watch-{id}; then watch=1; fi; \
+         rc=; \
+         if mule_regular $d/rc rc; then \
+           mule_read $d/rc rc; rc=$REPLY; \
+           case $rc in ''|*[!0-9]*) mule_u \"rc $d/rc is not a number: $rc\";; esac; \
+         elif [ $alive = 0 ]; then \
+           mule_regular $d/cmd cmd || mule_u \"the job is claimed by its key but has not started (no cmd)\"; \
+         fi; \
+         printf 'rc=%s\\nalive=%s\\nwatch=%s\\nwhy=\\n' \"$rc\" $alive $watch; \
+         runtime=; \
+         if mule_regular $d/cmd cmd; then \
+           mule_mtime $d/cmd; start=$REPLY; end=; \
+           if [ -n \"$rc\" ]; then mule_mtime $d/rc; end=$REPLY; \
+           elif [ $alive = 1 ]; then mule_now; end=$REPLY; fi; \
+           if [ -n \"$end\" ]; then runtime=$((end - start)); [ $runtime -lt 0 ] && runtime=0; fi; \
+         fi; \
          printf 'runtime=%s\\n' \"$runtime\"; \
-         printf 'size=%s\\n' \"$(wc -c < $d/log 2>/dev/null || echo 0)\"; \
+         mule_size $d/log log; printf 'size=%s\\n' $REPLY; \
          printf 'bytes:\\n'; {bytes}",
+        prelude = crate::remote::PRELUDE,
         socket = host.tmux_socket,
-        no_server = crate::jobs::NO_TMUX_SERVER,
         bytes = from.bytes_command(&host.tmux_socket, id)
     );
     let mut output = t.run(host, &script)?;
+    if output.code == crate::remote::CANNOT_TELL {
+        let why = output
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("mule: cannot tell: "))
+            .unwrap_or("the probe could not tell")
+            .trim()
+            .to_string();
+        return Err(MuleError::Unverifiable {
+            id: id.to_string(),
+            why,
+        }
+        .into());
+    }
     if output.code != 0 {
         bail!("probe failed: {}", output.stderr.trim());
     }

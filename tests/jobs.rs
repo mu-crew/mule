@@ -330,9 +330,10 @@ fn kill_records_rc_before_destroying_the_session() {
 fn prune_uses_two_horizons_and_never_touches_running_jobs() {
     let script = prune(&host());
 
-    // Finished jobs: the ordinary horizon.
+    // Finished jobs: the ordinary horizon, and a done job is one whose `rc`
+    // reads as a regular file.
     assert!(script.contains("-mtime +14"));
-    assert!(script.contains("-exec test -f '{}/rc'"));
+    assert!(script.contains("mule_regular \"$d/rc\" rc || continue"));
 
     // Orphans: kept four times as long, because an orphan is evidence -- but
     // bounded, since a disk-full incident leaves orphans holding the biggest
@@ -342,21 +343,27 @@ fn prune_uses_two_horizons_and_never_touches_running_jobs() {
         "orphans need a longer horizon"
     );
     assert!(
-        script.contains("-exec test ! -f '{}/rc'"),
+        script.contains("mule_regular \"$d/rc\" rc && continue"),
         "the second pass must select rc-LESS directories"
     );
     assert!(
-        script.contains("list-sessions"),
+        script.contains("mule_sessions") && script.contains("mule_has \"mule-$id\""),
         "a running job has no rc, so age alone would prune it; skip live sessions"
     );
+    // A keyed job is never pruned, and its key's absence must be proven.
+    assert_eq!(
+        script
+            .matches("mule_absent \"$d/key\" key || continue")
+            .count(),
+        2
+    );
 
-    assert!(script.contains("-exec rm -rf '{}'"));
+    assert!(script.contains("rm -rf \"$d\""));
     assert!(
-        !script.contains("log"),
+        !script.contains("/log"),
         "prune must not look at log contents"
     );
 
-    // A running job has no `rc`, so only the orphan pass can match it -- and
     // that pass must skip live sessions. Derive both horizons from the same
     // host config rather than restating them, so a change to keep_days cannot
     // silently narrow the gap.
@@ -383,18 +390,23 @@ fn rm_one_script_kills_both_sessions_then_verifies_before_claiming_success() {
 
     // Exit 0 is a proof, so the script must ask tmux again rather than trust
     // `kill-session`'s status, and must look at the directory after `rm -rf`.
-    let verify = script.find("list-sessions").expect("must verify sessions");
+    let verify = script.find("mule_sessions;").expect("must verify sessions");
     let last_kill = script.rfind("kill-session -t").unwrap();
     assert!(verify > last_kill, "verify after killing: {script}");
-    assert!(script.contains("grep -Fxq \"$s\""), "{script}");
-    assert!(script.contains("mule-abc123 watch-abc123"), "{script}");
+    assert!(script.contains("mule_has mule-abc123"), "{script}");
+    assert!(script.contains("mule_has watch-abc123"), "{script}");
     let rm = script.find("rm -rf").expect("must remove the dir");
-    let check = script.rfind("if probe;").expect("must re-check the dir");
+    let check = script
+        .rfind("mule_absent \"$d\"")
+        .expect("must re-check the dir");
     assert!(check > rm, "check the dir after removing it: {script}");
 
     // The old script ended in an unconditional `exit 0` that masked both.
     assert!(!script.contains("rm -rf $d && echo"), "{script}");
-    assert!(script.contains("exit 1"), "{script}");
+    assert!(
+        script.contains("mule_u_code=1"),
+        "a stop is rm's exit 1: {script}"
+    );
 }
 
 #[test]
@@ -402,17 +414,20 @@ fn rm_one_script_exits_one_when_tmux_cannot_be_queried() {
     let script = remove_one_script(&host(), &job_id());
 
     // `has-session` exits 1 for a protocol mismatch as it does for "no such
-    // session", so it cannot certify a stop. A failed list is absence only
-    // when tmux says there is no server; every other failure is unverifiable.
+    // session", so it cannot certify a stop. A failed list or kill is absence
+    // only when tmux says there is no server (or no such session); every
+    // other failure stops the script, through the prelude, with exit 1.
     assert!(!script.contains("has-session"), "{script}");
     assert!(script.contains("2>&1"), "stderr is the evidence: {script}");
     assert!(script.contains("'no server running'"), "{script}");
-    let unknown = script
-        .find("cannot verify session state: $out")
-        .expect("unverifiable tmux must be reported");
-    let absent = script.find("'no server running'").unwrap();
-    assert!(absent < unknown, "known absence is matched first: {script}");
-    assert!(script[unknown..].contains("exit 1"), "{script}");
+    assert!(
+        script.contains("cannot verify session state: $SESSIONS"),
+        "unverifiable tmux must be reported: {script}"
+    );
+    assert!(
+        script.contains("cannot verify session state: cannot kill"),
+        "{script}"
+    );
 }
 
 #[test]
@@ -421,18 +436,22 @@ fn rm_one_script_exits_one_when_the_state_dir_cannot_be_looked_up() {
 
     // `[ -d ]` is false for a directory behind an unsearchable parent, so it
     // would read "cannot look" as "missing". Only a "No such file" error is
-    // absence.
+    // absence: `mule_absent`, `ls -d`.
     assert!(!script.contains("[ -d \"$d\" ]"), "{script}");
     assert!(!script.contains("[ -e \"$d\" ]"), "{script}");
-    assert!(script.contains("ls -d \"$d\""), "{script}");
+    assert!(script.contains("ls -d \"$1\""), "{script}");
     assert!(
-        script.contains("*'No such file or directory'*) return 1"),
+        script.contains("*'No such file or directory'*) return 0"),
         "{script}"
     );
-    let unverifiable = script
-        .find("cannot verify state dir $d")
-        .expect("unverifiable path must be reported");
-    assert!(script[unverifiable..].contains("exit 1"), "{script}");
+    assert!(
+        script.contains("mule_absent \"$d\" \"state dir\""),
+        "{script}"
+    );
+    assert!(
+        script.contains("cannot verify ${2:-path} $1"),
+        "unverifiable path must be reported: {script}"
+    );
 }
 
 #[test]

@@ -49,6 +49,17 @@ key, and a cancel that stays inside the caller's process group.
 
 ### Fixed
 
+- **Remote snippets fail closed, by one rule and one prelude** (SPEC § Remote
+  snippets fail closed). The probe, `ls`, prune, `rm`'s proof, the key lookup
+  and the claim now start with shared shell helpers that check every external
+  command's status and output, refuse symlinked keys and `rc`, and answer an
+  absence only on proof. `tests/fault_injection.rs` fails every external
+  command of every one of those snippets in four modes and holds each verb
+  to it. Round 2 of the review, all red in that harness before: a failed
+  `test -e key` let prune delete a keyed job (and the key then ran again); a
+  symlinked unreadable key was skipped by the lookup and the listing; `ls
+  --running --key-prefix` dropped the unreadable-key row before the guard; a
+  `cat` that printed `1` then failed was taken as rc 1.
 - Review of the plugin surface (each with a regression test in
   `tests/regressions_p7a.rs`):
   - A failing tool is never a proven absence. `poll --json` read a `grep`

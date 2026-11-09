@@ -148,7 +148,7 @@ fn a_dispatch_whose_key_exists_returns_that_job() {
     // before tmux can start anything.
     let script = &scripts[0];
     let look = script.find("awk -v k=k1").expect("looks up the key");
-    let bail = script.find("then exit 0").expect("stops on a hit");
+    let bail = look + script[look..].find("then exit 0").expect("stops on a hit");
     let write = script.find("printf '%s\\n' k1 >").expect("writes $d/key");
     let start = script.find("new-session").expect("starts the job");
     assert!(look < bail && bail < write && write < start, "{script}");

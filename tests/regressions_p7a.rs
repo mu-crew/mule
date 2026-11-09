@@ -86,12 +86,15 @@ fn a_failing_grep_never_proves_a_session_gone() {
 
     assert_eq!(poll.status.code(), Some(0), "{}", stderr(&poll));
     assert_eq!(json(&poll)["state"], "unknown", "{}", stdout(&poll));
-    assert_eq!(
-        rm.status.code(),
-        Some(1),
-        "rm must not prove a stop it could not check: {}",
-        stderr(&rm)
-    );
+    // rm no longer asks grep (a `case` cannot fail): it kills the watchdog
+    // and proves it gone. Whatever it answers must be true.
+    if rm.status.success() {
+        assert!(
+            !host.tmux.has_session("watch-abc123"),
+            "rm claimed a stop it did not make: {}",
+            stderr(&rm)
+        );
+    }
 }
 
 #[test]

@@ -153,8 +153,12 @@ pub fn dispatch_keyed(
         ),
         None => (String::new(), String::new()),
     };
+    // The count is advisory (a warning, never a state answer), so a count
+    // that cannot be taken is `?` and no warning, not a failed dispatch: the
+    // job has started by then.
     let script = format!(
-        "{}; {claim}{write_key}{} && {{ tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null | grep -c '^mule-' || true; }}",
+        "{}; {claim}{write_key}{} && {{ n=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null) \
+           && printf '%s\\n' \"$n\" | awk '/^mule-/ {{ c++ }} END {{ print c + 0 }}' || echo '?'; }}",
         crate::jobs::prune(host),
         dispatch_script(host, &job),
         host.tmux_socket
@@ -178,14 +182,21 @@ pub fn dispatch_keyed(
     {
         return Ok(Dispatched::Existing(existing));
     }
-    let running: u32 = text
+    let count = text
         .lines()
         .filter(|line| !line.starts_with("existing="))
-        .collect::<String>()
-        .trim()
-        .parse()
-        .context("invalid running-session count in dispatch reply")?;
-    if running > host.max_running {
+        .collect::<String>();
+    let running: Option<u32> = match count.trim() {
+        "?" => None,
+        other => Some(
+            other
+                .parse()
+                .context("invalid running-session count in dispatch reply")?,
+        ),
+    };
+    if let Some(running) = running
+        && running > host.max_running
+    {
         writeln!(
             warnings,
             "mule: dispatched {}; {running} now running on {}, cap {}",
@@ -280,25 +291,26 @@ pub fn lookup(transport: &dyn Transport, host: &Host, key: &JobKey) -> Result<Op
 /// exist (`No such file or directory`) is no hit.
 fn key_lookup_script(key: &JobKey) -> String {
     format!(
-        "hit=; root={JOBS_ROOT}; \
-         if [ ! -d \"$root\" ]; then \
-           e=$(LC_ALL=C ls -d \"$root\" 2>&1); \
-           case $?:$e in \
-             *'No such file or directory'*) ;; \
-             *) echo \"cannot verify jobs root $root: $e\" >&2; exit 1;; \
-           esac; \
-         else \
-           hit=$( {{ find \"$root\" -mindepth 2 -maxdepth 2 -type f -name key 2>/dev/null \
-                     || echo //find-failed; }} \
-                 | awk -v k={key} '\
-                     $0 == \"//find-failed\" {{ bad = 1; next }} \
-                     {{ f = $0; l = \"\"; if ((getline l < f) <= 0 || l == \"\") {{ bad = 1; next }} close(f); \
-                       if ((l \"\") == (k \"\")) {{ id = f; sub(/\\/key$/, \"\", id); sub(/.*\\//, \"\", id); \
-                                      print \"existing=\" id }} }} \
-                     END {{ exit bad ? 2 : 0 }}'); \
-           if [ $? -ne 0 ]; then echo \"cannot read the job keys under $root\" >&2; exit 1; fi; \
+        "{prelude}hit=; root={JOBS_ROOT}; \
+         if mule_absent \"$root\" \"jobs root\"; then :; else \
+           [ -d \"$root\" ] || mule_u \"jobs root $root is not a directory\"; \
+           odd=$(find \"$root\" -mindepth 2 -maxdepth 2 -name key ! -type f) \
+             || mule_u \"cannot search the job keys under $root\"; \
+           [ -z \"$odd\" ] || mule_u \"a job key is not a regular file: $odd\"; \
+           keys=$(find \"$root\" -mindepth 2 -maxdepth 2 -name key -type f) \
+             || mule_u \"cannot search the job keys under $root\"; \
+           if [ -n \"$keys\" ]; then \
+             hit=$(printf '%s\\n' \"$keys\" | awk -v k={key} '\
+                 $0 == \"\" {{ next }} \
+                 {{ f = $0; l = \"\"; if ((getline l < f) <= 0 || l == \"\") {{ bad = 1; next }} close(f); \
+                   if ((l \"\") == (k \"\")) {{ id = f; sub(/\\/key$/, \"\", id); sub(/.*\\//, \"\", id); \
+                                  print \"existing=\" id }} }} \
+                 END {{ exit bad ? 2 : 0 }}') \
+               || mule_u \"cannot read the job keys under $root\"; \
+           fi; \
            if [ -n \"$hit\" ]; then printf '%s\\n' \"$hit\"; fi; \
-         fi;"
+         fi;",
+        prelude = crate::remote::PRELUDE,
     )
 }
 
