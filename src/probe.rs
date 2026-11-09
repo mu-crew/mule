@@ -96,8 +96,17 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     // paths: a running job passes `has-session`, a finished one has `rc`.
     // `missing` also needs `watch-<id>` gone, as `rm`'s proof does: a live
     // watchdog means the job's state is not all gone.
+    //
+    // Every tool's own failure counts as "cannot tell", never as a no:
+    // `grep -Fxq` exits 1 for no match and 2 for an error, and reading the
+    // 2 as "not listed" called a job missing while its watchdog lived (review
+    // of P7a, an injected grep exit 2). An `rc` that exists but reads empty
+    // or not at all is unknown too, never an absent one: that made a
+    // finished job behind an unreadable `rc` an orphan. A state dir with no
+    // `cmd` is a keyed lease's claim whose dispatch has not run (or never
+    // will): no job is proven to exist or not, so that is unknown as well.
     let script = format!(
-        "d={dir}; why=; watch=0; \
+        "d={dir}; why=; watch=0; rcread=1; \
          if [ -d $d ]; then exists=1; else \
            e=$(LC_ALL=C ls -d \"$d\" 2>&1); \
            case $?:$e in \
@@ -107,13 +116,25 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
            esac; \
          fi; printf 'exists=%s\\n' \"$exists\"; \
          alive=$(tmux -L {socket} has-session -t mule-{id} 2>/dev/null && echo 1 || echo 0); \
-         rc=$(cat $d/rc 2>/dev/null); printf 'rc=%s\\n' \"$rc\"; \
+         rc=$(cat $d/rc 2>/dev/null); \
+         if [ -z \"$rc\" ] && [ -e $d/rc ]; then rcread=0; why=\"cannot read $d/rc\"; fi; \
+         printf 'rc=%s\\n' \"$rc\"; printf 'rcread=%s\\n' \"$rcread\"; \
+         if [ -e $d/cmd ]; then cmd=1; else cmd=0; fi; printf 'cmd=%s\\n' \"$cmd\"; \
          if [ \"$alive\" = 0 ] && [ -z \"$rc\" ]; then \
            out=$(tmux -L {socket} list-sessions -F '#{{session_name}}' 2>&1); \
            if [ $? -eq 0 ]; then \
-             if printf '%s\\n' \"$out\" | grep -Fxq mule-{id}; then \
-               alive='?'; why=\"has-session and list-sessions disagree about mule-{id}\"; fi; \
-             if printf '%s\\n' \"$out\" | grep -Fxq watch-{id}; then watch=1; fi; \
+             printf '%s\\n' \"$out\" | grep -Fxq mule-{id}; \
+             case $? in \
+               0) alive='?'; why=\"has-session and list-sessions disagree about mule-{id}\";; \
+               1) ;; \
+               *) alive='?'; why=\"cannot search the session list for mule-{id}\";; \
+             esac; \
+             printf '%s\\n' \"$out\" | grep -Fxq watch-{id}; \
+             case $? in \
+               0) watch=1;; \
+               1) ;; \
+               *) watch='?'; why=\"cannot search the session list for watch-{id}\";; \
+             esac; \
            else \
              case \"$out\" in \
                {no_server}) ;; \
@@ -152,7 +173,9 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let mut exists = None;
     let mut rc = None;
     let mut alive = None;
-    let mut watch = false;
+    let mut watch = Seen::No;
+    let mut rc_read = true;
+    let mut has_cmd = true;
     let mut why = String::new();
     let mut runtime_secs = None;
     let mut log_size = None;
@@ -166,7 +189,11 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         } else if let Some(value) = line.strip_prefix("alive=") {
             alive = Some(Seen::parse(value));
         } else if let Some(value) = line.strip_prefix("watch=") {
-            watch = value == "1";
+            watch = Seen::parse(value);
+        } else if let Some(value) = line.strip_prefix("rcread=") {
+            rc_read = value != "0";
+        } else if let Some(value) = line.strip_prefix("cmd=") {
+            has_cmd = value != "0";
         } else if let Some(value) = line.strip_prefix("why=") {
             why = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("runtime=") {
@@ -198,8 +225,11 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let alive_now = matches!(alive, Some(Seen::Yes | Seen::Unknown));
     let state = match (exists, rc) {
         (Seen::Unknown, _) => return Err(unverifiable("the state dir could not be checked")),
+        (Seen::Yes, _) if !rc_read => {
+            return Err(unverifiable("the job's rc could not be read"));
+        }
         (Seen::No, _) => {
-            if alive != Some(Seen::No) || watch {
+            if alive != Some(Seen::No) || watch != Seen::No {
                 return Err(unverifiable(
                     "the state dir is gone but a session for the job is not proven gone",
                 ));
@@ -209,6 +239,12 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         (Seen::Yes, Some(code)) => State::Done(code),
         (Seen::Yes, None) => match alive.context("invalid probe reply: missing alive")? {
             Seen::Yes => State::Running,
+            // Not started: no `cmd`, so this is a claim, not a job that died.
+            Seen::No if !has_cmd => {
+                return Err(unverifiable(
+                    "the job is claimed by its key but has not started (no cmd)",
+                ));
+            }
             Seen::No => State::Orphan,
             Seen::Unknown => return Err(unverifiable("the session could not be checked")),
         },

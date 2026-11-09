@@ -245,24 +245,64 @@ fn a_keyed_lease_with_no_hit_names_its_job_before_the_keyed_dispatch() {
 }
 
 #[test]
-fn a_key_taken_between_lookup_and_dispatch_fails_and_never_retargets_the_job_file() {
-    // Another client started K between this lease's lookup and its dispatch.
-    // The job file already names the fresh id, which mu may have read;
-    // swapping it under mu would be worse than failing. The fresh id was
-    // never dispatched, so its stop is a no-op.
+fn a_lease_whose_claim_finds_the_key_held_names_only_the_holder() {
+    // The loser of a race between two keyed leases: its claim finds the
+    // winner's claim, whose dispatch has not run yet (a state dir with a key
+    // and no `cmd`, which probes `unknown`). It holds that job; its job file
+    // never names an id of its own (review of P7a: it used to name a fresh
+    // id that was never dispatched, and exit 1).
     let (dir, fake) = (scratch("keys-lease"), Fake::new());
-    fake.push(Output::ok(""))
-        .push(Output::ok("existing=ffff00\n"));
+    fake.push(Output::ok("existing=ffff00\n")).push(Output::ok(
+        "exists=1\nrc=\nrcread=1\ncmd=0\nalive=0\nwatch=0\nwhy=\nsize=0\nbytes:\n",
+    ));
 
-    let error = lease_start(&fake, &dir, &key("k6")).unwrap_err();
+    let owned = lease_start(&fake, &dir, &key("k6")).unwrap();
 
-    let text = format!("{error:#}");
-    assert!(
-        text.contains("ffff00") && text.contains("never dispatched"),
-        "{text}"
+    assert_eq!(owned.id, id("ffff00"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("w.job")).unwrap(),
+        "ffff00\n"
     );
-    let named = std::fs::read_to_string(dir.join("w.job")).unwrap();
-    assert_ne!(named.trim(), "ffff00", "the job file is not retargeted");
+    let scripts = fake.scripts();
+    assert_eq!(scripts.len(), 2, "the claim and one probe");
+    assert!(scripts.iter().all(|s| !s.contains("new-session")));
+}
+
+#[test]
+fn a_claim_is_made_before_the_job_file_and_the_dispatch_starts_its_own_claim() {
+    let (dir, fake) = (scratch("keys-lease"), Fake::new());
+    // The claim finds nothing; the dispatch's key check finds the claim.
+    fake.push(Output::ok(""));
+    let file = dir.join("w.job");
+    let owned = mule::lease::start_keyed(
+        &fake,
+        &host(),
+        &file,
+        &dir.join("stopping"),
+        &request(),
+        Some(&key("k6b")),
+        &|owned| {
+            if let Some(owned) = owned {
+                fake.push(Output::ok(format!("existing={}\n1\n", owned.id)));
+            }
+        },
+        &mut std::io::sink(),
+    )
+    .unwrap();
+
+    let scripts = fake.scripts();
+    assert_eq!(scripts.len(), 2);
+    assert!(
+        scripts[0].contains(&format!("jobs/{}/key", owned.id))
+            && !scripts[0].contains("new-session"),
+        "the claim writes the key and starts nothing: {}",
+        scripts[0]
+    );
+    assert!(scripts[1].contains("new-session"), "then the dispatch");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("{}\n", owned.id)
+    );
 }
 
 #[test]

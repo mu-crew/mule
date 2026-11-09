@@ -145,7 +145,10 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     // not race: a torn-down session is gone before its panes are hung up,
     // and a job that ends by itself is still in it. A trap cannot do this:
     // bash 3.2 ran `trap ... HUP` only after the write. The write goes
-    // through a temp file and a rename, so no reader sees it half done.
+    // through a temp file and a rename, so no reader sees it half done: the
+    // probe reads an `rc` that exists but is empty as `unknown`, so every
+    // writer here (job, watchdog, TUI wrapper) renames. `kill`'s write runs
+    // inside its locked call, where no mule probe can see it.
     let record = |code: &str| {
         format!(
             "if [ ! -f {dir}/rc ] && tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
@@ -167,7 +170,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
         // the job path, so a concurrent kill's 137 is not overwritten.
         let watchdog = format!(
             "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
-             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
+             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc.wd && mv -f {dir}/rc.wd {dir}/rc; fi; \
              tmux -L {socket} kill-session -t mule-{id}; fi",
             socket = host.tmux_socket,
             id = job.id,
@@ -240,7 +243,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     } else {
         let body = format!(
             "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
-             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc; fi; \
+             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc.wd && mv -f {dir}/rc.wd {dir}/rc; fi; \
              tmux -L {socket} kill-session -t mule-{id}; fi",
             socket = host.tmux_socket,
             id = job.id,
@@ -262,7 +265,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
          while [ ! -f \"$job_dir/.pipe-done\" ]; do sleep 0.01; done; \
          rm -f \"$job_dir/.pipe-done\"; \
          tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
-         if [ ! -f \"$job_dir/rc\" ]; then echo $rc > \"$job_dir/rc\"; fi",
+         if [ ! -f \"$job_dir/rc\" ]; then echo $rc > \"$job_dir/rc.tmp\" && mv -f \"$job_dir/rc.tmp\" \"$job_dir/rc\"; fi",
         socket = host.tmux_socket,
         id = job.id,
     );

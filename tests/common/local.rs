@@ -196,7 +196,8 @@ pub fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
 /// here: layer 2 for a whole verb, its CLI and exit codes included.
 ///
 /// mule's own `Command::new("ssh")` finds the shim, which answers every mux
-/// op as a live master (or as none, while [`ShimHost::master_down`] holds) and
+/// op (an argument that is exactly `-O`; a TUI dispatch script contains
+/// ` -O ` too, as `pipe-pane -O`) as a live master (or as none, while [`ShimHost::master_down`] holds) and
 /// runs the script -- ssh's last argument -- under `sh`. Remote and local
 /// state are then the same directory, `state`, as on the loopback sshd.
 pub struct ShimHost {
@@ -218,10 +219,9 @@ impl ShimHost {
             &shim,
             format!(
                 "#!/bin/sh\n\
-                 case \" $* \" in *\" -O \"*)\n\
+                 for arg; do if [ \"$arg\" = -O ]; then\n\
                    [ -e '{down}' ] && {{ echo 'Control socket connect: No such file or directory' >&2; exit 255; }}\n\
-                   echo 'Master running (pid=1)' >&2; exit 0;;\n\
-                 esac\n\
+                   echo 'Master running (pid=1)' >&2; exit 0; fi; done\n\
                  [ -e '{down}' ] && exit 255\n\
                  for last; do :; done\n\
                  exec sh -c \"$last\"\n",

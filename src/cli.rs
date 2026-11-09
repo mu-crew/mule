@@ -58,6 +58,10 @@ struct JobJson<'a> {
     /// keys existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<&'a str>,
+    /// Why the state is `unknown`: an artifact that exists but would not
+    /// read. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
 }
 
 /// `poll --json`: one of five states, always exit 0 (no master is still 3).
@@ -1213,9 +1217,22 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 all || key_prefix.is_some(),
             )?;
             if running {
-                rows.retain(|row| matches!(row.state, State::Running));
+                rows.retain(|row| row.unknown.is_none() && matches!(row.state, State::Running));
             }
             if let Some(prefix) = &key_prefix {
+                // A key that would not read may be the one asked for: "no
+                // match" there is not an answer, and a caller acting on it
+                // would start the effect again.
+                if let Some(row) = rows.iter().find(|row| row.key_unreadable) {
+                    anyhow::bail!(
+                        "cannot read the key of job {} on {}, so the lookup cannot be answered\n  \
+                         fix its permissions, or remove it: mule rm --host {} {}",
+                        row.id,
+                        row.host,
+                        row.host,
+                        row.id
+                    );
+                }
                 rows.retain(|row| prefix.matches(row.key.as_deref()));
                 hidden = 0;
             }
@@ -1412,12 +1429,14 @@ fn print_jobs(
             .iter()
             .map(|row| {
                 let (state, rc) = match row.state {
+                    _ if row.unknown.is_some() => ("unknown", None),
                     State::Running => ("running", None),
                     State::Done(code) => ("done", Some(code)),
                     State::Orphan => ("orphan", None),
                     State::Missing => ("missing", None),
                 };
                 JobJson {
+                    reason: row.unknown.as_deref(),
                     id: &row.id,
                     host: &row.host,
                     state,
@@ -1479,6 +1498,7 @@ fn print_jobs(
             .iter()
             .map(|row| {
                 let (state, rc) = match row.state {
+                    _ if row.unknown.is_some() => ("unknown", "-".to_string()),
                     State::Running => ("running", "-".to_string()),
                     State::Done(code) => ("done", code.to_string()),
                     State::Orphan => ("orphan", "-".to_string()),

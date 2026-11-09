@@ -352,23 +352,22 @@ pub fn start(
 /// [`start`] with a caller key (`run --lease --key K`): a job that already
 /// holds `key` is held instead of a new one started.
 ///
-/// The job file must name the job before any dispatch, so the key is looked
-/// up first, in its own locked round trip:
+/// The job file must only ever name a job that holds the key, so the key is
+/// claimed first ([`crate::run::claim`]), in one locked round trip, before
+/// the job file is written:
 ///
-/// - **found:** that job is owned as [`attach`] owns one -- the fence lock, a
-///   probe, the job file published without replacing anything, the fence
-///   bumped -- except that any state is accepted. A finished job is the
-///   answer to "start the effect with key K": the hold then reports its end
-///   (final screen, its code) as it would have for the first carrier.
-///   `on_dispatch` is called with the owned job and then `None` inside the
-///   fence lock, bracketing no dispatch: it only names the job for the
-///   signal path, before an old carrier's stop can run again.
-/// - **not found:** exactly [`start`], with the dispatch re-checking the key
-///   in its own round trip. If the key appeared in between (another client
-///   started it), nothing is dispatched and this is an error: the job file
-///   already names this lease's fresh id, and retargeting a handle mu may
-///   have read is worse than failing. That id was never dispatched, so its
-///   stop is a no-op, and a lookup by key finds the job that won.
+/// - **held by another job:** that job is owned as [`attach`] owns one --
+///   the fence lock, a probe, the job file published without replacing
+///   anything, the fence bumped -- except that any state is accepted,
+///   `unknown` included (a claim whose dispatch is still to come). A finished
+///   job is the answer to "start the effect with key K": the hold reports how
+///   it ended. This is also the loser of a race between two keyed leases:
+///   the claim is serialised by the ticket lock, so the second sees the
+///   first's claim and holds that job. `on_dispatch` is called with the
+///   owned job and then `None` inside the fence lock, bracketing no
+///   dispatch: it only names the job for the signal path.
+/// - **claimed:** exactly [`start`]: the job file names the fresh id, then
+///   the dispatch, whose key check finds this job's own claim and starts it.
 #[allow(clippy::too_many_arguments)] // `start`'s seam, plus the key.
 pub fn start_keyed(
     t: &dyn Transport,
@@ -380,29 +379,41 @@ pub fn start_keyed(
     on_dispatch: &dyn Fn(Option<&Owned>),
     warnings: &mut dyn Write,
 ) -> Result<Owned> {
-    if let Some(key) = key
-        && let Some(existing) = crate::run::lookup(t, host, key)?
-    {
-        return own_existing(
-            t,
-            host,
-            &existing,
-            job_file,
-            &StopFence::in_dir(fences, &existing),
-            &|owned| {
-                on_dispatch(Some(owned));
-                on_dispatch(None);
-            },
-            Require::AnyState,
-        );
-    }
     let id: JobId = new_id().parse().expect("generated ids are valid");
     // Almost always missing (0) for a fresh id; read anyway, since a reused
-    // id's leftover fence is exactly what the number must match.
+    // id's leftover fence is exactly what the number must match. Read before
+    // the claim, so a failure here leaves nothing on the host.
     let fence_gen = StopFence::in_dir(fences, &id)
         .generation_unlocked()
         .context("cannot own the job's stop fence; nothing was dispatched")?;
-    write_job_file(job_file, &id)?;
+    if let Some(key) = key {
+        match crate::run::claim(t, host, &id, key)? {
+            crate::run::Claim::Held(existing) => {
+                return own_existing(
+                    t,
+                    host,
+                    &existing,
+                    job_file,
+                    &StopFence::in_dir(fences, &existing),
+                    &|owned| {
+                        on_dispatch(Some(owned));
+                        on_dispatch(None);
+                    },
+                    Require::AnyState,
+                );
+            }
+            crate::run::Claim::Claimed => {}
+        }
+    }
+    if let Err(error) = write_job_file(job_file, &id) {
+        // Nothing names the claim, so take it back rather than leave the key
+        // held by a job that will never start. Best effort: a claim left
+        // behind is still found by its key, and polls `unknown`.
+        if key.is_some() {
+            let _ = crate::jobs::remove(t, host, &crate::jobs::Target::One(id.clone()));
+        }
+        return Err(error);
+    }
     let owned = Owned { id, fence_gen };
     on_dispatch(Some(&owned));
     let dispatched = crate::run::dispatch_keyed(
@@ -420,12 +431,13 @@ pub fn start_keyed(
     on_dispatch(None);
     match dispatched? {
         Dispatched::New(_) => Ok(owned),
+        // The claim made the key this job's, so only a second client
+        // claiming it at the same moment gets here.
         Dispatched::Existing(other) => anyhow::bail!(
-            "key {} was taken by job {other} while this lease started; \
-             job {} in {} was never dispatched",
+            "key {} is held by job {other} as well as by this lease's claim, job {}; \
+             nothing was dispatched",
             key.map(JobKey::as_str).unwrap_or_default(),
             owned.id,
-            job_file.display()
         ),
     }
 }
@@ -484,9 +496,22 @@ fn own_existing(
     let mut lock = fence.lock()?;
     // Flattened to text: a probe that fails is exit 1 for an attach whatever
     // the cause (spec step 3), not the code its error would map to elsewhere.
-    let state = probe(t, host, id, ProbeFrom::StateOnly)
-        .map_err(|error| anyhow::anyhow!("cannot probe job {id}: {error:#}"))?
-        .state;
+    let state = match probe(t, host, id, ProbeFrom::StateOnly) {
+        Ok(probed) => probed.state,
+        // A keyed lease holds whatever its key names, an unproven state
+        // included: a claim whose dispatch is still to come reads `unknown`,
+        // and the hold keeps probing until it is told.
+        Err(error)
+            if require == Require::AnyState
+                && matches!(
+                    error.downcast_ref::<MuleError>(),
+                    Some(MuleError::Unverifiable { .. })
+                ) =>
+        {
+            State::Running
+        }
+        Err(error) => anyhow::bail!("cannot probe job {id}: {error:#}"),
+    };
     let state = match state {
         State::Running => None,
         _ if require == Require::AnyState => None,

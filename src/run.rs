@@ -139,9 +139,12 @@ pub fn dispatch_keyed(
     // holds it.
     let (claim, write_key) = match key {
         Some(key) => (
+            // A hit on this job's own id is its claim (`claim`, from a keyed
+            // lease): start it. Any other hit is the job holding the key.
             format!(
-                "{} if [ -n \"$hit\" ]; then exit 0; fi; ",
-                key_lookup_script(key)
+                "{} if [ -n \"$hit\" ] && [ \"$hit\" != \"existing={}\" ]; then exit 0; fi; ",
+                key_lookup_script(key),
+                job.id
             ),
             format!(
                 "mkdir -p {dir} && printf '%s\\n' {key} > {dir}/key && ",
@@ -171,10 +174,14 @@ pub fn dispatch_keyed(
     let text = output.text();
     if let Some(key) = key
         && let Some(existing) = parse_hits(key, &text)?
+        && existing != job.id
     {
         return Ok(Dispatched::Existing(existing));
     }
     let running: u32 = text
+        .lines()
+        .filter(|line| !line.starts_with("existing="))
+        .collect::<String>()
         .trim()
         .parse()
         .context("invalid running-session count in dispatch reply")?;
@@ -187,6 +194,49 @@ pub fn dispatch_keyed(
     }
 
     Ok(Dispatched::New(job.id))
+}
+
+/// What a keyed lease's claim found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// The key was free; it is now `id`'s: `$d/key` exists, nothing started.
+    Claimed,
+    /// Another job holds the key.
+    Held(JobId),
+}
+
+/// Claim `key` for `id` before anything names `id`: one locked round trip
+/// that looks the key up and, only if it is free, makes `id`'s state dir and
+/// writes its `key`. Nothing is started.
+///
+/// For `run --lease --key`, whose job file must never name a job that does
+/// not hold its key. Two keyed leases that both looked first and wrote their
+/// job files after (review of P7a) both found the key free; the second's
+/// dispatch then found the first's job, and its job file already named an id
+/// that would never run. Claimed first, under the ticket lock, the loser
+/// sees the winner here and names only it. A claim whose dispatch never
+/// comes (the lease died in between) is a state dir with a key and no
+/// `cmd`: findable by the key, and `unknown`, never `missing`, to `poll`.
+pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -> Result<Claim> {
+    crate::errors::require_master(transport, host)?;
+    let dir = crate::wrapper::state_dir(id);
+    let script = format!(
+        "{} if [ -n \"$hit\" ]; then exit 0; fi; \
+         mkdir -p {dir} && printf '%s\\n' {key} > {dir}/key",
+        key_lookup_script(key)
+    );
+    let output = transport.run(host, &script)?;
+    if output.code != 0 {
+        bail!(
+            "claiming key {key} on {} failed: {}",
+            host.name,
+            output.stderr.trim()
+        );
+    }
+    Ok(match parse_hits(key, &output.text())? {
+        Some(holder) => Claim::Held(holder),
+        None => Claim::Claimed,
+    })
 }
 
 /// The job holding `key` on `host`, if any: one locked round trip.
@@ -212,28 +262,38 @@ pub fn lookup(transport: &dyn Transport, host: &Host, key: &JobKey) -> Result<Op
 /// One `find` and one `awk` over every job's `key` file, however many jobs
 /// there are: a per-job loop forking `cat` is the shape that took `ls` to
 /// 14.1s at 300 jobs (SPEC § Listing). awk compares each file's first line
-/// with the key exactly; the key's alphabet ([`JobKey`]) leaves nothing to
-/// quote or escape.
+/// with the key exactly and as a string: `l == k` alone compares two
+/// numeric-looking values as numbers, so `01` and `1` (or `1e0` and `1`)
+/// were one key and the second caller's command never ran (review of P7a).
+/// Concatenating `""` forces string comparison in every POSIX awk. The key's
+/// alphabet ([`JobKey`]) leaves nothing to quote or escape.
 ///
 /// No glob: the remote shell is the user's login shell, and zsh aborts a
 /// command whose glob matches nothing (`no matches found`), which is every
 /// first dispatch -- measured over the loopback sshd, whose user's shell is
 /// zsh. `find` has no such case.
 ///
-/// A key that cannot be checked refuses: a `key` file awk cannot open, or a
-/// `find` that failed, exits 2 and fails the script, because "no hit" there
-/// would start a second job for an effect that may already exist. A jobs
-/// root that does not exist yet is simply no hit.
+/// A key that cannot be checked refuses: a `key` file awk cannot open or
+/// that reads empty, a `find` that failed, or a jobs root that cannot be
+/// looked at fails the script, because "no hit" there would start a second
+/// job for an effect that may already exist. Only a jobs root seen not to
+/// exist (`No such file or directory`) is no hit.
 fn key_lookup_script(key: &JobKey) -> String {
     format!(
         "hit=; root={JOBS_ROOT}; \
-         if [ -d \"$root\" ]; then \
+         if [ ! -d \"$root\" ]; then \
+           e=$(LC_ALL=C ls -d \"$root\" 2>&1); \
+           case $?:$e in \
+             *'No such file or directory'*) ;; \
+             *) echo \"cannot verify jobs root $root: $e\" >&2; exit 1;; \
+           esac; \
+         else \
            hit=$( {{ find \"$root\" -mindepth 2 -maxdepth 2 -type f -name key 2>/dev/null \
                      || echo //find-failed; }} \
                  | awk -v k={key} '\
                      $0 == \"//find-failed\" {{ bad = 1; next }} \
-                     {{ f = $0; l = \"\"; if ((getline l < f) < 0) {{ bad = 1; next }} close(f); \
-                       if (l == k) {{ id = f; sub(/\\/key$/, \"\", id); sub(/.*\\//, \"\", id); \
+                     {{ f = $0; l = \"\"; if ((getline l < f) <= 0 || l == \"\") {{ bad = 1; next }} close(f); \
+                       if ((l \"\") == (k \"\")) {{ id = f; sub(/\\/key$/, \"\", id); sub(/.*\\//, \"\", id); \
                                       print \"existing=\" id }} }} \
                      END {{ exit bad ? 2 : 0 }}'); \
            if [ $? -ne 0 ]; then echo \"cannot read the job keys under $root\" >&2; exit 1; fi; \

@@ -49,6 +49,25 @@ key, and a cancel that stays inside the caller's process group.
 
 ### Fixed
 
+- Review of the plugin surface (each with a regression test in
+  `tests/regressions_p7a.rs`):
+  - A failing tool is never a proven absence. `poll --json` read a `grep`
+    error (exit 2) as "session not listed" and answered `missing` while
+    `watch-<id>` lived; `rm` "proved" the same stop; prune could delete a
+    running job's state. All now treat it as cannot-tell (`unknown`, exit 1,
+    or spare the directory). An `rc` that exists but will not read is
+    `unknown`, not an orphan, and every `rc` writer renames into place.
+  - `ls --key-prefix` with a `key` file that will not read exits 1 naming the
+    job, instead of an empty answer; plain `ls` shows that row as `unknown`,
+    and a keyed dispatch refuses. A `find` that fails fails the listing.
+  - Keys compare as strings: awk compared `01` and `1` as numbers, so the
+    second caller's command never ran.
+  - A keyed lease claims its key before writing its job file, so two racing
+    leases both hold the one job and name it; the loser used to exit 1 with
+    a job file naming an id that never ran. A claim not yet started polls
+    `unknown`.
+  - Prune never removes a keyed job: a finished keyed job past `keep_days`
+    was pruned by the next dispatch, and its key ran the effect again.
 - A job whose session was torn down from outside could still write its rc:
   129 over `mule kill`'s 137, 129 in place of an orphan, or an empty `rc`
   that made `kill` fail with "invalid exit code". The hangup does not kill a

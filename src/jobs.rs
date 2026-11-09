@@ -27,6 +27,11 @@ pub struct Row {
     pub cmd: String,
     /// The caller key the job was dispatched with (`run --key`), if any.
     pub key: Option<String>,
+    /// The job has a `key` file that could not be read: whether it holds a
+    /// given key cannot be told.
+    pub key_unreadable: bool,
+    /// Why this job's state cannot be told (`state` is then not an answer).
+    pub unknown: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,10 +140,12 @@ fn list_script(host: &Host) -> String {
            {NO_TMUX_SERVER}) out=;; \
            *) echo \"cannot verify session state: $out\" >&2; exit 1;; \
          esac; \
-         live=$(printf '%s\\n' \"$out\" | sed 's/^mule-//'); \
-         {{ find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -c '%Y %n' {{}} + 2>/dev/null \
-            || find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc \\) \\) \\) -exec stat -f '%m %N' {{}} + ; }} \
-         | live=\"$live\" awk -v now=\"$(date +%s)\" '\
+         live=$(printf '%s\\n' \"$out\" | sed 's/^mule-//') \
+           || {{ echo \"cannot read the session list\" >&2; exit 1; }}; \
+         if stat -c %Y \"$root\" >/dev/null 2>&1; then sf=-c; sfmt='%Y %n'; else sf=-f; sfmt='%m %N'; fi; \
+         listing=$(find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc -o -name key \\) \\) \\) -exec stat $sf \"$sfmt\" {{}} +) \
+           || {{ echo \"cannot list the jobs under $root\" >&2; exit 1; }}; \
+         printf '%s\\n' \"$listing\" | live=\"$live\" awk -v now=\"$(date +%s)\" '\
              BEGIN {{ \
                n = split(ENVIRON[\"live\"], L, \"\\n\"); \
                for (i = 1; i <= n; i++) if (L[i] != \"\") alive[L[i]] = 1; \
@@ -158,35 +165,50 @@ fn list_script(host: &Host) -> String {
                }} \
                return out; \
              }} \
+             NF == 0 {{ next }} \
              {{ \
                mtime = $1; path = substr($0, length($1) + 2); \
                dir = path; kind = \"dir\"; \
                if (sub(/\\/cmd$/, \"\", dir)) kind = \"cmd\"; \
                else if (sub(/\\/rc$/, \"\", dir)) kind = \"rc\"; \
+               else if (sub(/\\/key$/, \"\", dir)) kind = \"key\"; \
                id = dir; sub(/.*\\//, \"\", id); \
                dirs[id] = dir; \
                if (kind == \"dir\") dir_mtime[id] = mtime; \
                else if (kind == \"cmd\") cmd_mtime[id] = mtime; \
-               else rc_mtime[id] = mtime; \
+               else if (kind == \"rc\") rc_mtime[id] = mtime; \
+               else key_mtime[id] = mtime; \
              }} \
              END {{ \
                for (id in dirs) {{ \
                  dir = dirs[id]; \
-                 rc = \"\"; if ((getline l < (dir \"/rc\")) > 0) rc = l; \
-                 close(dir \"/rc\"); \
+                 bad = \"\"; \
+                 rc = \"\"; \
+                 if (id in rc_mtime) {{ \
+                   l = \"\"; if ((getline l < (dir \"/rc\")) > 0 && l != \"\") rc = l; \
+                   else bad = \"cannot read \" dir \"/rc\"; \
+                   close(dir \"/rc\"); \
+                 }} \
                  cmd = \"\"; \
                  while ((getline l < (dir \"/cmd\")) > 0) cmd = (cmd == \"\") ? l : cmd \"\\n\" l; \
                  close(dir \"/cmd\"); \
-                 key = \"\"; if ((getline l < (dir \"/key\")) > 0) key = l; \
-                 close(dir \"/key\"); \
+                 key = \"\"; keyok = 1; \
+                 if (id in key_mtime) {{ \
+                   l = \"\"; if ((getline l < (dir \"/key\")) > 0 && l != \"\") key = l; \
+                   else {{ keyok = 0; bad = \"cannot read \" dir \"/key\"; }} \
+                   close(dir \"/key\"); \
+                 }} \
+                 if (bad == \"\" && rc == \"\" && !(id in cmd_mtime) && !(id in alive)) \
+                   bad = \"no cmd: claimed by its key but not started\"; \
                  runtime = \"\"; \
                  if (rc != \"\" && (id in cmd_mtime) && (id in rc_mtime)) \
                    runtime = rc_mtime[id] - cmd_mtime[id]; \
                  else if (rc == \"\" && (id in alive) && (id in cmd_mtime)) \
                    runtime = now - cmd_mtime[id]; \
                  if (runtime != \"\" && runtime < 0) runtime = 0; \
-                 printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", \
-                   id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd), b64(key); \
+                 printf \"%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n\", \
+                   id, now - dir_mtime[id], runtime, rc, (id in alive) ? 1 : 0, b64(cmd), \
+                   keyok ? b64(key) : \"?\", b64(bad); \
                }} \
              }}'",
         host.tmux_socket
@@ -196,7 +218,7 @@ fn list_script(host: &Host) -> String {
 fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Result<usize> {
     let mut hidden = 0;
     for line in reply.lines() {
-        let mut fields = line.splitn(7, '\t');
+        let mut fields = line.splitn(8, '\t');
         let id = fields.next().context("invalid ls reply: missing id")?;
         let age_secs = fields
             .next()
@@ -219,10 +241,16 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             fields.next().context("invalid ls reply: missing cmd")?,
         )?)
         .into_owned();
-        // Last and optional: a reply from before keys existed has six fields.
-        // Base64 in transit, like `cmd`, so a hand-edited `key` holding a tab
-        // cannot shift a column.
+        // Optional: a reply from before keys existed has six fields. Base64
+        // in transit, like `cmd`, so a hand-edited `key` holding a tab cannot
+        // shift a column. `?` (not in the base64 alphabet) is a key file that
+        // exists but could not be read.
+        let mut key_unreadable = false;
         let key = match fields.next() {
+            Some("?") => {
+                key_unreadable = true;
+                None
+            }
             Some(encoded) if !encoded.is_empty() => Some(
                 String::from_utf8_lossy(&decode_command(encoded)?)
                     .trim_end()
@@ -231,6 +259,17 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             _ => None,
         }
         .filter(|key| !key.is_empty());
+        // Why the row's state cannot be told, if it cannot: an `rc` or `key`
+        // that exists but would not read, or a claim with no `cmd`.
+        let unknown = match fields.next() {
+            Some(encoded) if !encoded.is_empty() => Some(
+                String::from_utf8_lossy(&decode_command(encoded)?)
+                    .trim_end()
+                    .to_string(),
+            ),
+            _ => None,
+        }
+        .filter(|why| !why.is_empty());
         let rc = if rc_text.is_empty() {
             None
         } else {
@@ -257,7 +296,7 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
         // `running` and `orphan` are never hidden at any age: one is live, the
         // other is evidence.
         let recent = age_secs < DEFAULT_LS_WINDOW_SECS;
-        if all || recent || !matches!(state, State::Done(_)) {
+        if all || recent || unknown.is_some() || !matches!(state, State::Done(_)) {
             rows.push(Row {
                 id: id.into(),
                 host: host.name.clone(),
@@ -266,6 +305,8 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
                 runtime_secs,
                 cmd,
                 key,
+                key_unreadable,
+                unknown,
             });
         } else {
             hidden += 1;
@@ -364,7 +405,12 @@ pub fn remove_one_script(host: &Host, id: &JobId) -> String {
          alive=; \
          if [ \"$rc\" -eq 0 ]; then \
            for s in mule-{id} watch-{id}; do \
-             if printf '%s\\n' \"$out\" | grep -Fxq \"$s\"; then alive=\"$alive $s\"; fi; \
+             printf '%s\\n' \"$out\" | grep -Fxq \"$s\"; \
+             case $? in \
+               0) alive=\"$alive $s\";; \
+               1) ;; \
+               *) echo \"cannot search the session list for $s (state dir kept)\" >&2; exit 1;; \
+             esac; \
            done; \
          else \
            case \"$out\" in \
@@ -443,15 +489,27 @@ pub fn prune(host: &Host) -> String {
     // A `running` job has no `rc`, so the orphan pass would match it by age
     // alone. Skip live `mule-{id}` sessions: keep_days can be 1, which makes
     // the orphan horizon four days, and a multi-day job is legitimate work.
+    //
+    // Deleting is the one act here that cannot be undone, so it needs proof:
+    // a session list tmux could not give (anything but "no server") skips the
+    // orphan pass, and a `grep` that fails (exit 2, not 1) spares the dir.
+    // Read as "not live", either deleted a running job's state.
+    //
+    // A job with a `key` is never pruned, at any age: a dispatch with that
+    // key must keep returning it (`run --key`), and a pruned key would run
+    // its effect again. It goes when its caller runs `rm`.
     format!(
         "root={JOBS_ROOT}; [ ! -d \"$root\" ] || {{ \
-         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null); \
+         live=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>&1) && liveok=1 || \
+           case \"$live\" in {NO_TMUX_SERVER}) live=; liveok=1;; *) liveok=0;; esac; \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{} \
-           -exec test -f '{{}}/rc' \\; -exec rm -rf '{{}}' + ; \
+           -exec test -f '{{}}/rc' \\; ! -exec test -e '{{}}/key' \\; -exec rm -rf '{{}}' + ; \
+         [ \"$liveok\" = 1 ] && \
          find \"$root\" -mindepth 1 -maxdepth 1 -type d -mtime +{orphan_days} \
-           -exec test ! -f '{{}}/rc' \\; -print | while IFS= read -r d; do \
+           -exec test ! -f '{{}}/rc' \\; ! -exec test -e '{{}}/key' \\; -print | while IFS= read -r d; do \
              id=\"${{d##*/}}\"; \
-             echo \"$live\" | grep -qx \"mule-$id\" && continue; \
+             printf '%s\\n' \"$live\" | grep -qx \"mule-$id\"; \
+             [ $? -eq 1 ] || continue; \
              rm -rf \"$d\"; \
            done; }}",
         host.tmux_socket, host.keep_days

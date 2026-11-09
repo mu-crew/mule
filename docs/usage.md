@@ -156,8 +156,9 @@ That file means the job may still be running: open the master, then
 ```
 
 `unknown` covers every probe that did not complete: a state path behind an
-unsearchable directory, a tmux that cannot be queried, a refused or dropped
-session. Never read it as "gone". Exit 3 still means no master. Plain `poll`
+unsearchable directory, a tmux that cannot be queried, a tool that failed, an
+`rc` that exists but will not read, a key claimed by a lease that has not
+started its job, a refused or dropped session. Never read it as "gone". Exit 3 still means no master. Plain `poll`
 is unchanged: a missing job is exit 1, `job <id> not found`.
 
 ## Idempotent dispatch: `run --key`
@@ -170,13 +171,18 @@ If a job with that key already exists, in any state, mule prints its id,
 says `key K already names job <id>; nothing was dispatched` on stderr, and
 starts nothing. Otherwise it dispatches as usual and stores the key with the
 job. The id is still generated. The key is 1-128 characters of `A-Z a-z 0-9
-. _ -`, and stays with the job until `mule rm`. It works with `--wait`,
-`--tui` and `--lease`.
+. _ -`, compared as a string (`01` and `1` are two keys), and stays with the
+job until `mule rm`: prune never removes a keyed job, at any age. If the
+lookup cannot be completed (a `key` that will not read, say), the dispatch
+refuses rather than risk a second run. It works with `--wait`, `--tui` and
+`--lease`.
 
 `mule ls --json --key-prefix P` lists the keyed jobs whose key starts with
 `P`, at any age (the 24-hour window does not apply), each with its `key`. A
-host under `unreachable` was not searched. In plain `ls --json`, a keyed row
-has a `key` field and an unkeyed row has none.
+host under `unreachable` was not searched. If any job's `key` will not read,
+`--key-prefix` exits 1 naming it instead of answering. In plain `ls --json`, a
+keyed row has a `key` field and an unkeyed row has none, and a row whose `rc`
+or `key` will not read has state `unknown` and a `reason`.
 
 ## Forwarding a unix socket
 
@@ -254,9 +260,9 @@ mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
 
 With `--key K`, a lease whose key already names a job holds that job instead
 of starting one: `F` names it, and the lease ends with its code (at once, for
-a finished one). If another client starts `K` between the lease's lookup and
-its dispatch, the lease exits 1 and `F` keeps its own id, which was never
-dispatched.
+a finished one). The key is claimed before `F` is written, so `F` only ever
+names the job holding `K`: two leases racing with one key both hold the one
+job, and both job files name it.
 
 ### Reattaching to a running job
 
