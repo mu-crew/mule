@@ -129,8 +129,33 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     // over ~16KB with "command too long", so inlining the payload capped every
     // job at about 12KB of script. Redirecting the file keeps the old stdin
     // semantics exactly -- `sh` still reads its script from standard input.
+    //
+    // `rc` is recorded only while the job's own session still exists, and
+    // only if nothing recorded one first. A session torn down from outside
+    // (`kill-session`, `kill-server`) hangs up every process in the pane,
+    // but bash and zsh do not die at once while they wait for a child: the
+    // child dies with 129, and the shell can still run this write on its way
+    // out -- 129 over `kill`'s 137, 129 where the job should be an orphan, or
+    // only the redirection's truncation, an empty `rc` that `kill` then
+    // failed to parse. Whether it got that far was the server's signal order:
+    // under tmux, which leaves the hangup to the kernel, it never did (16/16
+    // rounds kept 137 and left orphans); vtmux closes the master and then
+    // signals the pane's group itself, and `mule kill` kept 137 in 3/8 rounds
+    // under `sh` and 0/8 under zsh. Asking the server is the fact that does
+    // not race: a torn-down session is gone before its panes are hung up,
+    // and a job that ends by itself is still in it. A trap cannot do this:
+    // bash 3.2 ran `trap ... HUP` only after the write. The write goes
+    // through a temp file and a rename, so no reader sees it half done.
+    let record = |code: &str| {
+        format!(
+            "if [ ! -f {dir}/rc ] && tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
+             echo {code} > {dir}/rc.tmp && mv -f {dir}/rc.tmp {dir}/rc; fi",
+            socket = host.tmux_socket,
+            id = job.id,
+        )
+    };
     let run = if job.max_secs == 0 {
-        format!("{}; echo $? > {dir}/rc", body(&cd, &shell))
+        format!("{}; rc=$?; {}", body(&cd, &shell), record("$rc"))
     } else {
         // POSIX sh has no portable process-group primitive, so the inner tmux
         // session supplies one: `kill-session` terminates the command and all
@@ -153,11 +178,12 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
              \"printf %s {watchdog} | base64 -d | sh\"; \
              {body}; rc=$?; \
              tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
-             if [ ! -f {dir}/rc ]; then echo $rc > {dir}/rc; fi",
+             {record}",
             socket = host.tmux_socket,
             id = job.id,
             watchdog = encode_command(watchdog.as_bytes()),
             body = body(&cd, &shell),
+            record = record("$rc"),
         )
     };
 

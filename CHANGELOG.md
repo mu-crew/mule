@@ -49,6 +49,13 @@ key, and a cancel that stays inside the caller's process group.
 
 ### Fixed
 
+- A job whose session was torn down from outside could still write its rc:
+  129 over `mule kill`'s 137, 129 in place of an orphan, or an empty `rc`
+  that made `kill` fail with "invalid exit code". The hangup does not kill a
+  waiting bash or zsh at once, and under vtmux (which signals the pane's group
+  itself) the wrapper's `echo $? > rc` usually won the race. The wrapper now
+  records `rc` only if none exists and its session still does, through a temp
+  file and a rename.
 - `mule ls` on a macOS host with two or more live jobs failed with `awk:
   newline in string`: BSD awk refuses a `-v` value holding a newline. The
   session list now reaches awk through `ENVIRON`.

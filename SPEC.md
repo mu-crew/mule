@@ -187,9 +187,13 @@ A job wrapper has this shape. The log is capped at `max_log_bytes`; `-f /dev/nul
 
 ```sh
 tmux -L mule -f /dev/null new-session -d -s mule-<id> \
-  '{ cd ... && printf %s <b64> | base64 -d | sh; echo $? > <state>/rc; } \
+  '{ cd ... && sh < <state>/cmd; rc=$?; \
+     if [ ! -f <state>/rc ] && tmux -L mule has-session -t mule-<id>; then \
+       echo $rc > <state>/rc.tmp && mv -f <state>/rc.tmp <state>/rc; fi; } \
    | { head -c <max> > <state>/log; cat > <state>/.overflow; ... }'
 ```
+
+The wrapper records `rc` only if nothing recorded one first and only while its own session still exists. A session torn down from outside (`kill-session`, `kill-server`, or `mule kill` after it writes 137) hangs up every process in the pane, but bash and zsh do not die at once while they wait for a child: the child dies with 129 and the shell could still run the write on its way out, putting 129 over `kill`'s 137, turning an orphan into "done 129", or leaving only the redirection's truncation, an empty `rc` that `kill` failed to parse. Whether it got that far depended on the server's signal order. Measured: under tmux, which leaves the hangup to the kernel, never (16/16); under vtmux, which also signals the pane's group itself, `mule kill` kept 137 in 3/8 rounds under `sh` and 0/8 under zsh. A torn-down session is gone before its panes are hung up, and a job that ends by itself is still in its session, so `has-session` is the fact that does not race. A `trap ... HUP` was rejected: bash 3.2 ran it only after the write. The temp file and rename mean no reader sees a half-written `rc`. The TUI wrapper is unchanged.
 
 With `--max-secs` or `max_job_secs`, a second `watch-<id>` session writes **124** only if `rc` is still absent, then kills the job session. Normal completion destroys the watchdog and keeps the command's own rc.
 
