@@ -62,3 +62,13 @@ signal-hook = "0.3"
 # `setsid()` for the detached cleanup child (macOS has no `setsid` executable),
 # `dup2` onto /dev/null after a hangup, and `poll` on the signal pipe.
 libc = "0.2"
+
+# Release binaries are what the release workflow ships and what `cargo
+# install` builds. Fat LTO with one codegen unit plus stripped symbols cut
+# them by about a third. The price is a slower release build and panic
+# backtraces with no function names. panic = "abort" is left out on purpose,
+# since it changes behaviour, not just size.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
