@@ -304,3 +304,45 @@ fn a_claim_record_round_trips() {
         assert_eq!(Claimer::parse(bad), None, "{bad:?}");
     }
 }
+
+/// Set by [`a_start_time_reads_the_same_in_every_time_zone`] for its child:
+/// print `start_time` of the pid named, and nothing else.
+const TZ_CHILD: &str = "MULE_TEST_START_TIME_OF";
+
+#[test]
+fn start_time_child() {
+    // Only the child run does anything: it reads under its own `TZ`.
+    if let Ok(pid) = std::env::var(TZ_CHILD) {
+        println!("START={}", start_time(pid.parse().unwrap()).unwrap());
+    }
+}
+
+#[test]
+fn a_start_time_reads_the_same_in_every_time_zone() {
+    // Review of P7a, round 4: `lstart` is local wall-clock time, so a mule
+    // under another `TZ` read a live claimer's start as another time, which
+    // is the proof a claim was abandoned. Read in a child of this test binary
+    // under two zones, hours apart, the start must be the same.
+    let pid = std::process::id();
+    let read_in = |tz: &str| {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "start_time_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TZ_CHILD, pid.to_string())
+            .env("TZ", tz)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            // On the line libtest began with `test start_time_child ... `.
+            .find_map(|l| l.split_once("START=").map(|(_, start)| start.to_string()))
+            .unwrap_or_else(|| panic!("no start under {tz}: {}", stderr(&out)))
+    };
+    let (new_york, tokyo) = (read_in("America/New_York"), read_in("Asia/Tokyo"));
+    assert_eq!(new_york, tokyo);
+    assert_eq!(new_york, start_time(pid).unwrap(), "and the same as here");
+}

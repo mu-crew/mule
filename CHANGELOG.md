@@ -49,6 +49,19 @@ key, and a cancel that stays inside the caller's process group.
 
 ### Fixed
 
+- Review of P7a, round 4:
+  - A keyed lease forgets its fresh id once its claim is known to have made
+    nothing (the key was held, or the lookup stopped before `mkdir`), so a
+    later failure no longer spawns a detached `mule rm` of an id that never
+    existed.
+  - The claimer's start time is read under `TZ=UTC` as well as `LC_ALL=C`:
+    two mule processes in different zones read one live claimer's start as
+    two times, which is the proof a claim was abandoned.
+  - Test harness: the fault shims stop waiting for their lock once the
+    fault dir is gone (bounded either way), every fault run reaps the
+    processes it left (a detached `mule rm`), and every fault test fails if
+    any survive. Unbounded shim loops left by detached `rm`s were the load
+    behind `exec_tmux`'s 1s flake.
 - Review of P7a, round 3 (all in the fault-injection harness):
   - `exec --no-detach`'s collect now runs on the prelude. A failed `wc`
     used to read as size 0, so exec exited 0 with the output silently

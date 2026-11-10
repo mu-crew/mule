@@ -345,6 +345,7 @@ pub fn start(
         request,
         None,
         on_dispatch,
+        &|| {},
         warnings,
     )
 }
@@ -368,6 +369,14 @@ pub fn start(
 ///   dispatch: it only names the job for the signal path.
 /// - **claimed:** exactly [`start`]: the job file names the fresh id, then
 ///   the dispatch, whose key check finds this job's own claim and starts it.
+///
+/// The fresh id is named (`on_dispatch(Some)`) before each claim, so a
+/// signal while the claim is in flight removes a claim that landed. Once a
+/// claim is known to have made nothing -- it found the key held, or it
+/// stopped in its lookup, before `mkdir` -- `on_unnamed` takes the name back:
+/// nothing of that id exists, and a later failure must not spawn an `rm`
+/// for it (review of P7a, round 4: every injected failure past such a claim
+/// spawned a detached `mule rm` of an id that never existed).
 #[allow(clippy::too_many_arguments)] // `start`'s seam, plus the key.
 pub fn start_keyed(
     t: &dyn Transport,
@@ -377,6 +386,7 @@ pub fn start_keyed(
     request: &Request,
     key: Option<&JobKey>,
     on_dispatch: &dyn Fn(Option<&Owned>),
+    on_unnamed: &dyn Fn(),
     warnings: &mut dyn Write,
 ) -> Result<Owned> {
     let id: JobId = new_id().parse().expect("generated ids are valid");
@@ -387,22 +397,31 @@ pub fn start_keyed(
         .generation_unlocked()
         .context("cannot own the job's stop fence; nothing was dispatched")?;
     if let Some(key) = key {
-        // Named for the signal path before the claim can land: a signal
-        // from here on removes the claim (`rm` of this id), rather than
-        // leave the key held by a job that will never start.
-        on_dispatch(Some(&Owned {
-            id: id.clone(),
-            fence_gen,
-        }));
         // Three claims at most: another after rolling back a claim proven
         // abandoned, or after the holder vanished in between; past that the
         // holder is owned as it is, never rolled back in a loop.
         let mut rounds = 0;
         loop {
             rounds += 1;
-            let existing = match crate::run::claim(t, host, &id, key)? {
-                crate::run::Claim::Claimed => break,
-                crate::run::Claim::Held(existing) => existing,
+            // Named for the signal path before the claim can land: a signal
+            // from here on removes the claim (`rm` of this id), rather than
+            // leave the key held by a job that will never start.
+            on_dispatch(Some(&Owned {
+                id: id.clone(),
+                fence_gen,
+            }));
+            let existing = match crate::run::claim(t, host, &id, key) {
+                Ok(crate::run::Claim::Claimed) => break,
+                Ok(crate::run::Claim::Held(existing)) => {
+                    on_unnamed();
+                    existing
+                }
+                Err(error) => {
+                    if crate::run::claimed_nothing(&error) {
+                        on_unnamed();
+                    }
+                    return Err(error);
+                }
             };
             match crate::run::claim_state(t, host, &existing)? {
                 crate::run::ClaimState::Gone if rounds < 3 => continue,
@@ -1125,6 +1144,14 @@ fn carrier_cli(
                 } else {
                     dispatching.store(false, Ordering::SeqCst);
                 }
+            },
+            // The claim made nothing of the named id: forget it, so a later
+            // failure spawns no `rm` for an id that never existed.
+            &|| {
+                if let Ok(mut named) = named.lock() {
+                    *named = None;
+                }
+                dispatching.store(false, Ordering::SeqCst);
             },
             &mut stderr,
         ),

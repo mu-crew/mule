@@ -77,11 +77,12 @@ fn shims() -> &'static Path {
             } else {
                 format!("exec '{real}' \"$@\"")
             };
+            let wait_lock = lock_wait(&format!("{{ {exec}; }}"));
             let body = format!(
                 "#!/bin/sh\n\
                  [ -n \"$MULE_FAULT_DIR\" ] && [ -n \"$MULE_FAULT_CALL\" ] || {exec}\n\
                  F=$MULE_FAULT_DIR\n\
-                 while ! /bin/mkdir \"$F/lock\" 2>/dev/null; do :; done\n\
+                 {wait_lock}\
                  n=0; if [ -f \"$F/count\" ]; then read n < \"$F/count\"; fi\n\
                  n=$((n + 1)); echo $n > \"$F/count\"\n\
                  echo \"$n $MULE_FAULT_CALL {tool}\" >> \"$F/log\"\n\
@@ -110,33 +111,61 @@ fn shims() -> &'static Path {
 fn fault_host(tag: &str) -> ShimHost {
     let host = ShimHost::new(tag);
     let ssh = host.dir.join("ssh");
+    // `$0` (this shim's path, under the host's dir) goes on the remote
+    // `sh`'s command line, so [`reap`] can find a script still running.
+    let gone = "{ unset MULE_FAULT_DIR MULE_FAULT_CALL; exec sh -c \"$last\" \"$0\"; }";
     std::fs::write(
         &ssh,
+        format!(
         "#!/bin/sh\n\
          for arg; do if [ \"$arg\" = -O ]; then echo 'Master running (pid=1)' >&2; exit 0; fi; done\n\
          for last; do :; done\n\
          if [ -n \"$MULE_FAULT_DIR\" ]; then\n\
            F=$MULE_FAULT_DIR\n\
-           while ! /bin/mkdir \"$F/lock\" 2>/dev/null; do :; done\n\
+           {wait_lock}\
            c=0; if [ -f \"$F/calls\" ]; then read c < \"$F/calls\"; fi\n\
            c=$((c + 1)); echo $c > \"$F/calls\"\n\
            /bin/rmdir \"$F/lock\"\n\
            max=999999; if [ -f \"$F/maxcall\" ]; then read max < \"$F/maxcall\"; fi\n\
            if [ $c -le $max ]; then export MULE_FAULT_CALL=$c; else unset MULE_FAULT_CALL; fi\n\
          fi\n\
-         exec sh -c \"$last\"\n",
+         exec sh -c \"$last\" \"$0\"\n",
+            wait_lock = lock_wait(gone),
+        ),
     )
     .unwrap();
     host
 }
 
-/// One fault-run's control directory.
+/// The shims' wait for the fault dir's lock. Bounded, and it stops waiting
+/// once the dir is gone: a detached `mule rm` a failed lease left behind
+/// outlives its run, whose `Fault` then removed the dir, and an unguarded
+/// `while ! mkdir` spun on ENOENT forever (review of P7a, round 4: 1,910
+/// such loops, the load behind `exec_tmux`'s 1s flake). Without the dir the
+/// run is over and the call goes through uncounted (`gone`). A lock held
+/// past the bound (its holder killed mid-count) is recorded in `stale`,
+/// which fails the case, and the call goes through uncounted too.
+fn lock_wait(gone: &str) -> String {
+    format!(
+        "mule_i=0; while ! /bin/mkdir \"$F/lock\" 2>/dev/null; do \
+           [ -d \"$F\" ] || {gone}; \
+           mule_i=$((mule_i + 1)); \
+           if [ $mule_i -gt 5000 ]; then echo $$ >> \"$F/stale\" 2>/dev/null; {gone}; fi; \
+         done\n"
+    )
+}
+
+/// One fault-run's control directory, for runs against `host`.
 struct Fault {
     dir: PathBuf,
+    /// The host's dir: on the command line of every process a run leaves
+    /// behind (a detached `mule rm`'s `--config`, the ssh shim, the remote
+    /// `sh` it starts), so [`reap`] can find them.
+    host_dir: PathBuf,
 }
 
 impl Fault {
-    fn new(inject: Option<(usize, &str)>, max_call: Option<usize>) -> Self {
+    fn new(host: &ShimHost, inject: Option<(usize, &str)>, max_call: Option<usize>) -> Self {
         let dir = scratch("fault");
         if let Some((n, mode)) = inject {
             std::fs::write(dir.join("inject"), format!("{n} {mode}\n")).unwrap();
@@ -144,7 +173,10 @@ impl Fault {
         if let Some(max) = max_call {
             std::fs::write(dir.join("maxcall"), format!("{max}\n")).unwrap();
         }
-        Self { dir }
+        Self {
+            dir,
+            host_dir: host.dir.clone(),
+        }
     }
 
     /// The tools run, in order.
@@ -162,10 +194,106 @@ impl Fault {
 }
 
 impl Drop for Fault {
-    // Hundreds of runs each make one: leave none behind.
+    // Hundreds of runs each make one: leave none behind, and no process
+    // either. The reap comes first, while the dir still exists, so a
+    // detached `mule rm` the run caused finishes its cleanup counted as it
+    // began, rather than after the dir it reports to is gone.
     fn drop(&mut self) {
+        reap(&self.host_dir);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Processes whose command line contains `marker` (`pid`, command line),
+/// the `ps` itself and tmux excepted. A tmux server keeps the command line
+/// of the client that started it, and a TUI dispatch's `new-session -c`
+/// names the job's dir under the host's: that server is the host's, and
+/// [`common::local::LocalTmux`] kills it with the host.
+fn processes_with(marker: &str) -> Vec<(u32, String)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.contains(marker) && !line.contains("pid=,command="))
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, command) = line.split_once(' ')?;
+            Some((pid.parse().ok()?, command.to_string()))
+        })
+        .filter(|(pid, command)| {
+            let argv0 = command.split_whitespace().next().unwrap_or("");
+            *pid != std::process::id() && !argv0.ends_with("tmux")
+        })
+        .collect()
+}
+
+/// Wait up to 10s for every process naming `dir` to end -- a detached
+/// `mule rm` a failed lease spawned, a killed lease's ssh still running --
+/// then SIGKILL the rest. Returns what had to be killed.
+fn reap(dir: &Path) -> Vec<String> {
+    let marker = dir.display().to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = processes_with(&marker);
+        if left.is_empty() {
+            return Vec::new();
+        }
+        if std::time::Instant::now() >= deadline {
+            for (pid, _) in &left {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            }
+            return left
+                .into_iter()
+                .map(|(pid, c)| format!("{pid} {c}"))
+                .collect();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Every process of this binary's fault runs that is still alive: a shim
+/// (its path is under the shim dir) or anything naming a fault host's dir
+/// (`mule-fi-*` of this pid). Waits out a short grace first, since a shim
+/// that just ran may still be exiting; kills what survives it.
+fn strays() -> Vec<String> {
+    let pid = std::process::id();
+    let shims = shims().display().to_string();
+    let find = || {
+        let mut found = processes_with(&shims);
+        found.extend(
+            processes_with("/mule-fi-")
+                .into_iter()
+                .filter(|(_, c)| c.contains(&format!("-{pid}-"))),
+        );
+        found
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !find().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let left = find();
+    for (pid, _) in &left {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    left.into_iter()
+        .map(|(pid, c)| format!("{pid} {}", c.chars().take(200).collect::<String>()))
+        .collect()
+}
+
+/// No fault-run process survives: called at the end of every test here,
+/// under [`serial`], so nothing of this binary's may legitimately run.
+fn assert_no_strays() {
+    let left = strays();
+    assert!(
+        left.is_empty(),
+        "{} fault-run processes outlived their test:\n{}",
+        left.len(),
+        left.join("\n")
+    );
 }
 
 /// Is this run's failure the fixture's, not mule's? The fake master's
@@ -301,9 +429,26 @@ fn age(host: &ShimHost, id: &str) {
 /// by side, seventeen sweeps of four threads loaded the machine until the
 /// fake master's `-O check` missed mule's 2s bound and runs failed for the
 /// fixture's sake.
-fn serial() -> std::sync::MutexGuard<'static, ()> {
+///
+/// Every test here holds it, so when one ends nothing of this binary's
+/// fault runs may still be running: dropped last (taken first), the guard
+/// checks that no process survived the test (see [`assert_no_strays`]).
+fn serial() -> Serial {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    Serial(LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+struct Serial(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>); // held, never read
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Already failing: only clean up.
+            let _ = strays();
+        } else {
+            assert_no_strays();
+        }
+    }
 }
 
 /// A scenario: build a host's state, then check one verb run against it.
@@ -334,7 +479,7 @@ fn exercise(scenario: &Scenario) {
     let host = fault_host(&format!("fi-{}-enum", scenario.name));
     let ids = (scenario.setup)(&host);
     let args = (scenario.verb)(&ids);
-    let fault = Fault::new(None, scenario.max_call);
+    let fault = Fault::new(&host, None, scenario.max_call);
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
     let _ = match scenario.hold_for {
         Some(limit) => mule_for(&host, &fault, &args_ref, limit),
@@ -376,7 +521,7 @@ fn exercise(scenario: &Scenario) {
                         let ids = (scenario.setup)(&host);
                         let args = (scenario.verb)(&ids);
                         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-                        let fault = Fault::new(Some((n, mode)), scenario.max_call);
+                        let fault = Fault::new(&host, Some((n, mode)), scenario.max_call);
                         let out = match scenario.hold_for {
                             Some(limit) => mule_for(&host, &fault, &args_ref, limit),
                             None => mule_with(&host, &fault, &args_ref),
@@ -397,6 +542,8 @@ fn exercise(scenario: &Scenario) {
                         // The scenario ran fewer commands this time: say so,
                         // rather than pass a run that injected nothing.
                         Err(format!("injection {n} was never reached"))
+                    } else if fault.dir.join("stale").exists() {
+                        Err("a shim's wait for the fault lock timed out".into())
                     } else {
                         (scenario.check)(&host, &ids, &out)
                     };
@@ -893,7 +1040,7 @@ fn a_symlinked_unreadable_key_is_never_an_absence() {
     let _one_at_a_time = serial();
     let h = fault_host("fi-symlink");
     let id = symlinked_key(&h);
-    let none = Fault::new(None, Some(0));
+    let none = Fault::new(&h, None, Some(0));
 
     let ls = mule_with(&h, &none, &["ls", "--json", "--key-prefix", "mu."]);
     let run = mule_with(
@@ -918,7 +1065,11 @@ fn a_symlinked_unreadable_key_is_never_an_absence() {
     std::fs::remove_file(&key).unwrap();
     std::os::unix::fs::symlink(&target, &key).unwrap();
     age(&h2, &id2);
-    let _ = mule_with(&h2, &none, &["run", "--quiet", "true"]);
+    let _ = mule_with(
+        &h2,
+        &Fault::new(&h2, None, Some(0)),
+        &["run", "--quiet", "true"],
+    );
     if let Err(why) = kept(&h2, std::slice::from_ref(&id2)) {
         problems.push(format!("prune: {why}"));
     }
@@ -940,7 +1091,7 @@ fn an_unreadable_key_is_refused_with_running_too() {
         eprintln!("skipping: modes are not enforced for this user");
         return;
     }
-    let none = Fault::new(None, Some(0));
+    let none = Fault::new(&h, None, Some(0));
 
     let plain = mule_with(&h, &none, &["ls", "--json", "--key-prefix", "mu."]);
     let filtered = mule_with(
@@ -1085,7 +1236,7 @@ fn r3_run_key_new_never_poisons_key_with_unstarted_orphan() {
             }
             if !out.status.success() {
                 for h_id in &holders {
-                    let none = Fault::new(None, Some(0));
+                    let none = Fault::new(host, None, Some(0));
                     let polled = mule_with(host, &none, &["poll", h_id, "--json"]);
                     if let Some(v) = json(&polled)
                         && v["state"] != "unknown"
@@ -1140,7 +1291,7 @@ fn r3_run_tui_key_new_and_watchdog() {
                             "failed --tui dispatch left live session mule-{h_id} running/hung"
                         ));
                     }
-                    let none = Fault::new(None, Some(0));
+                    let none = Fault::new(host, None, Some(0));
                     let polled = mule_with(host, &none, &["poll", h_id, "--json"]);
                     if let Some(v) = json(&polled)
                         && v["state"] != "unknown"
@@ -1180,7 +1331,7 @@ fn r3_non_numeric_rc_in_ls_and_mule_regular_toctou() {
 ",
     )
     .unwrap();
-    let none = Fault::new(None, Some(0));
+    let none = Fault::new(&h, None, Some(0));
     let polled = mule_with(&h, &none, &["poll", "bad001", "--json"]);
     let listed = mule_with(&h, &none, &["ls", "--json", "--key-prefix", "mu.good"]);
 
@@ -1388,4 +1539,96 @@ fn a_failed_dispatch_keeps_its_key_while_its_session_will_not_die() {
         .command(&["kill-session", "-t", &format!("mule-{id}")])
         .status();
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// -- the harness leaks no process (review of P7a, round 4) ---------------------------
+
+/// Run `program` with a fault dir whose lock is held, remove the dir, and
+/// return whether the program ended within 10s (killed if not).
+fn ends_once_its_fault_dir_is_gone(program: &Path, args: &[&str]) -> bool {
+    let fault = scratch("fault-gone");
+    std::fs::create_dir(fault.join("lock")).unwrap();
+    let mut child = Command::new(program)
+        .args(args)
+        .env("MULE_FAULT_DIR", &fault)
+        .env("MULE_FAULT_CALL", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "it waits while the lock is held"
+    );
+    std::fs::remove_dir_all(&fault).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+#[test]
+fn a_shim_whose_fault_dir_is_gone_stops_waiting_for_its_lock() {
+    // A detached `mule rm` outlived its run, whose `Fault` then removed the
+    // dir: the shims' `while ! mkdir lock` spun on ENOENT forever (1,910
+    // such loops found, the load behind `exec_tmux`'s 1s flake).
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not on PATH");
+        return;
+    }
+    let _one_at_a_time = serial();
+    let h = fault_host("fi-gone-dir");
+    assert!(
+        ends_once_its_fault_dir_is_gone(&shims().join("ls"), &["/"]),
+        "a tool shim spun on"
+    );
+    assert!(
+        ends_once_its_fault_dir_is_gone(&h.dir.join("ssh"), &["shim", "true"]),
+        "the ssh shim spun on"
+    );
+}
+
+#[test]
+fn a_failed_lease_leaves_no_process_behind() {
+    // A keyed lease whose claim fails after its `mkdir` (here the claim
+    // record's `mv`) spawns a detached `mule rm` of its id, which outlives
+    // the lease. The run's `Fault` must reap it -- after it has removed the
+    // claim -- and nothing of the run may survive the test.
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not on PATH");
+        return;
+    }
+    let _one_at_a_time = serial();
+    let h = fault_host("fi-reap");
+    std::fs::create_dir_all(h.jobs()).unwrap();
+    let file = h.dir.join("w.job").display().to_string();
+    let args = lease_verb(&file);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let n = {
+        let fault = Fault::new(&h, None, Some(1));
+        let _ = mule_for(&h, &fault, &args, Duration::from_secs(2));
+        fault.log().iter().position(|tool| tool == "mv").unwrap() + 1
+    };
+    for id in jobs(&h) {
+        let _ = std::fs::remove_dir_all(h.jobs().join(id));
+    }
+    let fault = Fault::new(&h, Some((n, "exit2")), None);
+    let out = mule_with(&h, &fault, &args);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(fault.hit().contains("mv"), "{}", fault.hit());
+    drop(fault);
+    assert!(
+        jobs(&h).is_empty(),
+        "the reaped `mule rm` ran to the end and removed the claim: {:?}",
+        jobs(&h)
+    );
+    let left = strays();
+    assert!(left.is_empty(), "{}", left.join("\n"));
 }

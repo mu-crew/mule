@@ -255,6 +255,15 @@ pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -
         key_lookup_script(key)
     );
     let output = transport.run(host, &script)?;
+    if output.code == crate::remote::CANNOT_TELL {
+        // Only the lookup stops with it, and the lookup runs before `mkdir`.
+        return Err(NothingClaimed(format!(
+            "claiming key {key} on {} failed: {}",
+            host.name,
+            output.stderr.trim()
+        ))
+        .into());
+    }
     if output.code != 0 {
         bail!(
             "claiming key {key} on {} failed: {}",
@@ -266,6 +275,24 @@ pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -
         Some(holder) => Claim::Held(holder),
         None => Claim::Claimed,
     })
+}
+
+/// A [`claim`] that failed before it could make anything: no master, or its
+/// lookup stopped, cannot tell, before the `mkdir`. Any other failure may
+/// have left a state dir (a `mkdir` done, a `key` write failed, a reply
+/// lost), so only this one lets the caller forget the id.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
+pub struct NothingClaimed(String);
+
+/// Did this [`claim`] error make nothing? Its lookup stopped
+/// ([`NothingClaimed`]), or there was no master and nothing ran.
+pub fn claimed_nothing(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NothingClaimed>().is_some()
+        || matches!(
+            error.downcast_ref::<crate::errors::MuleError>(),
+            Some(crate::errors::MuleError::NoMaster { .. })
+        )
 }
 
 /// What a key's holder is, as far as a keyed lease needs to know.

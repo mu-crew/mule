@@ -24,7 +24,7 @@ use std::process::Command;
 pub struct Claimer {
     pub pid: u32,
     pub host: String,
-    /// `ps -o lstart=` of the pid, under `LC_ALL=C`.
+    /// `ps -o lstart=` of the pid, under `LC_ALL=C` and `TZ=UTC`.
     pub start: String,
 }
 
@@ -89,10 +89,17 @@ pub fn local_host() -> Option<String> {
 }
 
 /// The start time of `pid`, from `ps -o lstart=`, or `None`.
+///
+/// `lstart` is wall-clock time in the caller's zone, so the zone is pinned
+/// as the locale is: two mule processes with different `TZ`s read one live
+/// claimer's start as two times, and the second would take a live claim
+/// for an abandoned one (review of P7a, round 4: `Tue Nov 10 00:26:13 2026`
+/// under UTC is `Mon Nov  9 19:26:13 2026` in New York).
 pub fn start_time(pid: u32) -> Option<String> {
     let out = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
+        .env("TZ", "UTC")
         .output()
         .ok()?;
     if !out.status.success() {

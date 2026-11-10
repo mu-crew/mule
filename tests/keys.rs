@@ -77,6 +77,7 @@ fn lease_start(fake: &Fake, dir: &Path, k: &JobKey) -> anyhow::Result<mule::leas
         &request(),
         Some(k),
         &|_| {},
+        &|| {},
         &mut std::io::sink(),
     )
 }
@@ -242,6 +243,7 @@ fn a_keyed_lease_with_no_hit_names_its_job_before_the_keyed_dispatch() {
                 let _ = owned;
             }
         },
+        &|| {},
         &mut std::io::sink(),
     )
     .unwrap();
@@ -301,6 +303,7 @@ fn a_claim_is_made_before_the_job_file_and_the_dispatch_starts_its_own_claim() {
                 fake.push(Output::ok(format!("existing={}\n1\n", owned.id)));
             }
         },
+        &|| {},
         &mut std::io::sink(),
     )
     .unwrap();
@@ -708,4 +711,96 @@ fn the_key_scripts_run_under_zsh_with_no_jobs_yet_and_with_some() {
         dispatch(&local, &host, "e00002", &key("z1"), "sleep 30").unwrap(),
         Dispatched::Existing(id("e00001"))
     );
+}
+
+/// `start_keyed` with `carrier_cli`'s naming: `named` is the id a failed
+/// start would `rm` (its error path spawns a detached `mule rm` of it).
+fn lease_named(
+    fake: &Fake,
+    dir: &Path,
+    k: &JobKey,
+) -> (anyhow::Result<mule::lease::Owned>, Option<JobId>) {
+    let named = std::sync::Mutex::new(None);
+    let result = mule::lease::start_keyed(
+        fake,
+        &host(),
+        &dir.join("w.job"),
+        &dir.join("stopping"),
+        &request(),
+        Some(k),
+        &|owned| {
+            if let Some(owned) = owned {
+                *named.lock().unwrap() = Some(owned.id.clone());
+            }
+        },
+        &|| *named.lock().unwrap() = None,
+        &mut std::io::sink(),
+    );
+    (result, named.into_inner().unwrap())
+}
+
+/// A pid that was this host's and has exited.
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[test]
+fn a_claim_that_made_nothing_leaves_no_id_to_remove() {
+    // Review of P7a, round 4: the fresh id was named before the claim and
+    // never unnamed, so every failure past a claim that found the key held,
+    // or that stopped in its lookup, spawned a detached `mule rm` of an id
+    // that never existed.
+    let cases: [(&str, Vec<Output>); 3] = [
+        // The lookup stopped, cannot tell: before any `mkdir`.
+        (
+            "lookup stopped",
+            vec![Output::fail(86, "mule: cannot tell: x")],
+        ),
+        // Held, then the claim state cannot be told.
+        (
+            "held, claim state failed",
+            vec![
+                Output::ok("existing=abc123\n"),
+                Output::fail(86, "mule: cannot tell: x"),
+            ],
+        ),
+        // Held by a claim whose claimer is gone, then the rollback cannot
+        // tell.
+        (
+            "held, rollback failed",
+            vec![
+                Output::ok("existing=abc123\n"),
+                Output::ok(format!(
+                    "unstarted pid={} host={} start=Thu Jan  1 00:00:00 1970\n",
+                    dead_pid(),
+                    mule::claimer::local_host().unwrap()
+                )),
+                Output::fail(86, "mule: cannot tell: x"),
+            ],
+        ),
+    ];
+    for (what, replies) in cases {
+        let (dir, fake) = (scratch("keys-unnamed"), Fake::new());
+        for reply in replies {
+            fake.push(reply);
+        }
+        let (result, named) = lease_named(&fake, &dir, &key("k9"));
+        assert!(result.is_err(), "{what}");
+        assert_eq!(named, None, "{what}: nothing of the fresh id exists");
+    }
+}
+
+#[test]
+fn a_claim_that_may_have_made_its_dir_keeps_the_id_to_remove() {
+    // A claim that failed past its lookup (a `mkdir` done, the `key` write
+    // failed, exit 1) may have left the dir: the id stays named, so the
+    // error path's `rm` takes it back.
+    let (dir, fake) = (scratch("keys-unnamed"), Fake::new());
+    fake.push(Output::fail(1, "key: Permission denied"));
+    let (result, named) = lease_named(&fake, &dir, &key("k9"));
+    assert!(result.is_err());
+    assert!(named.is_some(), "the claim's dir may exist");
 }
