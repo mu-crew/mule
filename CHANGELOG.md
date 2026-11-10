@@ -49,6 +49,33 @@ key, and a cancel that stays inside the caller's process group.
 
 ### Fixed
 
+- Review of P7a, round 3 (all in the fault-injection harness):
+  - `exec --no-detach`'s collect now runs on the prelude. A failed `wc`
+    used to read as size 0, so exec exited 0 with the output silently
+    dropped and removed the job.
+  - A failed dispatch rolls back: a `pending` marker until the session
+    starts, `cmd` written atomically, and the dir (key, claim) removed on
+    failure. A failed `run --key` no longer leaves its key holding a
+    never-started "orphan", and a failed TUI `pipe-pane` or `wait-for` no
+    longer leaves a session hung. The key is written inside that guard,
+    and the dir goes only once the sessions are proven gone; a session
+    that will not die keeps the dir and its `pending`, so the job reads
+    `unknown`, not `running`, and its key is never handed to a second job.
+  - Prune and the final removal of `pending` are silent on stdout: an `rm`
+    that printed before failing broke the dispatch reply's count and
+    failed the dispatch of a job that had started.
+  - The dispatch's advisory count can no longer print `1?` and fail a
+    dispatch whose job already started.
+  - `mule_regular` decides from one `ls -ld`, so an `rc` appearing mid-check
+    is not "not a regular file".
+  - A non-numeric `rc` makes one `ls` row unknown instead of failing the
+    listing.
+  - A claim records its claimer (host, pid, start time); a keyed lease rolls
+    an unstarted claim back and dispatches only on proof the claimer is gone
+    on this host and no session exists. It no longer holds every abandoned
+    claim as unknown forever.
+  - SPEC lists what is not fail closed yet: `tail`, `kill`, `rm --all`, and
+    the interactive non-lease TUI helpers.
 - **Remote snippets fail closed, by one rule and one prelude** (SPEC § Remote
   snippets fail closed). The probe, `ls`, prune, `rm`'s proof, the key lookup
   and the claim now start with shared shell helpers that check every external

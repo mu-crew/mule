@@ -399,3 +399,60 @@ fn ls_with_two_live_jobs_works_where_bsd_awk_refused_the_session_list() {
     want.sort();
     assert_eq!(running, want);
 }
+
+#[test]
+fn a_server_that_exits_mid_request_is_observed_once_more_and_never_read_as_gone() {
+    // `server exited unexpectedly` means the server went while the client
+    // asked: no answer either way. Seen under a loaded suite, an `ls`
+    // racing a fast job's end. One more look decides, and only a proof does.
+    if skip() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let real = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v tmux"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    for (always, want) in [(false, "running"), (true, "unknown")] {
+        let host = ShimHost::new("status-exited");
+        let id = stdout(&host.mule(&["run", "--quiet", "sleep 30"]));
+        let bin = scratch("status-exited-shim");
+        let flag = bin.join("once");
+        let gate = if always {
+            String::new()
+        } else {
+            format!(
+                "[ -e '{}' ] && exec '{real}' \"$@\"; : > '{}'\n",
+                flag.display(),
+                flag.display()
+            )
+        };
+        std::fs::write(
+            bin.join("tmux"),
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *list-sessions*) {gate}echo 'server exited unexpectedly' >&2; exit 1;; esac\nexec '{real}' \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("tmux"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = host
+            .command(&["poll", &id, "--json"])
+            .env("PATH", host.path_env(Some(&bin)))
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            json(&out)["state"],
+            want,
+            "always={always}: {}",
+            stdout(&out)
+        );
+    }
+}

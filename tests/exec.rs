@@ -344,7 +344,8 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
     impl mule::transport::Transport for ByScript {
         fn run_unlocked(&self, host: &Host, script: &str) -> anyhow::Result<Output> {
             self.0.run_unlocked(host, script)?;
-            Ok(if script.contains("live=0; tmux") {
+            // The collect is the script that prints the `trunc=` header.
+            Ok(if script.contains("printf 'trunc=") {
                 collected_live("")
             } else {
                 state("rc=0\nalive=1")

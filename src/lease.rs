@@ -387,22 +387,64 @@ pub fn start_keyed(
         .generation_unlocked()
         .context("cannot own the job's stop fence; nothing was dispatched")?;
     if let Some(key) = key {
-        match crate::run::claim(t, host, &id, key)? {
-            crate::run::Claim::Held(existing) => {
-                return own_existing(
-                    t,
-                    host,
-                    &existing,
-                    job_file,
-                    &StopFence::in_dir(fences, &existing),
-                    &|owned| {
-                        on_dispatch(Some(owned));
-                        on_dispatch(None);
-                    },
-                    Require::AnyState,
-                );
+        // Named for the signal path before the claim can land: a signal
+        // from here on removes the claim (`rm` of this id), rather than
+        // leave the key held by a job that will never start.
+        on_dispatch(Some(&Owned {
+            id: id.clone(),
+            fence_gen,
+        }));
+        // Three claims at most: another after rolling back a claim proven
+        // abandoned, or after the holder vanished in between; past that the
+        // holder is owned as it is, never rolled back in a loop.
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let existing = match crate::run::claim(t, host, &id, key)? {
+                crate::run::Claim::Claimed => break,
+                crate::run::Claim::Held(existing) => existing,
+            };
+            match crate::run::claim_state(t, host, &existing)? {
+                crate::run::ClaimState::Gone if rounds < 3 => continue,
+                crate::run::ClaimState::Unstarted(Some(claimer))
+                    if rounds < 3 && crate::claimer::proven_gone(&claimer) =>
+                {
+                    let _ = writeln!(
+                        warnings,
+                        "mule: job {existing} held key {key} but never started, and its \
+                         claimer ({}) is gone; rolling the claim back",
+                        claimer.line()
+                    );
+                    crate::run::rollback_claim(t, host, &existing, &claimer)?;
+                    continue;
+                }
+                state => {
+                    if let crate::run::ClaimState::Unstarted(claimer) = &state {
+                        let by = claimer
+                            .as_ref()
+                            .map_or("an unrecorded claimer".to_string(), |c| c.line());
+                        let _ = writeln!(
+                            warnings,
+                            "mule: job {existing} holds key {key} but has not started; its \
+                             claimer ({by}) is not proven gone, so this lease holds it as \
+                             unknown. If that claimer is gone: mule rm --host {} {existing}",
+                            host.name
+                        );
+                    }
+                    return own_existing(
+                        t,
+                        host,
+                        &existing,
+                        job_file,
+                        &StopFence::in_dir(fences, &existing),
+                        &|owned| {
+                            on_dispatch(Some(owned));
+                            on_dispatch(None);
+                        },
+                        Require::AnyState,
+                    );
+                }
             }
-            crate::run::Claim::Claimed => {}
         }
     }
     if let Err(error) = write_job_file(job_file, &id) {

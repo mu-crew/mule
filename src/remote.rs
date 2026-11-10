@@ -44,11 +44,21 @@ pub const CANNOT_TELL: i32 = 86;
 /// - `mule_regular PATH [WHAT]`: 0 for a regular file that is not a
 ///   symlink, 1 if proven absent; a symlink, a directory or anything that
 ///   cannot be looked at stops. Keys and `rc` are read only this way: a
-///   symlink is refused, not followed.
+///   symlink is refused, not followed. One `ls -ld` decides, from the type
+///   its mode string names or from its "No such file" error: one
+///   observation, so a file that appears mid-check (a job writing `rc` as
+///   it ends) is seen either absent or regular, never "not a regular file".
+///   The first version tested `[ -f ]` and then proved absence with a second
+///   look, and `rc` landing between the two stopped `exec` and `wait`
+///   (review of P7a, round 3).
 /// - `mule_read PATH [WHAT]`: `REPLY` = its content, which must be
 ///   non-empty and read with `cat` exiting 0; a missing file stops too.
 /// - `mule_sessions`: `SESSIONS` = the server's session names, one per
-///   line; empty only on tmux's own "no server" errors.
+///   line; empty only on tmux's own "no server" errors. `server exited
+///   unexpectedly` (the server went mid-request, as it does when the job
+///   that just ended held its last session) is no answer either way, so it
+///   is observed once more, and that second answer must be a proof.
+///   Measured: an `ls` racing a fast job's end under a loaded suite.
 /// - `mule_has NAME`: is NAME in `SESSIONS`? A `case`, not `grep`: nothing
 ///   to fail.
 /// - `mule_mtime PATH`: `REPLY` = its mtime in epoch seconds, digits only
@@ -69,21 +79,32 @@ mule_absent() {
   mule_u "cannot verify ${2:-path} $1: $mule_e"
 }
 mule_regular() {
-  if [ -h "$1" ]; then mule_u "${2:-file} $1 is a symlink"; fi
-  if [ -f "$1" ]; then return 0; fi
-  if mule_absent "$1" "${2:-file}"; then return 1; fi
-  mule_u "${2:-file} $1 is not a regular file"
+  if mule_e=$(LC_ALL=C ls -ld "$1" 2>&1); then
+    case $mule_e in
+      -*) return 0;;
+      l*) mule_u "${2:-file} $1 is a symlink";;
+      *) mule_u "${2:-file} $1 is not a regular file";;
+    esac
+  fi
+  case $mule_e in *'No such file or directory'*) return 1;; esac
+  mule_u "cannot verify ${2:-file} $1: $mule_e"
 }
 mule_read() {
   mule_regular "$1" "$2" || mule_u "${2:-file} $1 is missing"
   REPLY=$(cat "$1") || mule_u "cannot read ${2:-file} $1"
   [ -n "$REPLY" ] || mule_u "${2:-file} $1 is empty"
 }
-mule_sessions() {
+mule_sessions_once() {
   SESSIONS=$(tmux -L "$mule_socket" list-sessions -F '#{session_name}' 2>&1) && return 0
   case $SESSIONS in
     *'no server running'*|*'error connecting to'*'No such file or directory'*) SESSIONS=; return 0;;
+    *'server exited unexpectedly'*) return 2;;
   esac
+  mule_u "cannot verify session state: $SESSIONS"
+}
+mule_sessions() {
+  mule_sessions_once && return 0
+  mule_sessions_once && return 0
   mule_u "cannot verify session state: $SESSIONS"
 }
 mule_has() {

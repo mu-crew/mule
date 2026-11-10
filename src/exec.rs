@@ -163,6 +163,13 @@ pub fn finish_within(
 
 /// The final read and the removal, in one round trip.
 ///
+/// Fail closed ([`crate::remote`]): the session list, the `truncated`
+/// marker, both sizes and both reads are checked, and any failure stops
+/// the script before the removal, so a job is never deleted with its output
+/// unread. A `wc` that failed used to read as size 0: exec exited 0 with
+/// the command's output silently dropped, and removed the job (review of
+/// P7a, round 3).
+///
 /// No waiting in here: this runs under the ticket lock, so a sleep is a channel
 /// outage for every other caller (a 5s wait was measured holding it ~14s with a
 /// background child). [`finish`] has already waited for the session to end; the
@@ -193,15 +200,17 @@ fn collect(
     // stderr has no wrapper-side cap, so it is bounded here on the way out; a
     // command whose error stream outgrows the cap is treated as truncated too.
     let script = format!(
-        "d={dir}; \
-         live=0; tmux -L {socket} has-session -t mule-{id} 2>/dev/null && live=1; \
-         t=0; [ -f $d/truncated ] && t=1; \
-         ls=$(( $(wc -c < $d/log 2>/dev/null || echo 0) )); \
-         es=$(( $(wc -c < $d/err 2>/dev/null || echo 0) )); \
+        "{prelude}mule_socket={socket}; d={dir}; \
+         mule_sessions; live=0; if mule_has mule-{id}; then live=1; fi; \
+         t=0; if mule_regular $d/truncated truncated; then t=1; fi; \
+         mule_size $d/log log; ls=$REPLY; \
+         mule_size $d/err err; es=$REPLY; \
          if [ $es -gt {max} ]; then es={max}; t=1; fi; \
          printf 'trunc=%s\\nlive=%s\\nlog=%s\\nerr=%s\\nbytes:\\n' $t $live $ls $es; \
-         head -c $ls $d/log 2>/dev/null; head -c $es $d/err 2>/dev/null; \
+         if [ $ls -gt 0 ]; then head -c $ls $d/log || mule_u \"cannot read $d/log\"; fi; \
+         if [ $es -gt 0 ]; then head -c $es $d/err || mule_u \"cannot read $d/err\"; fi; \
          ( {remove} ) >/dev/null || exit {REMOVAL_FAILED}; exit 0",
+        prelude = crate::remote::PRELUDE,
         remove = crate::jobs::remove_one_script(host, id),
     );
     let output = transport.run(host, &script)?;

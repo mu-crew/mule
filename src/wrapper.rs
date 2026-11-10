@@ -46,11 +46,56 @@ pub fn state_dir(id: &JobId) -> String {
 pub const JOBS_ROOT: &str = "${XDG_STATE_HOME:-$HOME/.local/state}/mule/jobs";
 
 pub fn dispatch_script(host: &Host, job: &Job) -> String {
-    match job.mode {
+    dispatch_script_with(host, job, "")
+}
+
+/// [`dispatch_script`], with `first` (a `cmd && ` prefix, e.g. writing the
+/// job's key) run inside the guarded body, so its failure rolls back too.
+pub fn dispatch_script_with(host: &Host, job: &Job, first: &str) -> String {
+    let body = match job.mode {
         JobMode::Pipe => pipe_dispatch_script(host, job, false),
         JobMode::Exec => pipe_dispatch_script(host, job, true),
         JobMode::Tui => tui_dispatch_script(host, job),
-    }
+    };
+    // A dispatch that fails leaves no definite state (review of P7a, round
+    // 3). `pending` is made first and goes only once the job's session has
+    // started, so a dir with no `rc` and `pending` still in it reads
+    // `unknown`, never `orphan` or `running`. A failure anywhere in the body
+    // (`first` included) kills whatever sessions it made and removes the dir
+    // -- the key with it, so a retry of the key starts afresh -- and the
+    // dispatch fails. Before, a failed `base64` or `new-session` left a `cmd`
+    // and a key, and the key's next `run` returned that never-started job as
+    // an orphan; a failed `pipe-pane` left a TUI session hung on `wait-for`.
+    //
+    // The dir goes only once both sessions are proven gone: killed, or
+    // tmux's own "can't find session" / "no server" (matched without the
+    // apostrophe, which would unbalance the job's single quotes). Removing
+    // it beside a session that would not die would take the key from a job
+    // that may run, and the key's next `run` would start a second one; kept,
+    // with `pending`, the job reads `unknown` and `mule rm` is the way out.
+    //
+    // The last `rm` of `pending` is the one tolerated failure: the job has
+    // started, and a `pending` left behind only makes it read `unknown`
+    // until its `rc` lands. Silenced on stdout too: that `rm` printing `1`
+    // before it failed reached the dispatch reply, which then failed to
+    // parse beside a started job (fault injection).
+    let dir = state_dir(&job.id);
+    format!(
+        "mkdir -p {dir} && : > {dir}/pending && \
+         if {{ {first}{body}; }}; then rm -f {dir}/pending >/dev/null 2>&1; :; \
+         else \
+           mule_k=0; \
+           for mule_s in mule-{id} watch-{id}; do \
+             mule_e=$(tmux -L {socket} kill-session -t $mule_s 2>&1) || case $mule_e in \
+               *'t find session'*|*'no server running'*|*'error connecting to'*'No such file or directory'*) ;; \
+               *) mule_k=1;; \
+             esac; \
+           done; \
+           if [ $mule_k = 0 ]; then rm -rf {dir}; fi; false; \
+         fi",
+        socket = host.tmux_socket,
+        id = job.id,
+    )
 }
 
 fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
@@ -191,7 +236,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     };
 
     format!(
-        "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
+        "printf %s {command} | base64 -d > {dir}/cmd.tmp && mv -f {dir}/cmd.tmp {dir}/cmd && \
          tmux -L {} -f /dev/null new-session -d -s mule-{} \
          '{{ {run}; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
@@ -277,7 +322,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     );
 
     format!(
-        "mkdir -p {dir} && printf %s {command} | base64 -d > {dir}/cmd && \
+        "printf %s {command} | base64 -d > {dir}/cmd.tmp && mv -f {dir}/cmd.tmp {dir}/cmd && \
          printf %s {wrapper} | base64 -d > {dir}/wrapper && \
          printf %s {consumer} | base64 -d > {dir}/pipe && echo tui > {dir}/mode && \
          tmux -L {socket} -f /dev/null new-session -d -s mule-{id} -c {dir} \

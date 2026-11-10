@@ -185,7 +185,9 @@ fn a_keyed_lease_that_finds_its_key_holds_that_job_and_starts_nothing() {
         (probe_reply(1, "0", 0), "done"),
     ] {
         let (dir, fake) = (scratch("keys-lease"), Fake::new());
-        fake.push(Output::ok("existing=abc123\n")).push(reply);
+        fake.push(Output::ok("existing=abc123\n"))
+            .push(Output::ok("started\n"))
+            .push(reply);
 
         let owned = lease_start(&fake, &dir, &key("k4")).unwrap();
 
@@ -201,7 +203,11 @@ fn a_keyed_lease_that_finds_its_key_holds_that_job_and_starts_nothing() {
         assert_eq!(owned.fence_gen, 1, "{what}");
         assert_eq!(fence.generation_unlocked().unwrap(), 1, "{what}");
         let scripts = fake.scripts();
-        assert_eq!(scripts.len(), 2, "{what}: the lookup and one probe");
+        assert_eq!(
+            scripts.len(),
+            3,
+            "{what}: the claim, the claim state and one probe"
+        );
         assert!(
             scripts.iter().all(|s| !s.contains("new-session")),
             "{what}: nothing is dispatched"
@@ -224,8 +230,11 @@ fn a_keyed_lease_with_no_hit_names_its_job_before_the_keyed_dispatch() {
         &request(),
         Some(&key("k5")),
         &|owned| {
-            // Write-ahead: when the dispatch starts, the file already names it.
-            if let Some(owned) = owned {
+            // Named once before the claim, for the signal path; then, when
+            // the dispatch starts, the file already names it (write-ahead).
+            if let Some(owned) = owned
+                && !fake.scripts().is_empty()
+            {
                 seen.lock()
                     .unwrap()
                     .push(std::fs::read_to_string(&file).unwrap());
@@ -252,9 +261,15 @@ fn a_lease_whose_claim_finds_the_key_held_names_only_the_holder() {
     // never names an id of its own (review of P7a: it used to name a fresh
     // id that was never dispatched, and exit 1).
     let (dir, fake) = (scratch("keys-lease"), Fake::new());
-    fake.push(Output::ok("existing=ffff00\n")).push(Output::ok(
-        "exists=1\nrc=\nrcread=1\ncmd=0\nalive=0\nwatch=0\nwhy=\nsize=0\nbytes:\n",
-    ));
+    // The claimer is recorded on another host, so nothing proves it gone:
+    // the claim is held as it is.
+    fake.push(Output::ok("existing=ffff00\n"))
+        .push(Output::ok(
+            "unstarted pid=1 host=elsewhere.invalid start=Thu Jan  1 00:00:00 1970\n",
+        ))
+        .push(Output::ok(
+            "exists=1\nrc=\nrcread=1\ncmd=0\nalive=0\nwatch=0\nwhy=\nsize=0\nbytes:\n",
+        ));
 
     let owned = lease_start(&fake, &dir, &key("k6")).unwrap();
 
@@ -264,7 +279,7 @@ fn a_lease_whose_claim_finds_the_key_held_names_only_the_holder() {
         "ffff00\n"
     );
     let scripts = fake.scripts();
-    assert_eq!(scripts.len(), 2, "the claim and one probe");
+    assert_eq!(scripts.len(), 3, "the claim, the claim state and one probe");
     assert!(scripts.iter().all(|s| !s.contains("new-session")));
 }
 

@@ -132,7 +132,7 @@ fn list_script(host: &Host) -> String {
          [ -d \"$root\" ] || mule_u \"jobs root $root is not a directory\"; \
          mule_sessions; mule_now; now=$REPLY; \
          mule_stat_flavor; \
-         listing=$(find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc -o -name key \\) \\) \\) -exec stat $mule_sf \"$mule_sfmt\" {{}} +) \
+         listing=$(find \"$root\" -mindepth 1 -maxdepth 2 \\( \\( -type d ! -path \"$root/*/*\" \\) -o \\( -type f \\( -name cmd -o -name rc -o -name key -o -name pending \\) \\) \\) -exec stat $mule_sf \"$mule_sfmt\" {{}} +) \
            || mule_u \"cannot list the jobs under $root\"; \
          odd=$(find \"$root\" -mindepth 2 -maxdepth 2 \\( -name rc -o -name key \\) ! -type f) \
            || mule_u \"cannot list the jobs under $root\"; \
@@ -169,12 +169,14 @@ fn list_script(host: &Host) -> String {
                if (sub(/\\/cmd$/, \"\", dir)) kind = \"cmd\"; \
                else if (sub(/\\/rc$/, \"\", dir)) kind = \"rc\"; \
                else if (sub(/\\/key$/, \"\", dir)) kind = \"key\"; \
+               else if (sub(/\\/pending$/, \"\", dir)) kind = \"pending\"; \
                id = dir; sub(/.*\\//, \"\", id); \
                dirs[id] = dir; \
                if (kind == \"dir\") dir_mtime[id] = mtime; \
                else if (kind == \"cmd\") cmd_mtime[id] = mtime; \
                else if (kind == \"rc\") rc_mtime[id] = mtime; \
-               else key_mtime[id] = mtime; \
+               else if (kind == \"key\") key_mtime[id] = mtime; \
+               else pending[id] = 1; \
              }} \
              END {{ \
                for (id in dirs) {{ \
@@ -182,7 +184,8 @@ fn list_script(host: &Host) -> String {
                  bad = (id in odd_why) ? odd_why[id] : \"\"; \
                  rc = \"\"; \
                  if (id in rc_mtime) {{ \
-                   l = \"\"; if ((getline l < (dir \"/rc\")) > 0 && l != \"\") rc = l; \
+                   l = \"\"; if ((getline l < (dir \"/rc\")) > 0 && l ~ /^[0-9]+$/) rc = l; \
+                   else if (l != \"\") bad = dir \"/rc is not a number\"; \
                    else bad = \"cannot read \" dir \"/rc\"; \
                    close(dir \"/rc\"); \
                  }} \
@@ -197,6 +200,8 @@ fn list_script(host: &Host) -> String {
                  }} \
                  if (bad == \"\" && rc == \"\" && !(id in cmd_mtime) && !(id in alive)) \
                    bad = \"no cmd: claimed by its key but not started\"; \
+                 if (bad == \"\" && rc == \"\" && (id in pending)) \
+                   bad = \"pending: the dispatch did not complete\"; \
                  runtime = \"\"; \
                  if (rc != \"\" && (id in cmd_mtime) && (id in rc_mtime)) \
                    runtime = rc_mtime[id] - cmd_mtime[id]; \
@@ -268,10 +273,20 @@ fn parse_rows(host: &Host, reply: &str, all: bool, rows: &mut Vec<Row>) -> Resul
             _ => None,
         }
         .filter(|why| !why.is_empty());
+        // One bad row never fails the listing: an `rc` that will not parse
+        // (awk passes only digits; this catches one too large) makes that
+        // row unknown, like the rows awk itself marks.
+        let mut unknown = unknown;
         let rc = if rc_text.is_empty() {
             None
         } else {
-            Some(rc_text.parse().context("invalid rc in ls reply")?)
+            match rc_text.parse() {
+                Ok(code) => Some(code),
+                Err(_) => {
+                    unknown.get_or_insert_with(|| format!("rc {rc_text:?} is not an exit code"));
+                    None
+                }
+            }
         };
         let state = match rc {
             Some(code) => State::Done(code),
@@ -413,11 +428,15 @@ pub fn remove_one_script(host: &Host, id: &JobId) -> String {
 
 /// `kill-session` of `name`, which must kill it or prove it was not there
 /// (`can't find session`, or tmux's own "no server"); anything else stops
-/// the script, cannot tell.
+/// the script, cannot tell. `server exited unexpectedly` (killing the last
+/// session ends the server, which can drop the reply) proves nothing by
+/// itself and is let through only because the session list that follows
+/// must prove the session gone.
 fn kill_session_proven(socket: &str, name: &str) -> String {
     format!(
         "e=$(tmux -L {socket} kill-session -t {name} 2>&1) || case $e in \
            *\"can't find session\"*|*'no server running'*|*'error connecting to'*'No such file or directory'*) ;; \
+           *'server exited unexpectedly'*) ;; \
            *) mule_u \"cannot verify session state: cannot kill {name}: $e\";; \
          esac; "
     )
@@ -483,7 +502,11 @@ pub fn prune(host: &Host) -> String {
     // orphan, `rc` seen absent, `cmd` present and neither session in a list
     // tmux gave. A `find -exec test` that failed used to read as "no key"
     // and delete a keyed job (review of P7a, round 2). Runs in a subshell, so
-    // a stop ends the prune and never the dispatch it rides in.
+    // a stop ends the prune and never the dispatch it rides in. Silenced on
+    // stdout as well: the dispatch's reply is its key hits and its count,
+    // and an `rm` that printed `1` before failing turned that count into
+    // `1\n0`, failing the dispatch of a job that had started (fault
+    // injection, review of P7a round 3).
     format!(
         "( {prelude}mule_socket={socket}; root={JOBS_ROOT}; \
            if mule_absent \"$root\" \"jobs root\"; then exit 0; fi; \
@@ -505,9 +528,10 @@ pub fn prune(host: &Host) -> String {
              mule_absent \"$d/key\" key || continue; \
              mule_regular \"$d/rc\" rc && continue; \
              mule_regular \"$d/cmd\" cmd || continue; \
+             mule_regular \"$d/pending\" pending && continue; \
              if mule_has \"mule-$id\" || mule_has \"watch-$id\"; then continue; fi; \
              rm -rf \"$d\" || mule_u \"cannot remove $d\"; \
-           done ) 2>/dev/null",
+           done ) >/dev/null 2>&1",
         prelude = crate::remote::PRELUDE,
         socket = host.tmux_socket,
         keep = host.keep_days,

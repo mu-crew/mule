@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Host;
 use crate::key::JobKey;
 use crate::transport::Transport;
-use crate::wrapper::{JOBS_ROOT, Job, JobId, JobMetadata, JobMode, dispatch_script, new_id};
+use crate::wrapper::{JOBS_ROOT, Job, JobId, JobMetadata, JobMode, dispatch_script_with, new_id};
 
 pub fn dispatch(
     transport: &dyn Transport,
@@ -146,8 +146,11 @@ pub fn dispatch_keyed(
                 key_lookup_script(key),
                 job.id
             ),
+            // Inside the dispatch's guard, after its `pending`: a key write
+            // that fails rolls back with the rest, never leaving the key held
+            // by a dir that will not start.
             format!(
-                "mkdir -p {dir} && printf '%s\\n' {key} > {dir}/key && ",
+                "printf '%s\\n' {key} > {dir}/key && ",
                 dir = crate::wrapper::state_dir(&job.id)
             ),
         ),
@@ -155,12 +158,16 @@ pub fn dispatch_keyed(
     };
     // The count is advisory (a warning, never a state answer), so a count
     // that cannot be taken is `?` and no warning, not a failed dispatch: the
-    // job has started by then.
+    // job has started by then. Captured and checked before it is printed:
+    // an `awk` that printed `1` and then failed used to reach stdout as `1?`,
+    // which failed the dispatch of a job already running (review of P7a,
+    // round 3).
     let script = format!(
-        "{}; {claim}{write_key}{} && {{ n=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null) \
-           && printf '%s\\n' \"$n\" | awk '/^mule-/ {{ c++ }} END {{ print c + 0 }}' || echo '?'; }}",
+        "{}; {claim}{} && {{ n=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null) \
+           && c=$(printf '%s\\n' \"$n\" | awk '/^mule-/ {{ c++ }} END {{ print c + 0 }}') \
+           && case $c in ''|*[!0-9]*) false;; esac && echo \"$c\" || echo '?'; }}",
         crate::jobs::prune(host),
-        dispatch_script(host, &job),
+        dispatch_script_with(host, &job, &write_key),
         host.tmux_socket
     );
 
@@ -231,9 +238,20 @@ pub enum Claim {
 pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -> Result<Claim> {
     crate::errors::require_master(transport, host)?;
     let dir = crate::wrapper::state_dir(id);
+    // The claimer's record goes in before the key, so a claim that holds the
+    // key always says who made it (`crate::claimer`). A process that cannot
+    // read its own start time records nothing, and its claim can only ever
+    // be rolled back by hand.
+    let record = match crate::claimer::Claimer::current() {
+        Some(me) => format!(
+            "printf %s {} | base64 -d > {dir}/claim.tmp && mv -f {dir}/claim.tmp {dir}/claim && ",
+            crate::wrapper::encode_command(me.line().as_bytes())
+        ),
+        None => String::new(),
+    };
     let script = format!(
         "{} if [ -n \"$hit\" ]; then exit 0; fi; \
-         mkdir -p {dir} && printf '%s\\n' {key} > {dir}/key",
+         mkdir -p {dir} && {record}printf '%s\\n' {key} > {dir}/key",
         key_lookup_script(key)
     );
     let output = transport.run(host, &script)?;
@@ -248,6 +266,97 @@ pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -
         Some(holder) => Claim::Held(holder),
         None => Claim::Claimed,
     })
+}
+
+/// What a key's holder is, as far as a keyed lease needs to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimState {
+    /// It has a `cmd` or a session: a job, to be held whatever its state.
+    Started,
+    /// A claim whose dispatch never ran: no `cmd`, no session. `None` when
+    /// it records no claimer.
+    Unstarted(Option<crate::claimer::Claimer>),
+    /// Its state dir is gone (removed since the claim found it).
+    Gone,
+}
+
+/// Is `id` a started job or an unstarted claim, and whose? One locked round
+/// trip, fail closed: anything it cannot tell is an error, never `Unstarted`.
+pub fn claim_state(transport: &dyn Transport, host: &Host, id: &JobId) -> Result<ClaimState> {
+    let dir = crate::wrapper::state_dir(id);
+    let script = format!(
+        "{prelude}mule_socket={socket}; d={dir}; \
+         if mule_absent \"$d\" \"state dir\"; then echo gone; exit 0; fi; \
+         if mule_regular $d/cmd cmd; then echo started; exit 0; fi; \
+         mule_sessions; \
+         if mule_has mule-{id} || mule_has watch-{id}; then echo started; exit 0; fi; \
+         if mule_regular $d/claim claim; then \
+           mule_read $d/claim claim; printf 'unstarted %s\\n' \"$REPLY\"; \
+         else echo unrecorded; fi",
+        prelude = crate::remote::PRELUDE,
+        socket = host.tmux_socket,
+    );
+    let output = transport.run(host, &script)?;
+    if output.code != 0 {
+        bail!(
+            "cannot tell whether job {id} on {} has started: {}",
+            host.name,
+            output.stderr.trim()
+        );
+    }
+    let text = output.text();
+    let line = text.lines().next().unwrap_or("").trim();
+    Ok(match line {
+        "started" => ClaimState::Started,
+        "gone" => ClaimState::Gone,
+        "unrecorded" => ClaimState::Unstarted(None),
+        other => match other.strip_prefix("unstarted ") {
+            Some(record) => ClaimState::Unstarted(crate::claimer::Claimer::parse(record)),
+            None => bail!("invalid claim state reply for job {id}: {other:?}"),
+        },
+    })
+}
+
+/// Roll back `id`'s unstarted claim, recorded as `claimer`: one locked round
+/// trip that removes the state dir only if it still has no `cmd`, no
+/// session, and the same claimer record, and proves it gone. `Ok(false)`
+/// when the dir was already gone.
+pub fn rollback_claim(
+    transport: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    claimer: &crate::claimer::Claimer,
+) -> Result<bool> {
+    let dir = crate::wrapper::state_dir(id);
+    let script = format!(
+        "{prelude}mule_socket={socket}; d={dir}; \
+         if mule_absent \"$d\" \"state dir\"; then echo gone; exit 0; fi; \
+         if mule_regular $d/cmd cmd; then mule_u \"job {id} has started since\"; fi; \
+         mule_sessions; \
+         if mule_has mule-{id} || mule_has watch-{id}; then mule_u \"job {id} has a session\"; fi; \
+         mule_read $d/claim claim; \
+         exp=$(printf %s {expected} | base64 -d) || mule_u \"cannot decode the expected claimer\"; \
+         [ \"$REPLY\" = \"$exp\" ] || mule_u \"job {id}'s claimer changed\"; \
+         rm -rf \"$d\" || mule_u \"cannot remove $d\"; \
+         if mule_absent \"$d\" \"state dir\"; then echo rolled-back; exit 0; fi; \
+         mule_u \"$d survived its removal\"",
+        prelude = crate::remote::PRELUDE,
+        socket = host.tmux_socket,
+        expected = crate::wrapper::encode_command(claimer.line().as_bytes()),
+    );
+    let output = transport.run(host, &script)?;
+    if output.code != 0 {
+        bail!(
+            "cannot roll back job {id}'s claim on {}: {}",
+            host.name,
+            output.stderr.trim()
+        );
+    }
+    match output.text().trim() {
+        "rolled-back" => Ok(true),
+        "gone" => Ok(false),
+        other => bail!("invalid claim rollback reply for job {id}: {other:?}"),
+    }
 }
 
 /// The job holding `key` on `host`, if any: one locked round trip.

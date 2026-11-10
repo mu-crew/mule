@@ -101,10 +101,15 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     // every external command's status is checked, and only a proof makes an
     // absence. `missing` is `rm`'s proof -- the state dir seen not to exist,
     // and neither `mule-<id>` nor `watch-<id>` in a session list tmux gave.
-    // `orphan` is a dir, no session, an `rc` seen not to exist and a `cmd`
+    // `orphan` is a dir, no session, an `rc` seen not to exist, a `cmd`
     // that does (a dir with no `cmd` is a keyed lease's claim not yet
-    // started). `done` is an `rc` read as a regular file whose whole content
-    // is a number. Everything else stops the script with `CANNOT_TELL`.
+    // started) and no `pending`. `running` is a session, no `rc` and no
+    // `pending`: a dispatch that did not complete may have left a session
+    // that never runs the command (a TUI one hung on `wait-for` whose
+    // rollback could not kill it), so with `pending` there is no state to
+    // give until `rc` lands. `done` is an `rc` read as a regular file whose
+    // whole content is a number. Everything else stops the script with
+    // `CANNOT_TELL`.
     //
     // One `list-sessions`, read before `rc` (see above), answers both
     // session questions; `has-session` exits 1 for a protocol mismatch as
@@ -127,8 +132,10 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
          if mule_regular $d/rc rc; then \
            mule_read $d/rc rc; rc=$REPLY; \
            case $rc in ''|*[!0-9]*) mule_u \"rc $d/rc is not a number: $rc\";; esac; \
+         elif mule_regular $d/pending pending; then \
+           mule_u \"the job's dispatch did not complete (pending); if it is not still dispatching: mule rm {id}\"; \
          elif [ $alive = 0 ]; then \
-           mule_regular $d/cmd cmd || mule_u \"the job is claimed by its key but has not started (no cmd)\"; \
+           mule_regular $d/cmd cmd || mule_u \"the job is claimed by its key but has not started (no cmd); if its claimer is gone: mule rm {id}\"; \
          fi; \
          printf 'rc=%s\\nalive=%s\\nwatch=%s\\nwhy=\\n' \"$rc\" $alive $watch; \
          runtime=; \

@@ -46,6 +46,10 @@ fn scratch() -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    // Pids are reused, and nothing removes these dirs: a later run with
+    // this run's pid found an old run's job file and fence in its scratch
+    // dir (all of tests/attach.rs failed at once). Start empty.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

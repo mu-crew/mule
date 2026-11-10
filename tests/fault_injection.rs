@@ -41,7 +41,7 @@ use common::local::{ShimHost, scratch, stdout, tmux_available, wait_until};
 /// `read`, `case`) cannot fail this way; `test` is here for `find -exec test`.
 const TOOLS: &[&str] = &[
     "awk", "base64", "cat", "date", "find", "grep", "head", "ls", "mkdir", "mv", "rm", "sed",
-    "stat", "tail", "test", "tmux", "tr", "wc",
+    "stat", "tail", "test", "tmux", "tr", "uname", "wc",
 ];
 
 const MODES: &[&str] = &["exit2", "exit1", "partial", "eperm"];
@@ -161,6 +161,13 @@ impl Fault {
     }
 }
 
+impl Drop for Fault {
+    // Hundreds of runs each make one: leave none behind.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// Is this run's failure the fixture's, not mule's? The fake master's
 /// `-O check` is a shell script, and mule bounds the check at 2s: on a
 /// machine loaded enough, the script starts too late and mule reports no
@@ -184,6 +191,41 @@ fn retried(mut make: impl FnMut() -> Command, fresh: impl Fn() -> bool) -> Outpu
         out = make().output().unwrap();
     }
     out
+}
+
+/// [`mule_with`], killed after `limit` if it is still running, or as soon
+/// as a remote call past the fault window has started (the window's calls
+/// are then done, and a held lease would only go on holding).
+fn mule_for(host: &ShimHost, fault: &Fault, args: &[&str], limit: Duration) -> Output {
+    let mut child = host
+        .command(args)
+        .env("PATH", host.path_env(Some(shims())))
+        .env("MULE_FAULT_DIR", &fault.dir)
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + limit;
+    let window = std::fs::read_to_string(fault.dir.join("maxcall"))
+        .ok()
+        .and_then(|max| max.trim().parse::<usize>().ok());
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        let calls = std::fs::read_to_string(fault.dir.join("calls"))
+            .ok()
+            .and_then(|calls| calls.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if window.is_some_and(|max| calls > max) {
+            // Let the call that crossed the window get going, then stop.
+            std::thread::sleep(Duration::from_millis(200));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SIGKILL: no signal-path stop, so the check sees what the run left.
+    let _ = child.kill();
+    child.wait_with_output().unwrap()
 }
 
 /// Run mule with the shims first on PATH and `fault` on.
@@ -267,6 +309,8 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// A scenario: build a host's state, then check one verb run against it.
 struct Scenario {
     name: &'static str,
+    /// Kill the verb after this long: for a lease that rightly holds on.
+    hold_for: Option<Duration>,
     /// Remote calls to inject in (a lease runs on; its first calls decide).
     max_call: Option<usize>,
     setup: fn(&ShimHost) -> Vec<String>,
@@ -292,7 +336,10 @@ fn exercise(scenario: &Scenario) {
     let args = (scenario.verb)(&ids);
     let fault = Fault::new(None, scenario.max_call);
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    let _ = mule_with(&host, &fault, &args_ref);
+    let _ = match scenario.hold_for {
+        Some(limit) => mule_for(&host, &fault, &args_ref, limit),
+        None => mule_with(&host, &fault, &args_ref),
+    };
     let tools = fault.log();
     let count = tools.len();
     eprintln!(
@@ -318,13 +365,27 @@ fn exercise(scenario: &Scenario) {
             let failures = &failures;
             scope.spawn(move || {
                 for &(n, mode) in chunk {
-                    let host = fault_host(&format!("fi-{}-{n}-{mode}", scenario.name));
-                    let ids = (scenario.setup)(&host);
-                    let args = (scenario.verb)(&ids);
-                    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-                    let fault = Fault::new(Some((n, mode)), scenario.max_call);
-                    let out = mule_with(&host, &fault, &args_ref);
-                    let hit = fault.hit();
+                    // A run that took a shorter path than the enumeration
+                    // (fewer commands) never reaches a late injection: run it
+                    // again on a fresh setup, so every point is tested.
+                    let mut attempt = 0;
+                    let (host, ids, out, hit, fault) = loop {
+                        attempt += 1;
+                        let host =
+                            fault_host(&format!("fi-{}-{n}-{mode}-{attempt}", scenario.name));
+                        let ids = (scenario.setup)(&host);
+                        let args = (scenario.verb)(&ids);
+                        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+                        let fault = Fault::new(Some((n, mode)), scenario.max_call);
+                        let out = match scenario.hold_for {
+                            Some(limit) => mule_for(&host, &fault, &args_ref, limit),
+                            None => mule_with(&host, &fault, &args_ref),
+                        };
+                        let hit = fault.hit();
+                        if !hit.is_empty() || attempt == 3 {
+                            break (host, ids, out, hit, fault);
+                        }
+                    };
                     if only {
                         eprintln!(
                             "CASE log:\n{}\nstderr: {}",
@@ -409,6 +470,7 @@ fn poll_check(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), Strin
 fn poll_of_a_running_job() {
     exercise(&Scenario {
         name: "poll-running",
+        hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "sleep 60"])],
         verb: poll_verb,
@@ -420,6 +482,7 @@ fn poll_of_a_running_job() {
 fn poll_of_a_done_job() {
     exercise(&Scenario {
         name: "poll-done",
+        hold_for: None,
         max_call: None,
         setup: |h| vec![finished(h, &["run", "--quiet", "exit 17"])],
         verb: poll_verb,
@@ -431,6 +494,7 @@ fn poll_of_a_done_job() {
 fn poll_of_an_orphan() {
     exercise(&Scenario {
         name: "poll-orphan",
+        hold_for: None,
         max_call: None,
         setup: |h| {
             let d = h.jobs().join("0f0f01");
@@ -453,6 +517,7 @@ fn poll_of_a_missing_job_with_a_live_watchdog() {
     // Round 1's grep finding: absence of `mule-` and `watch-` must be seen.
     exercise(&Scenario {
         name: "poll-missing",
+        hold_for: None,
         max_call: None,
         setup: |h| {
             std::fs::create_dir_all(h.jobs()).unwrap();
@@ -486,6 +551,7 @@ fn ls_check(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), String>
 fn ls_plain() {
     exercise(&Scenario {
         name: "ls",
+        hold_for: None,
         max_call: None,
         setup: ls_setup,
         verb: |_| vec!["ls".into(), "--json".into()],
@@ -497,6 +563,7 @@ fn ls_plain() {
 fn ls_key_prefix() {
     exercise(&Scenario {
         name: "ls-key-prefix",
+        hold_for: None,
         max_call: None,
         setup: ls_setup,
         verb: |_| {
@@ -515,6 +582,7 @@ fn ls_key_prefix() {
 fn ls_running_key_prefix() {
     exercise(&Scenario {
         name: "ls-running-key-prefix",
+        hold_for: None,
         max_call: None,
         setup: ls_setup,
         verb: |_| {
@@ -538,6 +606,7 @@ fn prune_in_a_dispatch() {
     // unkeyed done job and an old orphan may go (prune's job).
     exercise(&Scenario {
         name: "prune",
+        hold_for: None,
         max_call: None,
         setup: |h| {
             let keyed = finished(h, &["run", "--quiet", "--key", "mu.old", "true"]);
@@ -576,6 +645,7 @@ fn rm_check(_: &ShimHost, _: &[String], out: &Output) -> Result<(), String> {
 fn rm_of_a_running_job() {
     exercise(&Scenario {
         name: "rm-running",
+        hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "sleep 60"])],
         verb: |ids| vec!["rm".into(), ids[0].clone()],
@@ -587,6 +657,7 @@ fn rm_of_a_running_job() {
 fn rm_of_a_done_job() {
     exercise(&Scenario {
         name: "rm-done",
+        hold_for: None,
         max_call: None,
         setup: |h| {
             // The job first: a server the test started would hand its own
@@ -625,6 +696,7 @@ fn no_second_job(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), St
 fn run_key_of_an_existing_key() {
     exercise(&Scenario {
         name: "run-key",
+        hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "--key", "mu.k", "sleep 60"])],
         verb: |_| {
@@ -644,6 +716,7 @@ fn run_key_of_an_existing_key() {
 fn run_key_of_a_new_key() {
     exercise(&Scenario {
         name: "run-key-new",
+        hold_for: None,
         max_call: None,
         setup: |h| {
             vec![running(
@@ -688,18 +761,26 @@ fn lease_verb(file: &str) -> Vec<String> {
         "mu.lease".into(),
         "--job-file".into(),
         file.into(),
+        // The watchdog's dispatch path too.
+        "--max-secs".into(),
+        "30".into(),
         "--".into(),
-        "exit 4".into(),
+        // A second of life: the dispatch's advisory count runs its `awk`
+        // only while the job's server is up, and an instant `exit 4` raced
+        // it, so the command count varied from run to run.
+        "sleep 1; exit 4".into(),
     ]
 }
 
 #[test]
 fn keyed_lease_of_an_existing_key() {
-    // The claim finds the done job; the adoption probe follows. Injected in
-    // those two calls, the lease must start nothing and name only that job.
+    // The claim finds the done job; its claim state and the adoption probe
+    // follow. Injected in those three calls, the lease must start nothing
+    // and name only that job.
     exercise(&Scenario {
         name: "lease-existing",
-        max_call: Some(2),
+        hold_for: None,
+        max_call: Some(3),
         setup: |h| {
             let id = finished(h, &["run", "--quiet", "--key", "mu.lease", "exit 4"]);
             vec![id, h.dir.join("w.job").display().to_string()]
@@ -726,12 +807,13 @@ fn keyed_lease_of_an_existing_key() {
 
 #[test]
 fn keyed_lease_through_its_first_hold_tick() {
-    // The third call is the hold's first probe, a screen probe (`capture-pane`
+    // The fourth call is the hold's first probe, a screen probe (`capture-pane`
     // or the saved screen): injected there, the lease holds on and ends with
     // the job's code, never with a state it could not read.
     exercise(&Scenario {
         name: "lease-hold",
-        max_call: Some(3),
+        hold_for: None,
+        max_call: Some(4),
         setup: |h| {
             let id = finished(
                 h,
@@ -759,6 +841,7 @@ fn keyed_lease_of_a_new_key() {
     // for the key, and its job file names that job or nothing.
     exercise(&Scenario {
         name: "lease-new",
+        hold_for: None,
         max_call: Some(2),
         setup: |h| {
             std::fs::create_dir_all(h.jobs()).unwrap();
@@ -873,5 +956,436 @@ fn an_unreadable_key_is_refused_with_running_too() {
             problems.push(format!("{what}: {why}: {}", stdout(out)));
         }
     }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// -- review round 3: the reviewer's scenarios for the in-scope verbs ---------------
+//
+// Adopted from the round-3 review harness. Its `tail`, `kill` and `rm --all`
+// scenarios are not here: those verbs are out of scope for the discipline
+// (SPEC § Remote snippets fail closed, "Not yet fail closed").
+
+#[test]
+fn r3_ls_all_with_uname() {
+    exercise(&Scenario {
+        name: "ls-all",
+        hold_for: None,
+        max_call: None,
+        setup: |h| {
+            let ids = ls_setup(h);
+            age(h, &ids[1]);
+            ids
+        },
+        verb: |_| vec!["ls".into(), "--json".into(), "--all".into()],
+        check: ls_check,
+    });
+}
+
+#[test]
+fn r3_attach_of_a_running_job() {
+    exercise(&Scenario {
+        name: "attach-running",
+        hold_for: None,
+        max_call: Some(1),
+        setup: |h| {
+            let id = running(h, &["run", "--quiet", "--tui", "sleep 60"]);
+            vec![id, h.dir.join("attach.job").display().to_string()]
+        },
+        verb: |ids| {
+            vec![
+                "run".into(),
+                "--lease".into(),
+                "--attach".into(),
+                ids[0].clone(),
+                "--job-file".into(),
+                ids[1].clone(),
+            ]
+        },
+        check: |host, ids, out| {
+            refused(host, &ids[..1], out)?;
+            if Path::new(&ids[1]).exists() {
+                return Err("attach wrote job file after failed probe".into());
+            }
+            kept(host, &ids[..1])
+        },
+    });
+}
+
+#[test]
+fn r3_exec_no_detach() {
+    exercise(&Scenario {
+        name: "exec-no-detach",
+        hold_for: None,
+        max_call: None,
+        setup: |h| {
+            std::fs::create_dir_all(h.jobs()).unwrap();
+            vec![]
+        },
+        verb: |_| {
+            vec![
+                "exec".into(),
+                "--no-detach".into(),
+                "echo hello-exec; echo err-exec >&2".into(),
+            ]
+        },
+        check: |host, _, out| {
+            if out.status.success() {
+                if stdout(out) != "hello-exec" {
+                    return Err(format!(
+                        "exec exited 0 with wrong/dropped stdout {:?}",
+                        stdout(out)
+                    ));
+                }
+                let err = String::from_utf8_lossy(&out.stderr);
+                if err.trim() != "err-exec" {
+                    return Err(format!(
+                        "exec exited 0 with wrong/dropped stderr {:?}",
+                        err.trim()
+                    ));
+                }
+            }
+            let leftover = jobs(host);
+            if !leftover.is_empty() {
+                return Err(format!("exec left jobs behind: {leftover:?}"));
+            }
+            Ok(())
+        },
+    });
+}
+
+#[test]
+fn r3_run_key_new_never_poisons_key_with_unstarted_orphan() {
+    exercise(&Scenario {
+        name: "run-key-new-strict",
+        hold_for: None,
+        max_call: None,
+        setup: |h| {
+            vec![running(
+                h,
+                &["run", "--quiet", "--key", "mu.other", "sleep 60"],
+            )]
+        },
+        verb: |_| {
+            vec![
+                "run".into(),
+                "--quiet".into(),
+                "--key".into(),
+                "mu.new".into(),
+                "sleep 60".into(),
+            ]
+        },
+        check: |host, ids, out| {
+            kept(host, ids)?;
+            let holders: Vec<_> = jobs(host)
+                .into_iter()
+                .filter(|id| key_of(host, id).as_deref() == Some("mu.new"))
+                .collect();
+            if holders.len() > 1 {
+                return Err(format!("two jobs hold the key: {holders:?}"));
+            }
+            if !out.status.success() {
+                for h_id in &holders {
+                    let none = Fault::new(None, Some(0));
+                    let polled = mule_with(host, &none, &["poll", h_id, "--json"]);
+                    if let Some(v) = json(&polled)
+                        && v["state"] != "unknown"
+                        && v["state"] != "running"
+                    {
+                        return Err(format!(
+                            "failed run --key left holder {h_id} in definite state {}",
+                            v["state"]
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        },
+    });
+}
+
+#[test]
+fn r3_run_tui_key_new_and_watchdog() {
+    exercise(&Scenario {
+        name: "run-tui-key-wd",
+        hold_for: None,
+        max_call: None,
+        setup: |h| {
+            std::fs::create_dir_all(h.jobs()).unwrap();
+            vec![]
+        },
+        verb: |_| {
+            vec![
+                "run".into(),
+                "--quiet".into(),
+                "--tui".into(),
+                "--max-secs".into(),
+                "30".into(),
+                "--key".into(),
+                "mu.tui".into(),
+                "true".into(),
+            ]
+        },
+        check: |host, _, out| {
+            let holders: Vec<_> = jobs(host)
+                .into_iter()
+                .filter(|id| key_of(host, id).as_deref() == Some("mu.tui"))
+                .collect();
+            if holders.len() > 1 {
+                return Err(format!("two jobs hold the key: {holders:?}"));
+            }
+            if !out.status.success() {
+                for h_id in &holders {
+                    if host.tmux.has_session(&format!("mule-{h_id}")) {
+                        return Err(format!(
+                            "failed --tui dispatch left live session mule-{h_id} running/hung"
+                        ));
+                    }
+                    let none = Fault::new(None, Some(0));
+                    let polled = mule_with(host, &none, &["poll", h_id, "--json"]);
+                    if let Some(v) = json(&polled)
+                        && v["state"] != "unknown"
+                    {
+                        return Err(format!(
+                            "failed --tui dispatch left holder {h_id} in definite state {}",
+                            v["state"]
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        },
+    });
+}
+
+#[test]
+fn r3_non_numeric_rc_in_ls_and_mule_regular_toctou() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not on PATH");
+        return;
+    }
+    let _one_at_a_time = serial();
+    let h = fault_host("fi-bad-rc");
+    let good = running(&h, &["run", "--quiet", "--key", "mu.good", "sleep 60"]);
+    let bad = h.jobs().join("bad001");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(
+        bad.join("cmd"),
+        "true
+",
+    )
+    .unwrap();
+    std::fs::write(
+        bad.join("rc"),
+        "notanumber
+",
+    )
+    .unwrap();
+    let none = Fault::new(None, Some(0));
+    let polled = mule_with(&h, &none, &["poll", "bad001", "--json"]);
+    let listed = mule_with(&h, &none, &["ls", "--json", "--key-prefix", "mu.good"]);
+
+    // Also test mule_regular TOCTOU: when $d/rc appears just as ls -d $d/rc runs
+    // after [ -f $d/rc ] returned false.
+    let h2 = fault_host("fi-toctou");
+    let running_id = running(&h2, &["run", "--quiet", "sleep 60"]);
+    let rc_path = h2.jobs().join(&running_id).join("rc");
+    let real_ls = real("ls");
+    let ls_shim = h2.dir.join("ls");
+    std::fs::write(
+        &ls_shim,
+        format!(
+            "#!/bin/sh\nfor a; do case $a in */rc) echo 0 > '{}' ;; esac; done\nexec '{real_ls}' \"$@\"\n",
+            rc_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ls_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let toctou_wait = h2.mule(&["wait", &running_id]);
+
+    let mut problems = Vec::new();
+    if json(&polled)
+        .and_then(|v| v["state"].as_str().map(str::to_string))
+        .as_deref()
+        != Some("unknown")
+    {
+        problems.push(format!(
+            "poll bad001: expected unknown, got {}",
+            stdout(&polled)
+        ));
+    }
+    if !listed.status.success() {
+        problems.push(format!(
+            "ls --json --key-prefix mu.good failed when another job (bad001) had non-numeric rc (good={good}): {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    if !toctou_wait.status.success() {
+        problems.push(format!(
+            "wait failed on mule_regular TOCTOU when rc appeared between [ -f ] and ls -d: {}",
+            String::from_utf8_lossy(&toctou_wait.stderr).trim()
+        ));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+// -- the claim proof path (ruling 3) ---------------------------------------------------
+
+/// An unstarted claim of `mu.lease` by `claimer`: a state dir with a `key`
+/// and a `claim` record, and no `cmd`.
+fn claim_by(h: &ShimHost, id: &str, claimer: &mule::claimer::Claimer) {
+    let d = h.jobs().join(id);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("claim"), format!("{}\n", claimer.line())).unwrap();
+    std::fs::write(d.join("key"), "mu.lease\n").unwrap();
+}
+
+/// A pid that was this host's and has exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+fn here() -> String {
+    mule::claimer::local_host().expect("a host name")
+}
+
+#[test]
+fn keyed_lease_of_an_abandoned_claim() {
+    // The claimer is gone (same host, pid dead), no session: the lease rolls
+    // the claim back and dispatches once. Injected anywhere in the claim,
+    // the claim state, the rollback, the second claim or the dispatch, it
+    // makes at most one job for the key, and names that job or nothing.
+    exercise(&Scenario {
+        name: "lease-abandoned",
+        hold_for: None,
+        max_call: Some(5),
+        setup: |h| {
+            let claimer = mule::claimer::Claimer {
+                pid: dead_pid(),
+                host: here(),
+                start: "Thu Jan  1 00:00:00 1970".into(),
+            };
+            claim_by(h, "0c1a1d", &claimer);
+            vec![h.dir.join("w.job").display().to_string()]
+        },
+        verb: |ids| lease_verb(&ids[0]),
+        check: |host, ids, _| {
+            std::thread::sleep(Duration::from_millis(300));
+            let holders: Vec<_> = jobs(host)
+                .into_iter()
+                .filter(|id| key_of(host, id).as_deref() == Some("mu.lease"))
+                .collect();
+            if holders.len() > 1 {
+                return Err(format!("two jobs hold the key: {holders:?}"));
+            }
+            if let Ok(named) = std::fs::read_to_string(&ids[0])
+                && !holders.iter().any(|id| id == named.trim())
+                && jobs(host).contains(named.trim())
+            {
+                return Err(format!(
+                    "job file names {}, not the key's job",
+                    named.trim()
+                ));
+            }
+            Ok(())
+        },
+    });
+}
+
+#[test]
+fn keyed_lease_of_a_live_claimers_claim() {
+    // The claimer is alive (this test process): nothing proves the claim
+    // abandoned, under any injection. The lease never rolls it back and
+    // never dispatches; it holds the claim as unknown until killed.
+    exercise(&Scenario {
+        name: "lease-claim-alive",
+        hold_for: Some(Duration::from_secs(30)),
+        max_call: Some(3),
+        setup: |h| {
+            let me = mule::claimer::Claimer {
+                pid: std::process::id(),
+                host: here(),
+                start: mule::claimer::start_time(std::process::id()).unwrap(),
+            };
+            claim_by(h, "0c1a1e", &me);
+            vec!["0c1a1e".into(), h.dir.join("w.job").display().to_string()]
+        },
+        verb: |ids| lease_verb(&ids[1]),
+        check: |host, ids, _| {
+            let now = jobs(host);
+            if now.len() != 1 || !now.contains(&ids[0]) {
+                return Err(format!("the live claim was replaced: jobs are {now:?}"));
+            }
+            if host.jobs().join(&ids[0]).join("cmd").exists() {
+                return Err("the live claimer's job was started by another lease".into());
+            }
+            Ok(())
+        },
+    });
+}
+
+// -- a failed dispatch whose rollback cannot kill its session ------------------------
+
+#[test]
+fn a_failed_dispatch_keeps_its_key_while_its_session_will_not_die() {
+    // Two faults, which the sweep never makes: the TUI `pipe-pane` fails,
+    // and then so does the rollback's `kill-session`. The session may run,
+    // so its dir -- the key with it -- must stay, `pending` and all: `poll`
+    // says unknown, and the key's next `run` finds that job rather than
+    // start a second.
+    if !tmux_available() {
+        eprintln!("skipping: tmux is not on PATH");
+        return;
+    }
+    let _one_at_a_time = serial();
+    let h = fault_host("fi-stuck-rollback");
+    std::fs::create_dir_all(h.jobs()).unwrap();
+    let bin = scratch("fi-stuck-rollback-shim");
+    std::fs::write(
+        bin.join("tmux"),
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *pipe-pane\\ -O*|*kill-session*) echo 'tmux: Permission denied' >&2; exit 1;; esac\nexec '{}' \"$@\"\n",
+            real("tmux")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("tmux"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let failed = h
+        .command(&["run", "--quiet", "--tui", "--key", "mu.stuck", "true"])
+        .env("PATH", h.path_env(Some(&bin)))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let made = jobs(&h);
+    let mut problems = Vec::new();
+    if failed.status.success() {
+        problems.push(format!("the dispatch succeeded: {}", stdout(&failed)));
+    }
+    let id = made.iter().next().cloned().unwrap_or_default();
+    if made.len() != 1 || key_of(&h, &id).as_deref() != Some("mu.stuck") {
+        problems.push(format!("the job's dir and key went: jobs are {made:?}"));
+    } else {
+        if !h.jobs().join(&id).join("pending").exists() {
+            problems.push("no pending marker".into());
+        }
+        let polled = h.mule(&["poll", &id, "--json"]);
+        if json(&polled).is_some_and(|v| v["state"] != "unknown") {
+            problems.push(format!("poll: {}", stdout(&polled)));
+        }
+        let again = h.mule(&["run", "--quiet", "--key", "mu.stuck", "true"]);
+        if jobs(&h).len() != 1 {
+            problems.push(format!("a second job for the key: {:?}", jobs(&h)));
+        }
+        if again.status.success() && stdout(&again) != id {
+            problems.push(format!("the retry printed {}", stdout(&again)));
+        }
+    }
+    let _ = h
+        .tmux
+        .command(&["kill-session", "-t", &format!("mule-{id}")])
+        .status();
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
