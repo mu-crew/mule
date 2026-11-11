@@ -188,7 +188,7 @@ pub enum Commands {
         human: bool,
         /// Run an interactive/full-screen program on the remote tmux pane PTY
         ///
-        /// Use this for `pi-meta`, editors, REPLs, and other programs you plan
+        /// Use this for `pi`, editors, REPLs, and other programs you plan
         /// to view or control through murmur/mu. Without --tui, mule pipes the
         /// command's output into its log artifact, so attaching reaches the
         /// right pane but there is no live TUI to render. After dispatch, mule

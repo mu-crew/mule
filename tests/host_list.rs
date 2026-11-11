@@ -133,7 +133,7 @@ fn stdout_survives_invalid_utf8() {
 fn every_ssh_invocation_is_incapable_of_prompting() {
     // `BatchMode=yes` gags ssh's OWN prompts but not a `ProxyCommand`, which is
     // a separate program with its own terminal. A site wrapper that performs
-    // 2FA (`ProxyCommand 2fa-proxy ...`, as a corporate devserver typically sets)
+    // 2FA (`ProxyCommand 2fa-proxy ...`, as a devserver often sets)
     // will prompt regardless -- so a mule call against a host whose master died
     // could spawn a passcode prompt into the caller's terminal, with nothing
     // naming which invocation was asking.

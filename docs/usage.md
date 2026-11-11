@@ -23,7 +23,7 @@ mule forwards it unchanged, so murmur shows the job as crew. Use
 Commands that need a terminal use explicit TUI mode:
 
 ```sh
-id=$(mule run --tui 'pi-meta --pi-meta-no-solo --approve')
+id=$(mule run --tui 'pi --approve')
 mule tail "$id"                 # current screen, or final saved screen
 mule tail --transcript "$id"    # raw terminal transcript, explicitly
 ```
