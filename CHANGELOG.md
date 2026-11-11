@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-11-11
 
-The surface mu's mule plugin needs (mu plugins spec, D15): a status a caller
-can trust after its own crash, a caller key with dispatch dedupe, a listing by
-key, and a cancel that stays inside the caller's process group.
+For callers that must survive their own crash: a status they can trust, a
+caller key with dispatch dedupe, a listing by key, and a cancel that stays
+inside the caller's process group. **Breaking for scripts:** `poll --json`
+now exits 0 for every state, including a missing job (it was exit 1); read
+`state` instead of the exit code.
 
 ### Added
 
