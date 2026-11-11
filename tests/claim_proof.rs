@@ -67,19 +67,37 @@ fn lease(h: &ShimHost) -> std::process::Command {
     command
 }
 
-/// A lease that must hold the claim: it is still running after 3s, has
-/// started nothing and named the claim. Killed with SIGKILL so its
-/// signal-path stop does not remove the claim.
+/// How long a holding lease may take to name the claim in its job file. It
+/// does so in well under a second on an idle machine, but at load ~20 it was
+/// seen still short of it after 3s, so the read raced the write (flake fixed
+/// in mule_flakes_low). Waited for, never assumed: the bound only caps a hang.
+const NAMED_WITHIN: Duration = Duration::from_secs(30);
+
+/// A lease that must hold the claim: it is still running after 3s and until
+/// it has named the claim, has started nothing, and names only the claim.
+/// Killed with SIGKILL so its signal-path stop does not remove the claim.
 fn assert_held(h: &ShimHost) {
     let mut child = lease(h).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+    let alive = |child: &mut std::process::Child| {
         assert!(
             child.try_wait().unwrap().is_none(),
             "the lease ended instead of holding the claim"
         );
+    };
+    let held_for = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < held_for {
+        alive(&mut child);
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Holding is a state the lease reaches, then stays in: wait for the job
+    // file, still alive at every look, rather than read it at a fixed time.
+    let job_file = h.dir.join("w.job");
+    let named_by = Instant::now() + NAMED_WITHIN;
+    while !job_file.exists() && Instant::now() < named_by {
+        alive(&mut child);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    alive(&mut child);
     let _ = child.kill();
     let out = child.wait_with_output().unwrap();
     assert_eq!(jobs(h), vec![CLAIM.to_string()], "nothing else was started");

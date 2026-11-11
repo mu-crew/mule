@@ -27,14 +27,64 @@ struct Local {
     /// The longest any one script ran. `Transport::run` holds the ticket for
     /// exactly this long, so it is the channel outage a caller can cause.
     longest: Mutex<Duration>,
+    /// A `sleep` that logs each call to `sleeps` before sleeping, first on
+    /// every locked script's PATH. A deliberate wait shows up here at its
+    /// asked-for length, however loaded the machine is; wall time does not
+    /// separate that from a slow fork.
+    shim: PathBuf,
+    sleeps: PathBuf,
+    /// The sleep the shim hands off to, for a job that must not be logged.
+    real_sleep: PathBuf,
+}
+
+impl Local {
+    fn new(state: PathBuf) -> Self {
+        let shim = state.join("shim");
+        std::fs::create_dir_all(&shim).unwrap();
+        let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("sleep"))
+            .find(|path| path.is_file())
+            .expect("a sleep on PATH");
+        let sleep = shim.join("sleep");
+        std::fs::write(
+            &sleep,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"$MULE_TEST_SLEEPS\"\nexec '{}' \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sleep, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Self {
+            sleeps: state.join("sleeps"),
+            state,
+            longest: Mutex::new(Duration::ZERO),
+            shim,
+            real_sleep: real,
+        }
+    }
+
+    /// Every `sleep` a locked script asked for, as its arguments.
+    fn sleeps(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.sleeps)
+            .map(|s| s.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
 }
 
 impl Transport for Local {
     fn run_unlocked(&self, _: &Host, script: &str) -> anyhow::Result<Output> {
         let started = Instant::now();
+        let path = std::env::join_paths(
+            std::iter::once(self.shim.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )?;
         let out = Command::new("sh")
             .args(["-c", script])
             .env("XDG_STATE_HOME", &self.state)
+            .env("PATH", path)
+            .env("MULE_TEST_SLEEPS", &self.sleeps)
             .stdin(Stdio::null())
             .output()?;
         let mut longest = self.longest.lock().unwrap();
@@ -86,10 +136,7 @@ impl Server {
         };
         Self {
             host,
-            transport: Local {
-                state: root.clone(),
-                longest: Mutex::new(Duration::ZERO),
-            },
+            transport: Local::new(root.clone()),
             root,
         }
     }
@@ -413,9 +460,28 @@ fn an_ordinary_exec_holds_no_locked_call_past_a_second() {
     }
     let server = Server::start(1 << 20);
 
-    let (code, out, _) = server.exec("e20009", "sleep 1; echo late", None);
+    // A wall-clock bound of 1s around each locked call failed at load 86-173
+    // (1.00-1.65s for scripts that do no waiting), so this proves "no locked
+    // call waits" two ways, neither of which a loaded machine can trip:
+    //
+    // 1. No locked script sleeps. The job's own sleep names the real binary,
+    //    so it bypasses the shim the job inherits through the tmux server.
+    // 2. No locked call spans most of the job. A wait for the job by any
+    //    means -- a polling loop, `tmux wait-for`, a blocking read -- holds the
+    //    ticket for nearly all of JOB; the slowest waitless call seen under
+    //    load was 1.65s, under half of it.
+    const JOB: Duration = Duration::from_secs(4);
+    let cmd = format!(
+        "'{}' {}; echo late",
+        server.transport.real_sleep.display(),
+        JOB.as_secs()
+    );
+
+    let (code, out, _) = server.exec("e20009", &cmd, None);
 
     assert_eq!((code, out.as_str()), (0, "late\n"));
+    let sleeps = server.transport.sleeps();
+    assert!(sleeps.is_empty(), "a locked script slept: {sleeps:?}");
     let longest = *server.transport.longest.lock().unwrap();
-    assert!(longest < Duration::from_secs(1), "{longest:?}");
+    assert!(longest < JOB * 3 / 4, "a locked call ran {longest:?}");
 }
