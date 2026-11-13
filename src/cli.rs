@@ -1396,16 +1396,21 @@ impl<W: Write> Write for HintWriter<W> {
     }
 }
 
-fn missing_tool_hint(log_tail: &[u8]) {
+fn looks_like_missing_tool(log_tail: &[u8]) -> bool {
     let text = String::from_utf8_lossy(log_tail).to_ascii_lowercase();
-    if [
+    [
         "command not found",
+        // dash, /bin/sh on Debian and Ubuntu: `sh: 1: lake: not found`.
+        ": not found",
         "not found on path",
         "no such file or directory",
     ]
     .iter()
     .any(|pattern| text.contains(pattern))
-    {
+}
+
+fn missing_tool_hint(log_tail: &[u8]) {
+    if looks_like_missing_tool(log_tail) {
         eprintln!(
             "mule: the job's shell is non-login, so ~/.bash_profile did not run. If this is a missing tool, put its shims dir on PATH: mule run 'export PATH=$HOME/.elan/bin:$PATH; <cmd>'"
         );
@@ -1660,8 +1665,8 @@ fn collapse_whitespace(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, collapse_whitespace, command_from_args, display_command, host_info, poll_json,
-        tui_hints,
+        Cli, collapse_whitespace, command_from_args, display_command, host_info,
+        looks_like_missing_tool, poll_json, tui_hints,
     };
     use crate::config::Config;
     use crate::probe::State;
@@ -1924,5 +1929,17 @@ mod tests {
 
         // Whitespace still collapses on the full path.
         assert_eq!(collapse_whitespace("a\n\tb  c"), "a b c");
+    }
+
+    #[test]
+    fn a_missing_tool_is_recognised_in_each_shells_wording() {
+        // bash, and macOS's /bin/sh, which is bash.
+        assert!(looks_like_missing_tool(
+            b"bash: line 1: lake: command not found\n"
+        ));
+        // dash, /bin/sh on Debian and Ubuntu. First caught by CI on
+        // ubuntu-latest: the hint never fired there.
+        assert!(looks_like_missing_tool(b"sh: 1: lake: not found\n"));
+        assert!(!looks_like_missing_tool(b"error: build failed\n"));
     }
 }
