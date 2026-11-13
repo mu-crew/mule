@@ -13,9 +13,10 @@ documentation = "https://github.com/mu-crew/mule"
 readme = "README.md"
 keywords = ["ssh", "remote", "jobs", "tmux", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-# Edition 2024 needs 1.85, and the code uses let-chains and
-# `u64::is_multiple_of`. Stated so a build failure names the cause.
-rust-version = "1.85"
+# Let-chains (stable in 1.88) set the floor, above edition 2024's 1.85 and
+# `u64::is_multiple_of`'s 1.87. Stated so a build failure names the cause.
+# CI's msrv job builds with exactly this version.
+rust-version = "1.88"
 # Ship only what builds and explains the tool. `tests/` is excluded because
 # layers 2 and 3 need tmux and a local sshd, so they cannot run from a
 # published tarball -- the repository is where they belong.

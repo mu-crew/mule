@@ -17,7 +17,7 @@ npm i -g @mu-crew/mule
 ```
 
 Prebuilt for Linux x64, Linux arm64 and macOS arm64. Or `cargo install mule-cli`
-(Rust 1.85+), or `cargo install --path .` from a clone. The host needs `tmux`.
+(Rust 1.88+), or `cargo install --path .` from a clone. The host needs `tmux`.
 
 ## Set up a host
 

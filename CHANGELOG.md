@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The missing-tool hint after a failed `run --wait` now fires on hosts whose
+  `/bin/sh` is dash (Debian, Ubuntu), which word the error
+  `sh: 1: <cmd>: not found` rather than `command not found`.
+- `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
+  where the build fails.
+
 ## 0.5.0 — 2026-11-11
 
 For callers that must survive their own crash: a status they can trust, a

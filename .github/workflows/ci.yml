@@ -48,14 +48,20 @@ jobs:
         env:
           MULE_REQUIRE_LAYERS: "1"
 
-  # Cargo.toml states rust-version = 1.85, so check that it still builds.
+  # Build with the rust-version Cargo.toml claims. It is read from the file
+  # so the claim and the check cannot drift apart. The first run of this job
+  # found the claim was 1.85 while let-chains need 1.88.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: rustup toolchain install 1.85 --profile minimal
+      - name: Install the declared toolchain
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+          rustup toolchain install "$msrv" --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.85 check --all-targets --locked
+      - run: cargo +"$MSRV" check --all-targets --locked
 
   # The crate ships only the `include` list in Cargo.toml. Catch a missing file
   # here rather than on release day.

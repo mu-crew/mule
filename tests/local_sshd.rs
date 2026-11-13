@@ -456,8 +456,11 @@ fn run_wait_hints_when_a_missing_tool_fails_without_touching_stdout() {
         1,
         "the hint must not alter stdout: {failed_stdout:?}"
     );
+    // bash says `command not found`, and dash (/bin/sh on Ubuntu) says
+    // `sh: 1: <cmd>: not found`.
     assert!(
-        log_lines[0].contains("mule_definitely_missing_binary: command not found"),
+        log_lines[0].contains("mule_definitely_missing_binary: command not found")
+            || log_lines[0].contains("mule_definitely_missing_binary: not found"),
         "{failed_stdout:?}"
     );
     let hint = String::from_utf8_lossy(&failed.stderr);
