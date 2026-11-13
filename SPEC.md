@@ -276,23 +276,21 @@ mule: no control master for build
   run: ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
 ```
 
-Opening a master can require a terminal for a hardware token. The explicit command costs one token tap per `ControlPersist` window; a background process cannot perform that prompt. Missing masters exit with status **3**.
+Opening a master may need a prompt (a hardware token, a second factor) that only a terminal can answer, so a missing master exits **3**. A master lasts until `ControlPersist` runs out or the connection under it drops, whichever comes first. A resumable transport can hold the connection across drops: for example Eternal Terminal with a port forward to the host's sshd, and the host's ssh config pointing at that port. mule resolves its target through ssh, so it needs no change.
 
 ### Exit 3 is a request for a human, not a transient error
 
-The distinction matters for automated callers, which are the primary users. Every other failure is something a program can reason about; this one requires a physical act that no amount of retrying produces.
-
-So exit 3 has its own code, and the contract for a caller receiving it is to **stop and escalate to an operator**. Three specific responses are wrong:
+Every other failure is something a program can reason about; this one needs an act that no retry produces. A caller that gets exit 3 **stops and asks an operator**. Three responses are wrong:
 
 | Response | Why it fails |
 | --- | --- |
-| Retry, or sleep and retry | A master does not appear without the human act. The wait is unbounded. |
-| Run `ssh -MNf` from the agent | Measured: it cannot prompt for a token without a terminal, and fails opaquely from a background call. |
-| Fall back to `ssh host command` | Holds a session channel for the job's lifetime — the exact failure this design removes — and starves every other tool on a capped connection. |
+| Retry, or sleep and retry | The master does not appear without the human. The wait is unbounded. |
+| Run `ssh -MNf` from the agent | It cannot answer the prompt without a terminal, and fails opaquely in the background. |
+| Fall back to `ssh host command` | Holds a session channel for the job's lifetime and starves every other tool on a capped connection. |
 
-One tap unblocks every job for the life of the `ControlPersist` window, so the escalation is cheap and rare. An agent that improvises instead converts a ten-second interruption into a broken host.
+One prompt unblocks every job for as long as the master lives, so the escalation is cheap. An agent that improvises turns a short interruption into a broken host.
 
-One caller waits for a master instead: the **detached stop child** a lease (or `exec`) spawns from its signal path (`rm --retry-for`, [Detached cleanup](#detached-cleanup)). It has no terminal, opens nothing and prompts for nothing. It polls `-O check`, which is lock-free and opens no session, every 5s, and gives up at a soft deadline. It waits for the human the dead pane already asked, and when it gives up it says so in a record.
+One caller waits for a master instead: the **detached stop child** a lease (or `exec`) spawns from its signal path (`rm --retry-for`, [Detached cleanup](#detached-cleanup)). It has no terminal and opens nothing. It polls `-O check`, which opens no session, every 5s, gives up at a soft deadline, and records that it gave up.
 
 ## Commands and output
 
