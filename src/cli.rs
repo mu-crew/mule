@@ -1180,7 +1180,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         "cannot follow a TUI job; streaming redraw bytes is not useful".to_string();
                     if !quiet {
                         message.push_str(&format!(
-                            "\n  view current screen: mule tail {id}\n  jump/interact:       murmur pick --all    # select mule-{id}"
+                            "\n  view current screen: mule tail {id}\n  jump/interact:       tsesh pick-and-connect --mode agents  # (tmux: prefix a) select mule-{id}"
                         ));
                     }
                     anyhow::bail!(message);
@@ -1354,7 +1354,7 @@ fn tui_hints(id: &crate::wrapper::JobId, target: &str, workstream: Option<&str>)
     format!(
         "TUI job {id} is interactive\n\
            view current screen: mule tail {id}\n\
-           jump/interact:       murmur pick --all    # select {agent}\n\
+           jump/interact:       tsesh pick-and-connect --mode agents  # (tmux: prefix a) select {agent}\n\
            control through mu:  mu agent spawn {agent}{workstream} --command \\\n\
              \"$(murmur jump-command --host {target} --agent {agent})\"\n\
            stop and remove:     mule kill --rm {id}\n"
@@ -1814,7 +1814,10 @@ mod tests {
         );
 
         assert!(hints.contains("mule tail abc123"), "{hints}");
-        assert!(hints.contains("murmur pick --all"), "{hints}");
+        assert!(
+            hints.contains("tsesh pick-and-connect --mode agents"),
+            "{hints}"
+        );
         assert!(
             hints.contains("--host 'dev '\\''$(touch /tmp/target)'\\'''"),
             "{hints}"

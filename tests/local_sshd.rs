@@ -787,7 +787,10 @@ fn tui_follow_refuses_with_screen_and_picker_hints() {
     assert!(out.stdout.is_empty());
     let error = String::from_utf8_lossy(&out.stderr);
     assert!(error.contains(&format!("mule tail {id}")), "{error}");
-    assert!(error.contains("murmur pick --all"), "{error}");
+    assert!(
+        error.contains("tsesh pick-and-connect --mode agents"),
+        "{error}"
+    );
     assert!(!error.contains("--transcript"), "{error}");
 
     let _ = sshd.mule(&config, &["--quiet", "kill", "--rm", &id]);
@@ -2637,7 +2640,9 @@ fn a_lease_forwards_traffic_and_leaves_another_master_usable_while_it_holds() {
         "{text}"
     );
     assert!(
-        text.contains(&format!("murmur pick --all  # select mule-{id}")),
+        text.contains(&format!(
+            "tsesh pick-and-connect --mode agents  # (tmux: prefix a) select mule-{id}"
+        )),
         "{text}"
     );
     assert!(
