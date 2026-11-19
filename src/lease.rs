@@ -598,7 +598,9 @@ fn own_existing(
 /// The literal attach command, as `run --tui`'s hints print it. Printed, never
 /// executed: murmur is the user's, not mule's.
 fn attach_hint(id: &JobId) -> String {
-    format!("tsesh pick-and-connect --mode agents  # (tmux: prefix a) select mule-{id}")
+    format!(
+        "tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-{id}"
+    )
 }
 
 fn stop_hint(host: &Host, id: &JobId) -> String {

@@ -539,7 +539,7 @@ fn the_status_line_names_the_job_host_forwards_attach_and_stop() {
     assert!(out.contains("on lease"), "{out}");
     assert!(out.contains(&format!("{} -> /remote/ctl.sock", local.display())));
     assert!(
-        out.contains("tsesh pick-and-connect --mode agents  # (tmux: prefix a) select mule-a1b2c3"),
+        out.contains("tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-a1b2c3"),
         "{out}"
     );
     assert!(out.contains("mule rm --host lease a1b2c3"), "{out}");

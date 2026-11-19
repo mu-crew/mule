@@ -2641,7 +2641,7 @@ fn a_lease_forwards_traffic_and_leaves_another_master_usable_while_it_holds() {
     );
     assert!(
         text.contains(&format!(
-            "tsesh pick-and-connect --mode agents  # (tmux: prefix a) select mule-{id}"
+            "tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-{id}"
         )),
         "{text}"
     );

@@ -28,10 +28,10 @@ mule tail "$id"                 # current screen, or final saved screen
 mule tail --transcript "$id"    # raw terminal transcript, explicitly
 ```
 
-TUI dispatch prints pasteable `murmur pick`, `mu agent spawn`, and
+TUI dispatch prints pasteable `tsesh pick-and-connect`, `mu agent spawn`, and
 `mule kill --rm` commands on stderr. A mu worker uses `run --lease` instead
 (below): its pane is the job's life, not a viewer. `tail -f` refuses TUI jobs because a redraw
-stream is not a useful log; use the screen or attach through murmur instead.
+stream is not a useful log; use the screen or attach through the tsesh agents view instead.
 
 ## The job's shell
 
@@ -248,10 +248,10 @@ in between: a probe per tick (1s settling to 5s) over mule's own connection.
   writes `F.<id>.stop-failed`, one line starting with the id, so a job that
   could not be stopped is never silent.
 - **The pane shows** a status line (job, host, state, forwards, the
-  `murmur pick --all  # select mule-<id>` attach command and the stop command)
+  `tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-<id>` attach command and the stop command)
   and mirrors the remote screen for 30s after the first forward, then only on
   a change of state and at exit. Keystrokes are not forwarded; attach through
-  murmur to interact.
+  the tsesh agents view to interact.
 
 ```sh
 mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
