@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use mule::transport::SshLog;
 
 fn scratch(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("mule-ssh-log-{}-{name}", std::process::id()));
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("mule-ssh-log-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     root
@@ -55,5 +56,18 @@ fn a_symlink_in_place_of_the_directory_is_refused() {
     std::os::unix::fs::symlink(&target, &dir).unwrap();
     assert!(SshLog::create_in(&dir).is_err());
     assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_group_writable_ancestor_is_refused() {
+    let root = scratch("ancestor");
+    let mid = root.join("mid");
+    std::fs::create_dir(&mid).unwrap();
+    std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let dir = mid.join("ssh");
+    let err = SshLog::create_in(&dir).err().expect("must fail closed");
+    assert!(err.to_string().contains(&*mid.to_string_lossy()), "{err}");
+    std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
 }

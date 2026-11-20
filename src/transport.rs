@@ -439,6 +439,25 @@ impl SshLog {
                 meta.mode() & 0o7777
             );
         }
+        // Like ssh's StrictModes: whoever can write an ancestor can swap the
+        // verified dir for another between this check and ssh's open. Sticky
+        // dirs (/tmp) fail too: they are group/other writable.
+        let real = std::fs::canonicalize(dir)
+            .with_context(|| format!("cannot resolve ssh log dir {}", dir.display()))?;
+        for anc in real.ancestors().skip(1) {
+            let m = std::fs::metadata(anc)
+                .with_context(|| format!("cannot inspect {}", anc.display()))?;
+            if (m.uid() != uid && m.uid() != 0) || m.mode() & 0o022 != 0 {
+                anyhow::bail!(
+                    "refusing ssh log dir {}: ancestor {} is unsafe (uid {}, mode {:o}); \
+                     it must be owned by you or root and not group/other writable",
+                    dir.display(),
+                    anc.display(),
+                    m.uid(),
+                    m.mode() & 0o7777
+                );
+            }
+        }
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
