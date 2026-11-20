@@ -23,6 +23,10 @@
   unchanged: the gate closes before the wait and stays closed on a timeout, a
   queued dispatch never launches after the signal, and an admitted one gets a
   bounded best-effort wait of up to 3s.
+- The per-call `ssh -E` log that proves a session refusal now lives in
+  `~/.local/state/mule/ssh` (under `$XDG_STATE_HOME` when set), not the
+  shared temp dir. Each call checks that the directory is a real directory,
+  owned by the user and 0700, and fails rather than use one that is not.
 - `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
   where the build fails.
 

@@ -18,7 +18,7 @@
 //! needs a server round trip and so belongs inside the lock. Widening the
 //! exemption means editing the enum, in review, not passing a different string.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -393,24 +393,64 @@ fn output_within(
 ///
 /// Created exclusively (`create_new`, so a planted file or symlink fails the
 /// call rather than being written through) and 0600, under a name no other
-/// call can choose.
-struct SshLog(PathBuf);
+/// call can choose, inside `<state_dir>/ssh`: a directory checked to be ours
+/// and 0700 before every use. The refusal proof in `run` reads this file, so
+/// it must not sit in a shared temp dir, where another user can see, plant or
+/// race names beside it.
+#[doc(hidden)]
+pub struct SshLog(PathBuf);
 
 impl SshLog {
     fn create() -> Result<Self> {
+        Self::create_in(&crate::lock::state_dir().join("ssh"))
+    }
+
+    /// Create the log in `dir`, making `dir` 0700 if it is missing.
+    ///
+    /// Fails closed: a `dir` that is a symlink, not a directory, owned by
+    /// someone else, or open to group or other is refused, not repaired. A
+    /// directory we did not make that way is one we cannot vouch for.
+    #[doc(hidden)]
+    pub fn create_in(dir: &Path) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("cannot create ssh log dir {}", dir.display()));
+            }
+        }
+        // lstat, so a symlink is judged as itself and never followed.
+        let meta = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("cannot inspect ssh log dir {}", dir.display()))?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "refusing ssh log dir {}: it must be a directory owned by uid {uid} \
+                 with mode 0700 (found uid {}, mode {:o})",
+                dir.display(),
+                meta.uid(),
+                meta.mode() & 0o7777
+            );
+        }
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let path = std::env::temp_dir().join(format!(
+        let path = dir.join(format!(
             "mule-ssh-{}-{}-{nanos}.log",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
@@ -419,6 +459,11 @@ impl SshLog {
             .open(&path)
             .with_context(|| format!("cannot create ssh log {}", path.display()))?;
         Ok(Self(path))
+    }
+
+    #[doc(hidden)]
+    pub fn path(&self) -> &Path {
+        &self.0
     }
 }
 
