@@ -23,7 +23,6 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -48,11 +47,13 @@ const SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 /// 30 &`), and waiting longer would only be waiting for that process.
 const SESSION_END_WAIT: Duration = Duration::from_secs(5);
 
-/// How long a signal waits for an in-flight dispatch before cleaning up anyway.
+/// How long a signal waits for the locked call in flight (a dispatch already
+/// admitted, a probe, the collect) before cleaning up anyway.
 ///
-/// Dispatch is sub-second by invariant, but it queues for its ticket first,
-/// and may re-queue after a refused session (`transport::run_within`); the
-/// signal path must not wait on either for long.
+/// A dispatch is sub-second by invariant; a probe under load was measured at
+/// 2s. A dispatch still queued on its ticket, or about to re-queue after a
+/// refused session (`transport::run_within`), is not waited for: the closed
+/// gate refuses it.
 pub(crate) const DISPATCH_GRACE: Duration = Duration::from_secs(3);
 
 /// The collect script's exit status when the read worked but removing the job
@@ -361,7 +362,6 @@ pub fn run_cli_with(
     crate::lock::set_quiet(true);
 
     let id: JobId = new_id().parse().expect("generated ids are valid");
-    let dispatching = Arc::new(AtomicBool::new(false));
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
     // Every locked call goes through one gate the signal path can close, as
     // the lease's does: a probe in flight holds the one session, and exiting
@@ -370,7 +370,6 @@ pub fn run_cli_with(
     let ssh = InFlight::new(Ssh);
     let calls = ssh.stopper();
     {
-        let dispatching = Arc::clone(&dispatching);
         let host = host.clone();
         let id = id.clone();
         let config = config.clone();
@@ -378,24 +377,21 @@ pub fn run_cli_with(
             // First, so nothing below can panic on a dead tty (see
             // `redirect_stdio_to_null`).
             cleanup::redirect_stdio_to_null();
-            // A dispatch still in flight has not made the job yet; an `rm`
-            // that overtakes it would be a no-op and the job would leak.
-            let deadline = Instant::now() + DISPATCH_GRACE;
-            while dispatching.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // No new locked call from here, and the one in flight (a probe or
-            // the collect) gets the rest of the same bound. A group signal
-            // kills its ssh too, and the call returns at once.
-            calls.stop(deadline.saturating_duration_since(Instant::now()));
+            // Close the gate first: no locked call starts from here on. A
+            // dispatch still queued on its ticket is refused, so the job never
+            // starts -- its side effects are what the `rm` below cannot undo,
+            // while an `rm` of a job never made is a no-op. A dispatch already
+            // admitted is the call in flight, and is waited for, as is a probe
+            // or the collect: an `rm` that overtook the dispatch would leak the
+            // job, and one behind a probe's session would be refused. A group
+            // signal kills that ssh too, and the call returns at once.
+            calls.stop(DISPATCH_GRACE);
             stop(cancel, config.as_deref(), &host, &id, true);
             std::process::exit(cleanup::exit_status_for(signal));
         });
     }
 
-    dispatching.store(true, Ordering::SeqCst);
     let started = start(&ssh, host, id.clone(), request);
-    dispatching.store(false, Ordering::SeqCst);
     if let Err(error) = started {
         park_if_signalled(&signals);
         if matches!(

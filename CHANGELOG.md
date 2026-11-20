@@ -11,6 +11,15 @@
   every new locked call at once. The gate used to stay open while the stop
   waited for the call in flight, so a call queued behind it could start and
   hold the one session as the process exited.
+- A signal that lands while a lease's or `exec`'s named dispatch is still
+  waiting for its ticket now stops the job from ever starting. The signal
+  path used to wait for that dispatch, so the command ran after the signal
+  and the `rm` that followed could not undo what it had done. A dispatch
+  already admitted to the ssh gate is still waited for, up to 3s.
+- A signal-path stop now reports a clean finish only when the call in flight
+  ended within its grace. After a fixed 10ms sleep it used to trust a poll
+  that found the call finished without checking the deadline, so a call that
+  ended past it could count as clean.
 - `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
   where the build fails.
 

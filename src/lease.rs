@@ -29,7 +29,6 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -976,7 +975,6 @@ struct RealSignalSteps {
     job_file: PathBuf,
     specs: Vec<Spec>,
     config: Option<PathBuf>,
-    dispatching: Arc<AtomicBool>,
     /// The main thread's locked calls (dispatch, probes).
     calls: Stopper,
 }
@@ -987,27 +985,20 @@ impl SignalSteps for RealSignalSteps {
     }
 
     fn spawn_stop(&mut self) {
-        // A dispatch still in flight has not made the job yet; an `rm` that
-        // overtook it would be a no-op and the job would leak.
-        let deadline = Instant::now() + crate::exec::DISPATCH_GRACE;
-        while self.dispatching.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // A probe in flight holds the one session, and exiting would not free
-        // it: the remote script runs on, while the ticket goes with our pid.
-        // The `rm` would be served a taken channel and refused -- under three
-        // parallel layer-3 suites a probe took 2s, and a `mule rm` right after
-        // a TERMed lease failed this way. So no new call starts from here on,
-        // and the one running gets the rest of the same bound. A group signal
-        // kills that ssh too, and its call returns at once.
+        // Close the gate first: no locked call starts from here on. A named
+        // dispatch still queued on its ticket is refused when it gets there,
+        // so the job never starts. Its command's side effects are what an
+        // `rm` cannot undo; the `rm` of a job never made is a no-op, and safe.
         //
-        // The gate closes after the dispatch wait, not before: a named
-        // dispatch can still be queued on the ticket, and a closed gate would
-        // refuse it, leaving an `rm` for a job that was never made. The gap
-        // costs only grace: a probe that starts between the dispatch's end and
-        // the close is the call in flight `stop` waits for.
-        self.calls
-            .stop(deadline.saturating_duration_since(Instant::now()));
+        // A dispatch already admitted is the call in flight, and `stop` waits
+        // for it: an `rm` that overtook it would be a no-op and the job would
+        // leak. So is a probe: it holds the one session, and exiting would not
+        // free it -- the remote script runs on, while the ticket goes with our
+        // pid. The `rm` would be served a taken channel and refused (under
+        // three parallel layer-3 suites a probe took 2s, and a `mule rm` right
+        // after a TERMed lease failed this way). A group signal kills that ssh
+        // too, and its call returns at once.
+        self.calls.stop(crate::exec::DISPATCH_GRACE);
         // The generation this carrier owns, not one read now: see `Owned`.
         let failed_file = stop_failed_path(&self.job_file, &self.owned.id);
         let retry = stop_retry(&self.owned, &failed_file, cleanup::stop_retry_for());
@@ -1067,8 +1058,8 @@ pub fn run_cli_keyed(
 }
 
 /// `mule run --lease --attach <id>`: [`attach`], then the same hold and signal
-/// path as a lease. Not a re-dispatch: nothing is started, `dispatching` stays
-/// false, and the exit codes are the lease's.
+/// path as a lease. Not a re-dispatch: nothing is started, and the exit codes
+/// are the lease's.
 pub fn attach_cli(
     host: &Host,
     config: Option<PathBuf>,
@@ -1087,7 +1078,6 @@ fn carrier_cli(
     begin: Begin,
 ) -> Result<i32> {
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
-    let dispatching = Arc::new(AtomicBool::new(false));
     let ssh = InFlight::new(Ssh);
     let calls = ssh.stopper();
     // The id is known only once `start` has generated it; until then a signal
@@ -1096,7 +1086,7 @@ fn carrier_cli(
     {
         let (host, specs, config) = (host.clone(), specs.clone(), config.clone());
         let job_file = job_file.to_path_buf();
-        let (dispatching, named) = (Arc::clone(&dispatching), Arc::clone(&named));
+        let named = Arc::clone(&named);
         let calls = calls.clone();
         signals.on_signal(move |signal| {
             // Held to the exit when no id is named yet: `on_dispatch` takes the
@@ -1115,7 +1105,6 @@ fn carrier_cli(
                         job_file,
                         specs,
                         config,
-                        dispatching,
                         calls,
                     },
                     signal,
@@ -1138,19 +1127,14 @@ fn carrier_cli(
             &StopFence::dir(),
             request,
             key,
+            // Named before the dispatch takes its ticket: a signal from here
+            // on closes the gate, so a dispatch not yet admitted never starts
+            // and one admitted is waited for (`RealSignalSteps::spawn_stop`).
             &|owned| {
-                if let Some(owned) = owned {
-                    // `dispatching` is set under the lock, before the id is
-                    // visible: once the signal thread can see an id it also
-                    // sees the dispatch as in flight, so its `rm` waits for it
-                    // rather than overtaking it (a no-op `rm`, then a leaked
-                    // job).
-                    if let Ok(mut named) = named.lock() {
-                        dispatching.store(true, Ordering::SeqCst);
-                        *named = Some(owned.clone());
-                    }
-                } else {
-                    dispatching.store(false, Ordering::SeqCst);
+                if let Some(owned) = owned
+                    && let Ok(mut named) = named.lock()
+                {
+                    *named = Some(owned.clone());
                 }
             },
             // The claim made nothing of the named id: forget it, so a later
@@ -1159,7 +1143,6 @@ fn carrier_cli(
                 if let Ok(mut named) = named.lock() {
                     *named = None;
                 }
-                dispatching.store(false, Ordering::SeqCst);
             },
             &mut stderr,
         ),

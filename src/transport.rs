@@ -510,8 +510,11 @@ pub struct Stopper(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 impl Stopper {
     /// Refuse every new locked call, and wait up to `grace` for the one in
-    /// flight. True when nothing is left running. On a timeout the gate is
-    /// closed anyway: the caller is about to exit and must not start more.
+    /// flight. True only when nothing was in flight or it ended within
+    /// `grace`; false on a timeout, even if the call ends a moment later (and
+    /// possibly for one that ended just before the deadline was noticed). The
+    /// gate is closed either way: the caller is about to exit and must not
+    /// start more.
     pub fn stop(&self, grace: std::time::Duration) -> bool {
         use std::sync::atomic::Ordering;
         let deadline = std::time::Instant::now() + grace;
@@ -533,16 +536,30 @@ impl Stopper {
                 Err(seen) => current = seen,
             }
         }
+        if self.0.load(Ordering::SeqCst) == GATE_STOPPED {
+            return true;
+        }
         // Then wait for the call in flight, which turns STOPPING into STOPPED
         // as it ends. On a timeout STOPPING stays: it refuses as STOPPED does.
+        //
+        // True means the call ended within grace, so the state is read before
+        // the clock: STOPPED seen before the deadline ended before it. Read the
+        // other way round, a call still busy at the deadline that ended before
+        // the next poll counted as clean (1ms grace, call held 4ms: true after
+        // 11ms). For the same reason no sleep runs past the deadline.
         loop {
-            if self.0.load(Ordering::SeqCst) == GATE_STOPPED {
-                return true;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
             }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            let stopped = self.0.load(Ordering::SeqCst) == GATE_STOPPED;
             if std::time::Instant::now() >= deadline {
                 return false;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if stopped {
+                return true;
+            }
         }
     }
 }

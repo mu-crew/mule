@@ -802,6 +802,37 @@ fn stopping_returns_once_the_call_in_flight_returns() {
     releaser.join().unwrap();
 }
 
+#[test]
+fn a_call_that_ends_after_grace_is_not_reported_clean() {
+    // True means the call ended within grace. A stop that trusted STOPPED
+    // from a poll before looking at the clock, after an unconditional 10ms
+    // sleep, reported a call held 4ms past a 1ms grace as clean.
+    use mule::transport::InFlight;
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let ssh = Arc::new(InFlight::new(Gated {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+    }));
+    let stopper = ssh.stopper();
+    let call = {
+        let ssh = Arc::clone(&ssh);
+        std::thread::spawn(move || ssh.run(&host(), "probe").is_ok())
+    };
+    entered_rx.recv().unwrap();
+
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(4));
+        release_tx.send(()).unwrap();
+    });
+    assert!(
+        !stopper.stop(Duration::from_millis(1)),
+        "the call outlived the 1ms grace"
+    );
+    releaser.join().unwrap();
+    assert!(call.join().unwrap());
+}
+
 /// The first locked call blocks until released; every later one that reaches
 /// it is counted and returns at once.
 struct FirstBlocks {
