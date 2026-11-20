@@ -5,9 +5,11 @@
 ### Added
 
 - `--strict-codes` on `exec`, `wait` and `run --wait`: a command's own exit 3 is
-  reported as 8 (new, documented), with `mule: command exited 3 (remapped to 8)`
-  as the first stderr line, so a caller can treat 3 as mule's handback (no
-  master) without misreading a command. Opt-in; default behaviour is unchanged.
+  reported as 8 (new, documented), so a caller can treat 3 as mule's handback
+  (no master) without misreading a command. 8 may also be the command's own 8;
+  the `mule: command exited 3 (remapped to 8)` stderr note is diagnostic only
+  and may not be the first line (`run --wait` can print notices before it).
+  Rely only on '3 = handback'. Opt-in; default behaviour is unchanged.
 
 ### Fixed
 

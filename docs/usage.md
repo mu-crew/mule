@@ -367,7 +367,7 @@ master reads as down rather than hanging the verb.
 | 5 | Orphaned job: no exit code will arrive (`run --lease` too) |
 | 6 | Connection dropped while waiting; wait again |
 | 7 | `exec` only: output incomplete (truncated at `max_log_bytes`, or a leftover process still holds the job's stdout) |
-| 8 | `--strict-codes` only (`exec`, `wait`, `run --wait`): the command itself exited 3 |
+| 8 | `--strict-codes` only (`exec`, `wait`, `run --wait`): the command's 3 or its own 8 (ambiguous) |
 | *n* | `wait`, `run --wait`, `run --lease` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
 | 129/130/143 | `exec` and `run --lease` after SIGHUP/SIGINT/SIGTERM: the job was stopped |
 
@@ -377,6 +377,9 @@ master reads as down rather than hanging the verb.
 
 By default both are 3. Pass `--strict-codes` to `exec`, `wait` or `run --wait`
 and a command's own 3 comes out as **8**, with `mule: command exited 3
-(remapped to 8)` as the first stderr line; 3 then always means mule's handback
-(no master: stop and ask a human). All other codes are unchanged, so a command
-that itself exits 8 still reads 8 -- check for the stderr line if that matters.
+(remapped to 8)` on stderr; 3 then always means mule's handback in `exec`,
+`wait` and `run --wait` (no master: stop and ask a human). All other codes are
+unchanged, so a command that itself exits 8 also reads 8: 8 is ambiguous. The
+stderr note is diagnostic only, is not proof of the original status, and may
+not be the first line (`run --wait` can print dispatch notices before it). Rely
+only on '3 = handback'.

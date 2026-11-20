@@ -143,7 +143,8 @@ Exit status:
   7   exec only: output incomplete -- truncated at max_log_bytes, or a process
       still holds the job's stdout; what was printed is partial
   129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
-  8   only with --strict-codes: the command itself exited 3 (stderr says so)
+  8   only with --strict-codes: the command's 3, or its own 8 (ambiguous; 3 is
+      always mule's handback)
   <n> wait/--wait/--lease return the job's own exit code; exec returns the
       command's; run --lease exits 3 only at startup"
 )]
