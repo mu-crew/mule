@@ -1561,7 +1561,12 @@ fn ends_once_its_fault_dir_is_gone(program: &Path, args: &[&str]) -> bool {
         child.try_wait().unwrap().is_none(),
         "it waits while the lock is held"
     );
-    std::fs::remove_dir_all(&fault).unwrap();
+    // Rename first: the shim's `mkdir lock` loop can win the instant
+    // `remove_dir_all` has emptied `lock` and recreate it before the dir
+    // itself goes (ENOTEMPTY). Once renamed, `$F` no longer exists for it.
+    let tomb = fault.with_extension("gone");
+    std::fs::rename(&fault, &tomb).unwrap();
+    std::fs::remove_dir_all(&tomb).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
