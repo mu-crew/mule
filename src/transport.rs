@@ -510,11 +510,18 @@ pub struct Stopper(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 impl Stopper {
     /// Refuse every new locked call, and wait up to `grace` for the one in
-    /// flight. True only when nothing was in flight or it ended within
-    /// `grace`; false on a timeout, even if the call ends a moment later (and
-    /// possibly for one that ended just before the deadline was noticed). The
-    /// gate is closed either way: the caller is about to exit and must not
-    /// start more.
+    /// flight.
+    ///
+    /// The contract, which callers do rely on: admission closes before any
+    /// waiting and stays closed, timeout or not, so a call queued on the
+    /// ticket is refused once it gets here and never launches after the
+    /// signal; the one call already admitted gets a bounded, best-effort wait
+    /// of at most `grace`.
+    ///
+    /// The bool is an observation, not a proof: true means no call was seen in
+    /// flight at the last look before the deadline. It is best effort -- a
+    /// call that ends close to the deadline can be reported either way -- and
+    /// no caller relies on it (the lease and exec signal paths discard it).
     pub fn stop(&self, grace: std::time::Duration) -> bool {
         use std::sync::atomic::Ordering;
         let deadline = std::time::Instant::now() + grace;
@@ -542,11 +549,12 @@ impl Stopper {
         // Then wait for the call in flight, which turns STOPPING into STOPPED
         // as it ends. On a timeout STOPPING stays: it refuses as STOPPED does.
         //
-        // True means the call ended within grace, so the state is read before
-        // the clock: STOPPED seen before the deadline ended before it. Read the
-        // other way round, a call still busy at the deadline that ended before
-        // the next poll counted as clean (1ms grace, call held 4ms: true after
-        // 11ms). For the same reason no sleep runs past the deadline.
+        // The state is read before the clock, so STOPPED is reported only when
+        // it was seen before the deadline was noticed. Read the other way
+        // round, a call still busy at the deadline that ended before the next
+        // poll was reported clean (1ms grace, call held 4ms: true after 11ms).
+        // For the same reason no sleep runs past the deadline. This only
+        // sharpens the observation; the gate does not depend on it.
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {

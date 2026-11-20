@@ -16,10 +16,13 @@
   path used to wait for that dispatch, so the command ran after the signal
   and the `rm` that followed could not undo what it had done. A dispatch
   already admitted to the ssh gate is still waited for, up to 3s.
-- A signal-path stop now reports a clean finish only when the call in flight
-  ended within its grace. After a fixed 10ms sleep it used to trust a poll
-  that found the call finished without checking the deadline, so a call that
-  ended past it could count as clean.
+- A signal-path stop's clean-finish report is now read before the clock, so
+  it no longer counts a call still in flight at the deadline as finished. The
+  report is a best-effort observation (no call was seen in flight at the last
+  look before the deadline) and nothing relies on it. What callers rely on is
+  unchanged: the gate closes before the wait and stays closed on a timeout, a
+  queued dispatch never launches after the signal, and an admitted one gets a
+  bounded best-effort wait of up to 3s.
 - `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
   where the build fails.
 
