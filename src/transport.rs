@@ -449,9 +449,15 @@ pub struct InFlight<T> {
     state: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
+// A call is admitted only from IDLE, so STOPPING and STOPPED both refuse.
+// STOPPING is BUSY with admission already closed: a stop that waited in BUSY
+// instead left the gate open, and a call queued on the ticket behind the
+// one in flight took the freed gate before the stop's next look (a racing
+// test admitted 3-9 calls in 10 rounds).
 const GATE_IDLE: u8 = 0;
 const GATE_BUSY: u8 = 1;
-const GATE_STOPPED: u8 = 2;
+const GATE_STOPPING: u8 = 2;
+const GATE_STOPPED: u8 = 3;
 
 impl<T: Transport> InFlight<T> {
     pub fn new(inner: T) -> Self {
@@ -477,10 +483,19 @@ impl<T: Transport> Transport for InFlight<T> {
             anyhow::bail!("not started: mule is stopping");
         }
         let out = self.inner.run_unlocked(host, script);
-        // Fails only if `stop` gave up waiting and closed the gate anyway.
-        let _ =
-            self.state
-                .compare_exchange(GATE_BUSY, GATE_IDLE, Ordering::SeqCst, Ordering::SeqCst);
+        // BUSY goes back to IDLE; a stop that began meanwhile left STOPPING,
+        // which this call's end turns into STOPPED.
+        let _ = self
+            .state
+            .compare_exchange(GATE_BUSY, GATE_IDLE, Ordering::SeqCst, Ordering::SeqCst)
+            .or_else(|_| {
+                self.state.compare_exchange(
+                    GATE_STOPPING,
+                    GATE_STOPPED,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+            });
         out
     }
 
@@ -500,21 +515,34 @@ impl Stopper {
     pub fn stop(&self, grace: std::time::Duration) -> bool {
         use std::sync::atomic::Ordering;
         let deadline = std::time::Instant::now() + grace;
+        // Close admission first, whatever is in flight: IDLE closes outright,
+        // BUSY becomes STOPPING. Retried, because a call can start or end
+        // between the load and the swap.
+        let mut current = self.0.load(Ordering::SeqCst);
         loop {
-            match self.0.compare_exchange(
-                GATE_IDLE,
-                GATE_STOPPED,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(GATE_STOPPED) => return true,
-                Err(_) if std::time::Instant::now() >= deadline => {
-                    self.0.store(GATE_STOPPED, Ordering::SeqCst);
-                    return false;
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            let next = match current {
+                GATE_IDLE => GATE_STOPPED,
+                GATE_BUSY => GATE_STOPPING,
+                _ => break,
+            };
+            match self
+                .0
+                .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(seen) => current = seen,
             }
+        }
+        // Then wait for the call in flight, which turns STOPPING into STOPPED
+        // as it ends. On a timeout STOPPING stays: it refuses as STOPPED does.
+        loop {
+            if self.0.load(Ordering::SeqCst) == GATE_STOPPED {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }

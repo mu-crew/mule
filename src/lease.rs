@@ -1000,6 +1000,12 @@ impl SignalSteps for RealSignalSteps {
         // a TERMed lease failed this way. So no new call starts from here on,
         // and the one running gets the rest of the same bound. A group signal
         // kills that ssh too, and its call returns at once.
+        //
+        // The gate closes after the dispatch wait, not before: a named
+        // dispatch can still be queued on the ticket, and a closed gate would
+        // refuse it, leaving an `rm` for a job that was never made. The gap
+        // costs only grace: a probe that starts between the dispatch's end and
+        // the close is the call in flight `stop` waits for.
         self.calls
             .stop(deadline.saturating_duration_since(Instant::now()));
         // The generation this carrier owns, not one read now: see `Owned`.

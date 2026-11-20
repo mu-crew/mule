@@ -801,3 +801,97 @@ fn stopping_returns_once_the_call_in_flight_returns() {
     assert!(call.join().unwrap());
     releaser.join().unwrap();
 }
+
+/// The first locked call blocks until released; every later one that reaches
+/// it is counted and returns at once.
+struct FirstBlocks {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    calls: AtomicU32,
+}
+
+impl Transport for FirstBlocks {
+    fn run_unlocked(&self, _: &Host, _: &str) -> anyhow::Result<Output> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ok(Output::ok(""))
+    }
+
+    fn mux_op(&self, _: &Host, _: MuxOp) -> anyhow::Result<Output> {
+        Ok(Output::ok(""))
+    }
+}
+
+#[test]
+fn a_stop_begun_during_a_call_refuses_every_racing_call() {
+    // Admission must close when the stop begins, not when the call in flight
+    // ends: a gate left open while the stop waits hands the freed slot to the
+    // next caller in line, and the process exits with that call holding the
+    // one session. One round loses the race only some of the time on a gate
+    // that stays open (measured: 3 of 5 runs), so run several.
+    let admitted: u32 = (0..10).map(|_| stop_race_round()).sum();
+    assert_eq!(admitted, 0, "calls started after the stop began");
+}
+
+/// One call busy, a stop begun, four racers queued behind the call: returns
+/// how many racers the gate admitted before the stop returned.
+fn stop_race_round() -> u32 {
+    use mule::transport::InFlight;
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let ssh = Arc::new(InFlight::new(FirstBlocks {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        calls: AtomicU32::new(0),
+    }));
+    let stopper = ssh.stopper();
+    let host = host();
+
+    let call = {
+        let (ssh, host) = (Arc::clone(&ssh), host.clone());
+        std::thread::spawn(move || ssh.run(&host, "probe").is_ok())
+    };
+    entered_rx.recv().unwrap();
+
+    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = {
+        let (stopper, stopped) = (stopper.clone(), Arc::clone(&stopped));
+        std::thread::spawn(move || {
+            let clean = stopper.stop(Duration::from_secs(10));
+            stopped.store(true, Ordering::SeqCst);
+            clean
+        })
+    };
+    // Let the stop begin while the call is still busy.
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Racers queue on the ticket behind the call in flight and hit the gate
+    // the moment it is freed, until the stop has returned.
+    let racers: Vec<_> = (0..4)
+        .map(|_| {
+            let (ssh, host, stopped) = (Arc::clone(&ssh), host.clone(), Arc::clone(&stopped));
+            std::thread::spawn(move || {
+                let mut admitted = 0;
+                loop {
+                    let done = stopped.load(Ordering::SeqCst);
+                    if ssh.run(&host, "racer").is_ok() {
+                        admitted += 1;
+                    }
+                    if done {
+                        return admitted;
+                    }
+                }
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(20));
+    release_tx.send(()).unwrap();
+
+    assert!(call.join().unwrap(), "the call in flight finishes normally");
+    assert!(stop.join().unwrap(), "it finished within grace");
+    let admitted = racers.into_iter().map(|r| r.join().unwrap()).sum();
+    assert!(stopper.stop(Duration::ZERO), "the gate stays closed");
+    admitted
+}

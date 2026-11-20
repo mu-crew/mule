@@ -7,6 +7,10 @@
 - The missing-tool hint after a failed `run --wait` now fires on hosts whose
   `/bin/sh` is dash (Debian, Ubuntu), which word the error
   `sh: 1: <cmd>: not found` rather than `command not found`.
+- A signal that stops a lease or `exec` during a locked call now refuses
+  every new locked call at once. The gate used to stay open while the stop
+  waited for the call in flight, so a call queued behind it could start and
+  hold the one session as the process exited.
 - `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
   where the build fails.
 
