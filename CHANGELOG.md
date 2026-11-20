@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- `--strict-codes` on `exec`, `wait` and `run --wait`: a command's own exit 3 is
+  reported as 8 (new, documented), with `mule: command exited 3 (remapped to 8)`
+  as the first stderr line, so a caller can treat 3 as mule's handback (no
+  master) without misreading a command. Opt-in; default behaviour is unchanged.
+
 ### Fixed
 
 - The per-call `ssh -E` log dir check now also refuses an unsafe ancestor

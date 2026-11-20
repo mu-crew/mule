@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cleanup::{self, Signals};
 use crate::config::Host;
-use crate::errors::{EXIT_NO_MASTER, EXIT_TRUNCATED, MuleError};
+use crate::errors::{EXIT_NO_MASTER, EXIT_TRUNCATED, MuleError, strict_code, strict_note};
 use crate::probe::{From as ProbeFrom, State, probe};
 use crate::transport::{InFlight, Ssh, Transport};
 use crate::wrapper::{JobId, JobMetadata, JobMode, new_id, state_dir};
@@ -179,6 +179,22 @@ pub fn finish_within(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
+    finish_coded(transport, host, id, settle, pause, out, err, false)
+}
+
+/// [`finish_within`] with `--strict-codes` as a parameter: the command's exit 3
+/// comes back as `EXIT_COMMAND_3`, with the note as the first line of `err`.
+#[allow(clippy::too_many_arguments)] // finish_within's seven plus one flag; a struct would only rename them
+pub fn finish_coded(
+    transport: &dyn Transport,
+    host: &Host,
+    id: &JobId,
+    settle: Duration,
+    pause: &dyn Fn(Duration),
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    strict: bool,
+) -> Result<i32> {
     let mut interval = FIRST_INTERVAL;
     // When the first probe that saw `rc` began. Measured on the wall clock and
     // from before the probe, so the bound covers probe round trips too.
@@ -217,7 +233,7 @@ pub fn finish_within(
         }
         interval = next_interval(interval);
     };
-    collect(transport, host, id, code, out, err)
+    collect(transport, host, id, code, out, err, strict)
 }
 
 /// The final read and the removal, in one round trip.
@@ -251,6 +267,7 @@ fn collect(
     code: i32,
     out: &mut dyn Write,
     err: &mut dyn Write,
+    strict: bool,
 ) -> Result<i32> {
     let dir = state_dir(id);
     let socket = &host.tmux_socket;
@@ -305,6 +322,17 @@ fn collect(
     }
     out.write_all(&bytes[..log_len])?;
     out.flush()?;
+    // First on stderr, ahead of the command's own bytes: the one stable place a
+    // caller finds the original code. Only when the code is what exec returns
+    // (not when 7 or a removal failure replaces it).
+    if strict
+        && !truncated
+        && !live
+        && output.code != REMOVAL_FAILED
+        && let Some(note) = strict_note(code)
+    {
+        writeln!(err, "{note}")?;
+    }
     err.write_all(&bytes[log_len..log_len + err_len])?;
     if output.code == REMOVAL_FAILED {
         bail!(
@@ -331,7 +359,7 @@ fn collect(
     if truncated || live {
         return Ok(EXIT_TRUNCATED);
     }
-    Ok(code)
+    Ok(if strict { strict_code(code) } else { code })
 }
 
 /// Block this thread until the signal thread ends the process.
@@ -406,7 +434,7 @@ fn stop(cancel: Cancel, config: Option<&std::path::Path>, host: &Host, id: &JobI
 /// `config` is the effective `--config`, handed to the detached cleanup child so
 /// it reads the same file.
 pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Result<i32> {
-    run_cli_with(host, config, request, Cancel::Detach)
+    run_cli_with(host, config, request, Cancel::Detach, false)
 }
 
 /// [`run_cli`] with the cancel mode chosen (`exec --no-detach`).
@@ -415,6 +443,7 @@ pub fn run_cli_with(
     config: Option<PathBuf>,
     request: &Request,
     cancel: Cancel,
+    strict: bool,
 ) -> Result<i32> {
     let id: JobId = new_id().parse().expect("generated ids are valid");
     // Before the signal handlers, the gate and every transport call: an
@@ -467,10 +496,11 @@ pub fn run_cli_with(
         return Err(error);
     }
 
-    let result = finish(
+    let result = finish_coded(
         &ssh,
         host,
         &id,
+        SESSION_END_WAIT,
         &|interval| {
             if signals.wait(Some(interval)).is_some() {
                 // The signal thread is cleaning up and about to exit the
@@ -481,6 +511,7 @@ pub fn run_cli_with(
         },
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
+        strict,
     );
     if result.is_err() {
         park_if_signalled(&signals);

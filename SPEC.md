@@ -280,6 +280,8 @@ Opening a master may need a prompt (a hardware token, a second factor) that only
 
 ### Exit 3 is a request for a human, not a transient error
 
+By default a command's own exit 3 (`exec`, `wait`, `run --wait`) is also 3, so a caller cannot tell the command from mule's handback by the code. `--strict-codes` on those three verbs closes that: a command's 3 comes out as **8**, the lowest code mule produces nowhere else, and the first line of stderr says `mule: command exited 3 (remapped to 8)` (for `exec`, ahead of the command's own stderr). Other command codes pass unchanged, and mule's own codes, 3 included, are untouched. 8 was chosen by elimination: 0-7, 124, 129, 130, 137 and 143 are taken. A command can still exit 8 itself and mule does not rewrite it, so under the flag 8 is "the command's 3 *or* its own 8" and only the stderr line separates them; what the flag guarantees is that 3 never comes from a command. When `exec` returns 7 the command's code is already replaced, so nothing is remapped or reported. The flag is opt-in so default behaviour is byte-identical.
+
 Every other failure is something a program can reason about; this one needs an act that no retry produces. A caller that gets exit 3 **stops and asks an operator**. Three responses are wrong:
 
 | Response | Why it fails |
@@ -334,6 +336,7 @@ The stable mule-specific exit codes are:
 | 5 | Job is orphaned. |
 | 6 | Connection dropped while waiting. |
 | 7 | `exec` only: the output is partial -- it hit `max_log_bytes`, or a process the command left behind still holds its stdout. |
+| 8 | `--strict-codes` only: the command itself exited 3. |
 
 A refused session channel is classified instead of exposing the misleading authentication message. A dropped connection during a wait reports that the detached job continues and prints `mule tail <id>` as the recovery command.
 

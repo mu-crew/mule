@@ -143,6 +143,7 @@ Exit status:
   7   exec only: output incomplete -- truncated at max_log_bytes, or a process
       still holds the job's stdout; what was printed is partial
   129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
+  8   only with --strict-codes: the command itself exited 3 (stderr says so)
   <n> wait/--wait/--lease return the job's own exit code; exec returns the
       command's; run --lease exits 3 only at startup"
 )]
@@ -248,6 +249,9 @@ pub enum Commands {
         /// Block locally until the job finishes; unlike --max-secs, this does not kill it
         #[arg(long, conflicts_with_all = ["tui", "lease"])]
         wait: bool,
+        /// With --wait: report the command's own exit 3 as 8; see `exec --strict-codes`
+        #[arg(long, requires = "wait")]
+        strict_codes: bool,
         /// With --wait: print the log once at the end instead of streaming
         #[arg(long, requires = "wait", conflicts_with = "tui")]
         no_tail: bool,
@@ -302,6 +306,13 @@ pub enum Commands {
         /// Stop waiting locally after S seconds; the remote job keeps running
         #[arg(long, value_name = "S")]
         timeout: Option<u64>,
+        /// Report a command's own exit 3 as 8, so 3 only ever means no master
+        ///
+        /// Opt-in. Without it a command's 3 and mule's handback are both 3.
+        /// The original code is the first stderr line: `mule: command exited
+        /// 3 (remapped to 8)`. Other codes are untouched.
+        #[arg(long)]
+        strict_codes: bool,
     },
     /// Print ordinary output, or a TUI job's current/final readable screen
     ///
@@ -449,6 +460,13 @@ pub enum Commands {
         /// stop is a detached, retrying `rm` that survives the group.
         #[arg(long)]
         no_detach: bool,
+        /// Report a command's own exit 3 as 8, so 3 only ever means no master
+        ///
+        /// Opt-in. Without it a command's 3 and mule's handback are both 3.
+        /// The original code is the first stderr line: `mule: command exited
+        /// 3 (remapped to 8)`. Other codes are untouched.
+        #[arg(long)]
+        strict_codes: bool,
         /// The command: one shell string, or an argv (quoted for you)
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
@@ -923,6 +941,18 @@ pub fn wait(
     crate::tail::wait_only(t, host, id, timeout)
 }
 
+/// `--strict-codes` for a code a job produced (never mule's own handback, which
+/// is an `Err` on these paths): remap 3 and say so on stderr.
+fn strict_remap(code: i32, strict: bool) -> i32 {
+    if !strict {
+        return code;
+    }
+    if let Some(note) = crate::errors::strict_note(code) {
+        eprintln!("{note}");
+    }
+    crate::errors::strict_code(code)
+}
+
 pub fn dispatch(cli: Cli) -> Result<i32> {
     let cfg = load_config(cli.config.as_deref())?;
     let quiet = cli.quiet;
@@ -939,6 +969,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             key,
             forward_unix,
             wait,
+            strict_codes,
             no_tail,
             cmd,
         } => {
@@ -1074,6 +1105,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     } else {
                         crate::tail::follow(&Ssh, host, &id, 0, &mut output)
                     };
+                    let result = result.map(|code| strict_remap(code, strict_codes));
                     if let Ok(code) = result {
                         // The exit code is the cheap gate. Only a failed job
                         // earns even the bounded log-tail scan below.
@@ -1103,6 +1135,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             cwd,
             max_secs,
             no_detach,
+            strict_codes,
             cmd,
         } => {
             let host = cfg.host(host.host.as_deref())?;
@@ -1120,6 +1153,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 } else {
                     crate::exec::Cancel::Detach
                 },
+                strict_codes,
             )
         }
         Commands::Forward { host, unix } => {
@@ -1157,8 +1191,14 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         Commands::Poll { id, host, json } => {
             poll_with_hint(&Ssh, cfg.host(host.host.as_deref())?, &id, json, quiet)
         }
-        Commands::Wait { id, host, timeout } => {
-            let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout);
+        Commands::Wait {
+            id,
+            host,
+            timeout,
+            strict_codes,
+        } => {
+            let result = wait(&Ssh, cfg.host(host.host.as_deref())?, &id, timeout)
+                .map(|code| strict_remap(code, strict_codes));
             if result.is_ok() && !quiet {
                 eprintln!("next: mule tail {id} for output; mule rm {id} to drop its state");
             }

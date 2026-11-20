@@ -12,6 +12,31 @@ pub const EXIT_DROPPED: i32 = 6;
 /// parses stdout can never mistake a prefix for the whole answer.
 pub const EXIT_TRUNCATED: i32 = 7;
 
+/// Under `--strict-codes` only: a command's own exit 3 comes out as this, so 3
+/// then always means mule's handback (no master: stop and ask a human). 8 is
+/// the lowest code mule produces nowhere else (0-7, 124, 129, 130, 137, 143 are
+/// taken). A command can still exit 8 itself and mule does not touch it, so the
+/// code alone proves little; the first stderr line `mule: command exited 3
+/// (remapped to 8)` is what tells the two apart.
+pub const EXIT_COMMAND_3: i32 = 8;
+
+/// The stderr line that gives the command's real code back under
+/// `--strict-codes`; `None` when `code` is not remapped.
+pub fn strict_note(code: i32) -> Option<String> {
+    (code == EXIT_NO_MASTER)
+        .then(|| format!("mule: command exited {code} (remapped to {EXIT_COMMAND_3})"))
+}
+
+/// A command's code as `--strict-codes` reports it. Call only on a code the
+/// command produced, never on mule's own handback.
+pub fn strict_code(code: i32) -> i32 {
+    if code == EXIT_NO_MASTER {
+        EXIT_COMMAND_3
+    } else {
+        code
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MuleError {
     #[error(
