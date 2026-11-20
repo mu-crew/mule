@@ -87,3 +87,28 @@ fn a_root_owned_sticky_world_writable_ancestor_is_accepted() {
     std::fs::remove_dir_all(&root).unwrap();
     res.expect("sticky root-owned /tmp ancestor must pass");
 }
+
+#[test]
+fn a_symlinked_state_dir_alias_swapped_after_the_check_cannot_redirect_the_log() {
+    let root = scratch("alias");
+    let real = root.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let evil = root.join("evil");
+    std::fs::create_dir(&evil).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let log = SshLog::create_in(&alias.join("ssh")).unwrap();
+    // The path handed to ssh and read back is the verified canonical one,
+    // not one that goes through the alias.
+    let canon = std::fs::canonicalize(&real).unwrap();
+    assert!(log.path().starts_with(&canon), "{:?}", log.path());
+    // Swap the alias after the check: the used path still hits the real dir.
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&evil, &alias).unwrap();
+    std::fs::write(log.path(), "ssh: written").unwrap();
+    assert_eq!(std::fs::read_dir(&evil).unwrap().count(), 0);
+    assert_eq!(std::fs::read_to_string(log.path()).unwrap(), "ssh: written");
+    drop(log);
+    std::fs::remove_dir_all(&root).unwrap();
+}

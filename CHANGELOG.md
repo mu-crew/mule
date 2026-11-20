@@ -13,6 +13,9 @@
 
 ### Fixed
 
+- The per-call `ssh -E` log is created, passed to ssh and read back through
+  the canonical, verified path, so a symlinked state-dir alias swapped after
+  the check cannot redirect it.
 - The per-call `ssh -E` log dir check now also refuses an unsafe ancestor
   (not owned by you or root, or group/other writable), like ssh's
   StrictModes, naming the path. A root-owned sticky dir such as `/tmp` is

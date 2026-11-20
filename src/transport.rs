@@ -425,16 +425,27 @@ impl SshLog {
                     .with_context(|| format!("cannot create ssh log dir {}", dir.display()));
             }
         }
+        // Resolve once and use only the result from here on: the checks, the
+        // creation, ssh's `-E` open and the read-back all name this canonical
+        // path, so an alias (symlinked state dir or ancestor) swapped after
+        // this point cannot redirect the log.
+        // The leaf itself must not be a link (an ancestor alias is fine, it
+        // is resolved below); canonicalize would otherwise follow it silently.
+        if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            anyhow::bail!("refusing ssh log dir {}: it is a symlink", dir.display());
+        }
+        let real = std::fs::canonicalize(dir)
+            .with_context(|| format!("cannot resolve ssh log dir {}", dir.display()))?;
         // lstat, so a symlink is judged as itself and never followed.
-        let meta = std::fs::symlink_metadata(dir)
-            .with_context(|| format!("cannot inspect ssh log dir {}", dir.display()))?;
+        let meta = std::fs::symlink_metadata(&real)
+            .with_context(|| format!("cannot inspect ssh log dir {}", real.display()))?;
         // SAFETY: geteuid has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
         if !meta.file_type().is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
             anyhow::bail!(
                 "refusing ssh log dir {}: it must be a directory owned by uid {uid} \
                  with mode 0700 (found uid {}, mode {:o})",
-                dir.display(),
+                real.display(),
                 meta.uid(),
                 meta.mode() & 0o7777
             );
@@ -443,8 +454,6 @@ impl SshLog {
         // verified dir for another between this check and ssh's open. The one
         // exception is a root-owned sticky dir (/tmp): the sticky bit stops
         // others renaming or removing our entries, so state dirs may live there.
-        let real = std::fs::canonicalize(dir)
-            .with_context(|| format!("cannot resolve ssh log dir {}", dir.display()))?;
         for anc in real.ancestors().skip(1) {
             let m = std::fs::metadata(anc)
                 .with_context(|| format!("cannot inspect {}", anc.display()))?;
@@ -465,7 +474,7 @@ impl SshLog {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
-        let path = dir.join(format!(
+        let path = real.join(format!(
             "mule-ssh-{}-{}-{nanos}.log",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
