@@ -77,8 +77,61 @@ pub fn next_interval(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_INTERVAL)
 }
 
-/// Start the job under `id`. Silent: warnings go nowhere.
-pub fn start(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<()> {
+/// The largest remote script exec hands to one ssh call.
+///
+/// The script is a single argv element twice over: locally to `ssh`, and on the
+/// host as the `sh -c` string sshd spawns. Two documented ceilings bound it:
+/// Linux's per-argument limit `MAX_ARG_STRLEN` (32 pages = 131072 bytes
+/// including the NUL, execve(2)), and OpenSSH's mux reader, which drops a
+/// client message over 256 KiB (`channel_post_mux_client_read`, channels.c;
+/// the ~267KB `mux_client_request_session: write packet: Broken pipe` that
+/// spike_exec saw). The Linux limit is the smaller, so it governs; 16 KiB of
+/// headroom below it covers the NUL, mux framing and anything the transport
+/// adds. Not a measured end-to-end boundary (no sshd in the sandbox): policy
+/// derived from those two sources. SPEC § The dispatch size cap.
+pub const MAX_DISPATCH_BYTES: usize = 112 * 1024;
+
+/// A transport that sends nothing: it records the script a dispatch would have
+/// sent, so the size is measured on the exact string handed to ssh rather than
+/// re-derived from the pieces that build it.
+struct Measure(std::cell::RefCell<Option<usize>>);
+
+impl Transport for Measure {
+    fn run_unlocked(&self, _: &Host, script: &str) -> Result<crate::transport::Output> {
+        *self.0.borrow_mut() = Some(script.len());
+        bail!("measured, not sent")
+    }
+    fn mux_op(&self, _: &Host, _: crate::transport::MuxOp) -> Result<crate::transport::Output> {
+        bail!("measuring makes no mux call")
+    }
+    fn master_alive(&self, _: &Host) -> bool {
+        true
+    }
+    // In memory only: no ssh and no session channel, so there is nothing for
+    // the ticket lock to order, and waiting on it would make a size check
+    // block behind other callers.
+    fn run(&self, host: &Host, script: &str) -> Result<crate::transport::Output> {
+        self.run_unlocked(host, script)
+    }
+}
+
+/// Refuse a dispatch too big for one ssh argument, before any transport call
+/// (not even a `-O check` or a cleanup `rm`: nothing was dispatched).
+pub fn preflight(host: &Host, id: &JobId, request: &Request) -> Result<()> {
+    let measure = Measure(Default::default());
+    let _ = dispatch(&measure, host, id.clone(), request);
+    let size = measure.0.borrow().context("could not size the dispatch")?;
+    if size > MAX_DISPATCH_BYTES {
+        bail!(
+            "command too large for one dispatch ({size} bytes of remote script, limit \
+             {MAX_DISPATCH_BYTES}); put the payload in a file and run that"
+        );
+    }
+    Ok(())
+}
+
+/// The one dispatch call, so [`preflight`] measures what [`start`] sends.
+fn dispatch(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<JobId> {
     crate::run::dispatch_with_id(
         transport,
         host,
@@ -92,7 +145,12 @@ pub fn start(transport: &dyn Transport, host: &Host, id: JobId, request: &Reques
         JobMode::Exec,
         &mut std::io::sink(),
     )
-    .map(drop)
+}
+
+/// Start the job under `id`. Silent: warnings go nowhere.
+pub fn start(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<()> {
+    preflight(host, &id, request)?;
+    dispatch(transport, host, id, request).map(drop)
 }
 
 /// Wait for the job, print its output, remove it, and return the exit code.
@@ -358,10 +416,13 @@ pub fn run_cli_with(
     request: &Request,
     cancel: Cancel,
 ) -> Result<i32> {
+    let id: JobId = new_id().parse().expect("generated ids are valid");
+    // Before the signal handlers, the gate and every transport call: an
+    // oversize command was never dispatched, so there is nothing to clean up.
+    preflight(host, &id, request)?;
     // Exec's stderr belongs to the command; see `lock::set_quiet`.
     crate::lock::set_quiet(true);
 
-    let id: JobId = new_id().parse().expect("generated ids are valid");
     let signals = Arc::new(Signals::install(&cleanup::STOP_SIGNALS)?);
     // Every locked call goes through one gate the signal path can close, as
     // the lease's does: a probe in flight holds the one session, and exiting

@@ -325,6 +325,9 @@ is the command's own.
   that queues like any caller and retries for up to 10 minutes. Give it a moment before you tear the machine
   down. `run --wait` is the opposite: its job continues.
 - **Exit 3** is still "no master: stop and ask a human".
+- **A command whose dispatch script passes 112 KiB** (roughly 80KB of command)
+  exits 1 with `command too large for one dispatch (<n> bytes of remote script,
+  limit <m>)`, before any ssh call. Put big payloads in a file and run that.
 - **`--no-detach`** stops the job from exec itself on a signal: one `mule rm`
   attempt, then the exit, with every process left in exec's process group.
   For a caller that kills the group after a grace (a plugin host), where a

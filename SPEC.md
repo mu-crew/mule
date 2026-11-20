@@ -619,6 +619,12 @@ A forward record is not a job index. It exists only because OpenSSH cannot list 
 
 `/tmp` is shared and cleared unpredictably. It is also where the stale-`rc` failure was reproduced. A user-owned state directory gives cleanup and listing one stable root.
 
+### The dispatch size cap
+
+The dispatch script rides one ssh session as one argument: locally as `ssh`'s last argv element, and on the host as the `sh -c` string. `exec` builds the exact script it would send (prune prefix, wrapper, advisory session count) and measures that, not the user's command, then rejects over `MAX_DISPATCH_BYTES` = 112 KiB with `command too large for one dispatch (<n> bytes of remote script, limit <m>)`, exit 1, **before any ssh call**: no `-O check`, no cleanup `rm`, since nothing was dispatched.
+
+The limit comes from two documented ceilings, taking the smaller. Linux's per-argument limit `MAX_ARG_STRLEN` is 32 pages = 131072 bytes including the NUL (execve(2)). OpenSSH's mux reader drops a client message over 256 KiB (`channel_post_mux_client_read`, channels.c), which explains the ~267KB `mux_client_request_session: write packet: Broken pipe` spike_exec saw; it is not a 64KB threshold, and an earlier 64KB guess was wrong (a 46,000-byte command already sent 66,504 bytes). The Linux limit governs; 16 KiB of headroom covers the NUL, mux framing and transport additions. This is policy derived from those sources, not a measured end-to-end boundary (no sshd in the sandbox). Classifying the Broken pipe afterwards was rejected: the same text can come from a dropped connection, and the job may by then have been half-dispatched. Put big payloads in a file and run that. A single argument the OS itself refuses to start mule with (over 128 KiB on Linux) fails at spawn, before mule runs, and cannot be diagnosed by it.
+
 ### Split stdout and stderr
 
 Two logs require two offsets and extra reads while losing causal interleaving. The submitted command can redirect either stream when separation matters.

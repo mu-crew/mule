@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- `exec` of a command too big for one dispatch (remote script over 112 KiB, set
+  below Linux's 128 KiB per-argument limit) now exits 1 with `command too large
+  for one dispatch (<n> bytes of remote script, limit <m>)` before any ssh
+  call, not a bare `Broken pipe`.
+
 - The missing-tool hint after a failed `run --wait` now fires on hosts whose
   `/bin/sh` is dash (Debian, Ubuntu), which word the error
   `sh: 1: <cmd>: not found` rather than `command not found`.
