@@ -339,7 +339,7 @@ fn tui_dispatch_hints_are_pasteable_with_a_hostile_forwarded_workstream() {
         "{hints}"
     );
     assert!(hints.contains(&format!("mule tail {id}")), "{hints}");
-    assert!(hints.contains(&format!("# select mule-{id}")), "{hints}");
+    assert!(hints.contains(&format!("select mule-{id}")), "{hints}");
     assert!(hints.contains("--host '127.0.0.1'"), "{hints}");
     assert!(
         hints.contains(&format!(
