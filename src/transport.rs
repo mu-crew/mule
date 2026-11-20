@@ -440,14 +440,16 @@ impl SshLog {
             );
         }
         // Like ssh's StrictModes: whoever can write an ancestor can swap the
-        // verified dir for another between this check and ssh's open. Sticky
-        // dirs (/tmp) fail too: they are group/other writable.
+        // verified dir for another between this check and ssh's open. The one
+        // exception is a root-owned sticky dir (/tmp): the sticky bit stops
+        // others renaming or removing our entries, so state dirs may live there.
         let real = std::fs::canonicalize(dir)
             .with_context(|| format!("cannot resolve ssh log dir {}", dir.display()))?;
         for anc in real.ancestors().skip(1) {
             let m = std::fs::metadata(anc)
                 .with_context(|| format!("cannot inspect {}", anc.display()))?;
-            if (m.uid() != uid && m.uid() != 0) || m.mode() & 0o022 != 0 {
+            let sticky_root = m.uid() == 0 && m.mode() & 0o1000 != 0;
+            if (m.uid() != uid && m.uid() != 0) || (m.mode() & 0o022 != 0 && !sticky_root) {
                 anyhow::bail!(
                     "refusing ssh log dir {}: ancestor {} is unsafe (uid {}, mode {:o}); \
                      it must be owned by you or root and not group/other writable",

@@ -71,3 +71,19 @@ fn a_group_writable_ancestor_is_refused() {
     std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn a_root_owned_sticky_world_writable_ancestor_is_accepted() {
+    let tmp = std::path::Path::new("/tmp");
+    let m = std::fs::metadata(tmp).unwrap();
+    if m.uid() != 0 || m.mode() & 0o1002 != 0o1002 {
+        eprintln!("skip: /tmp is not a root-owned sticky world-writable dir");
+        return;
+    }
+    let root = tmp.join(format!("mule-ssh-log-sticky-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    let res = SshLog::create_in(&root.join("ssh"));
+    std::fs::remove_dir_all(&root).unwrap();
+    res.expect("sticky root-owned /tmp ancestor must pass");
+}
