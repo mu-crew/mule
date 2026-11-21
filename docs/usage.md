@@ -392,14 +392,31 @@ host can use mule as its link instead of `--shell`/`--exec` templates. It looks
 for `mule` beside itself, then on `PATH`.
 
 ```sh
-mu plugin add mule -- /abs/path/to/mu-plugin-mule [--config PATH]
+mule init
+mu plugin list
 mu host add box --plugin mule --fetch '<your fetch command>'
 mu host check box
 ```
 
-The mu host's name is the mule host's name. `--config` is passed to every
-`mule` call. mu needs the file to be named `mu-plugin-mule`, owned by you and
-writable by nobody else.
+`mule init` writes the commented config template only if missing and prints
+the master command for every configured host without opening any masters. It
+skips registration if `mu` is not on `PATH`. Rerun it after upgrading mule:
+it re-registers when the plugin reports a new version or schema digest and
+leaves a matching registration alone. It never creates mu host profiles.
+
+mu requires the executable to be named `mu-plugin-mule`, owned by you and
+not writable by others. If the install is root-owned, use a user-owned
+install or follow the printed commands to copy both binaries into a private
+directory and run `init` there. Refresh that copy after upgrading.
+
+The mu host's name is the mule host's name. `mule init --config PATH` seeds
+and uses that config instead of the default and records its absolute path in
+the plugin registration. To register manually, use
+`mu plugin add mule -- /abs/path/to/mu-plugin-mule [--config PATH]`. `init`
+will not replace an existing registration with different arguments.
+
+`init` exits 0 on success (including when mu is absent), 1 on a local setup
+error such as invalid config, and 9 when plugin registration fails.
 
 What it declares: the **link** seam only, with `exec` served by
 `mule exec --no-detach --strict-codes`. `fetch` is false (mule has no fetch, so
@@ -431,7 +448,9 @@ Limits and fences:
   mu's 1 MiB frame (measured after escaping: a NUL is six bytes).
 - A request whose `deadline` has passed is refused unstarted, and a live
   deadline shortens `timeoutMs`.
-- The handshake `instance` is `mule-<hash>` over the `--config` file and every
-  host's target and socket, so a retargeted backend is refused by mu's fence.
+- The plugin snapshots `--config` (or the default config) at `initialize`.
+  Every child uses that snapshot; edits only take effect when a new plugin
+  process initializes. The handshake `instance` hashes the snapshot and the
+  resolved hosts, so mu's fence refuses a retargeted backend.
 - `$/cancel` before dispatch means nothing runs; on stdin EOF the plugin stops
   mule and the `ssh` it started, and kills what mule leaves behind.

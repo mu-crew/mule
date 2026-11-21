@@ -12,6 +12,7 @@ mod dispatch_warn;
 pub mod errors;
 pub mod exec;
 pub mod forward;
+mod init;
 pub mod jobs;
 pub mod key;
 pub mod lease;

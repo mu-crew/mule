@@ -14,25 +14,32 @@ mule, 5 of 5. [Why, with diagrams, and which jobs belong here](docs/why.md).
 
 ```sh
 npm i -g @mu-crew/mule
+mule init
 ```
 
 Prebuilt for Linux x64, Linux arm64 and macOS arm64. Or `cargo install mule-cli`
 (Rust 1.88+), or `cargo install --path .` from a clone. The host needs `tmux`.
 
+Run `mule init` after installing or upgrading. It registers the bundled
+plugin if `mu` is on `PATH`, but does not create any mu host profiles. mu
+requires a plugin you own; use a user-owned install or follow the copy
+commands printed by `mule init`.
+
 ## Set up a host
 
-The first run writes a commented template to `~/.config/mule/config.toml`. The
-minimum is two lines:
+`mule init` writes a commented template to `~/.config/mule/config.toml` if it
+is missing. The minimum is two lines:
 
 ```toml
 [hosts.build]
 target = "build"
 ```
 
-The section name is what `--host` takes; with one host you can omit it.
+The section name is what `--host` takes; with one host you can omit it. Rerun
+`mule init` after editing to print the command for each host.
 
-mule needs an SSH control master on its own socket and never opens it. Open it
-once per `ControlPersist` window (one hardware-key tap, if you use one):
+mule needs an SSH control master on its own socket and never opens it. Open
+it yourself (this can require a hardware-key tap):
 
 ```sh
 ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build

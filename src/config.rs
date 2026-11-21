@@ -195,9 +195,17 @@ pub fn default_path() -> Result<PathBuf> {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::read(path, Self::parse)
+    }
+
+    pub(crate) fn load_for_init(path: &Path) -> Result<Self> {
+        Self::read(path, |text| Self::resolve(toml::from_str(text)?))
+    }
+
+    fn read(path: &Path, parse: fn(&str) -> Result<Self>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in config {}", path.display()))
+        parse(&text).with_context(|| format!("in config {}", path.display()))
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -211,6 +219,10 @@ impl Config {
                  [hosts.dev]\n    target = \"dev\""
             );
         }
+        Self::resolve(raw)
+    }
+
+    fn resolve(raw: RawConfig) -> Result<Self> {
         let hosts = raw
             .hosts
             .into_iter()

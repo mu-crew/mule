@@ -145,9 +145,10 @@ Exit status:
   6   connection dropped while waiting
   7   exec only: output incomplete -- truncated at max_log_bytes, or a process
       still holds the job's stdout; what was printed is partial
-  129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
   8   only with --strict-codes: the command's 3, or its own 8 (ambiguous; 3 is
       always mule's handback)
+  9   init only: mu is installed but plugin registration could not be completed
+  129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
   <n> wait/--wait/--lease return the job's own exit code; exec returns the
       command's; run --lease exits 3 only at startup"
 )]
@@ -178,6 +179,8 @@ pub struct HostArg {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Set up the config, print master commands and register the plugin if mu is installed
+    Init,
     /// Dispatch a command and print its job id
     Run {
         #[command(flatten)]
@@ -969,9 +972,13 @@ fn strict_remap(code: i32, strict: bool) -> i32 {
 }
 
 pub fn dispatch(cli: Cli) -> Result<i32> {
+    if matches!(cli.command, Commands::Init) {
+        return crate::init::run(cli.config.as_deref(), cli.quiet);
+    }
     let cfg = load_config(cli.config.as_deref())?;
     let quiet = cli.quiet;
     match cli.command {
+        Commands::Init => unreachable!("init handles its own config"),
         Commands::Run {
             host,
             cwd,
@@ -1396,7 +1403,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     }
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

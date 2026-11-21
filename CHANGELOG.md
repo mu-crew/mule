@@ -4,6 +4,9 @@
 
 ### Added
 
+- `mule init` seeds the config, prints master commands without opening them,
+  and registers `mu-plugin-mule` when mu is installed. Rerun after an upgrade
+  to refresh the registration if the plugin version or schema digest changed.
 - `mu-plugin-mule`: a second binary serving mu's plugin protocol (v1) for the
   link seam: `exec` via `mule exec --no-detach --strict-codes`, `slots: self`,
   provable quiescence, no fetch. Strict 3 is a hand-back; see docs/usage.md.
