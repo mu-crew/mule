@@ -32,8 +32,21 @@ pub fn isolate_state() {
     });
 }
 
+/// Forks take the read side, writes of an executable the write side. Writing
+/// a script and exec'ing it while another thread forks fails ETXTBSY (the
+/// fork inherits the write fd for an instant): seen as a flaky `-O check`
+/// reporting a down master, 3 of 10 runs, once tests rewrote shims in
+/// parallel with plugin spawns.
+pub static SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+pub fn write_exec(path: impl AsRef<Path>, text: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let _g = SPAWN_GATE.write().unwrap();
+    std::fs::write(path, text)
+}
+
 /// Is tmux here at all? Layer 2 skips, saying so, when it is not.
 pub fn tmux_available() -> bool {
+    let _g = SPAWN_GATE.read().unwrap();
     Command::new("tmux").arg("-V").output().is_ok()
 }
 
@@ -101,6 +114,7 @@ impl LocalTmux {
 
 impl Drop for LocalTmux {
     fn drop(&mut self) {
+        let _g = SPAWN_GATE.read().unwrap();
         // Ask for the socket path before killing, as layer 3 does: kill-server
         // leaves the file behind.
         let path = Command::new("tmux")
@@ -219,7 +233,7 @@ impl ShimHost {
         std::fs::create_dir_all(&state).unwrap();
         let tmux = LocalTmux::new(tag);
         let shim = dir.join("ssh");
-        std::fs::write(
+        write_exec(
             &shim,
             format!(
                 "#!/bin/sh\n\
@@ -234,6 +248,13 @@ impl ShimHost {
         )
         .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Run it once now: the first exec of a fresh script on macOS can take
+        // seconds (scan), and mule gives `-O check` 2 s -- a healthy master
+        // read as down, 2 of 10 loaded runs.
+        {
+            let _g = SPAWN_GATE.read().unwrap();
+            let _ = Command::new(&shim).arg("-O").output();
+        }
         let config = dir.join("config.toml");
         std::fs::write(
             &config,

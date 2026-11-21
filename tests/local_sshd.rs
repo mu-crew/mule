@@ -1257,7 +1257,7 @@ fn host_info_probes_real_capabilities_and_reports_a_down_master() {
         "a reachable host without a detected GPU must report none: {json}"
     );
     assert!(
-        json.contains("\"name\":\"down\",\"target\":\"127.0.0.1\",\"master\":false,\"os\":\"unknown\",\"arch\":\"unknown\",\"cores\":null,\"ram_gb\":null,\"gpu\":\"unknown\""),
+        json.contains("\"name\":\"down\",\"target\":\"127.0.0.1\",\"master\":false,\"os\":\"unknown\",\"arch\":\"unknown\",\"cores\":null,\"ram_gb\":null,\"tmux\":null,\"gpu\":\"unknown\""),
         "a down master must remain visible without a probe: {json}"
     );
     assert!(

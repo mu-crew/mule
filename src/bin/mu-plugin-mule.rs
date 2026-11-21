@@ -55,9 +55,31 @@ type Calls = Arc<Mutex<HashMap<String, Arc<Live>>>>;
 struct Ctx {
     out: Out,
     calls: Calls,
+    /// `[mule, --quiet]`: the config is never here, only in the snapshot.
     mule: Arc<Vec<String>>,
-    /// The instance the handshake advertised; `None` before it.
-    negotiated: Arc<Mutex<Option<String>>>,
+    /// The `--config PATH` this plugin was started with, read once, at the
+    /// handshake.
+    config_path: Option<std::path::PathBuf>,
+    /// The config as the handshake saw it; `None` before it. Every dispatch
+    /// uses this and nothing else (see `Snap`).
+    snap: Arc<Mutex<Option<Arc<Snap>>>>,
+    /// Set once any `mule` child has been spawned: the process group may then
+    /// hold helpers that outlive their mule (see `main`).
+    spawned: Arc<AtomicBool>,
+}
+
+/// The mule config, read and validated ONCE at the handshake. The instance mu
+/// fingerprints is derived from these bytes, and every `mule` child is handed
+/// a private copy of them (`--config <copy>`) instead of the mutable pathname:
+/// an atomic replace of the real file between the check and the use can then
+/// never retarget a dispatch (reviewed: exec ran against `two/two.sock` while
+/// mu held `one`'s fingerprint). A changed file is seen only by a new plugin
+/// process, i.e. when mu re-handshakes.
+struct Snap {
+    instance: String,
+    /// The private copy; `None` when the file was unreadable at the handshake,
+    /// in which case nothing dispatches.
+    config: Option<std::path::PathBuf>,
 }
 
 fn send(out: &Out, msg: &Value) {
@@ -177,16 +199,33 @@ fn orphaned(pid: i32) -> bool {
 
 static PARTIALS: AtomicU64 = AtomicU64::new(0);
 
-/// Run `mule <args>` to completion, to `timeout`, or to a cancel (`live`).
-/// Starts nothing if the cancel already arrived. `Ok(None)` is that case.
+enum Run {
+    Done(Ran),
+    /// Cancelled before dispatch: nothing ran.
+    Cancelled,
+    /// The wire deadline had passed at the moment of dispatch: nothing ran.
+    Expired,
+}
+
+/// Run `mule <args>` to completion, to `timeout` (capped by the absolute wire
+/// `deadline`), or to a cancel (`live`). The deadline is checked HERE,
+/// immediately before the spawn and after every other preparation: a budget
+/// taken earlier and measured from the spawn would hand a late call a fresh
+/// copy of the old budget. Starts nothing if the cancel or the deadline
+/// already arrived.
 fn run_mule(
     ctx: &Ctx,
+    snap: &Snap,
     live: &Live,
     args: &[String],
-    timeout: Duration,
-) -> std::io::Result<Option<Ran>> {
+    mut timeout: Duration,
+    deadline: Option<u64>,
+) -> std::io::Result<Run> {
+    let Some(config) = &snap.config else {
+        return Err(std::io::Error::other("no config snapshot"));
+    };
     if live.cancelled.load(Ordering::SeqCst) {
-        return Ok(None);
+        return Ok(Run::Cancelled);
     }
     // mule's own word that output was cut (exec.rs): the exit code 7 and the
     // stderr note are ambiguous with the command's.
@@ -195,8 +234,16 @@ fn run_mule(
         std::process::id(),
         PARTIALS.fetch_add(1, Ordering::SeqCst)
     ));
+    match remaining_at(deadline, now_ms()) {
+        Err(()) => return Ok(Run::Expired),
+        Ok(Some(left)) => timeout = timeout.min(left),
+        Ok(None) => {}
+    }
+    ctx.spawned.store(true, Ordering::SeqCst);
     let mut child: Child = Command::new(&*ctx.mule[0])
         .args(&ctx.mule[1..])
+        .arg("--config")
+        .arg(config)
         .args(args)
         .env("MULE_PARTIAL_FILE", &partial_file)
         .stdin(Stdio::null())
@@ -256,7 +303,7 @@ fn run_mule(
     let (se, cut_e) = se.join().unwrap_or_default();
     let upstream = partial_file.exists();
     let _ = std::fs::remove_file(&partial_file);
-    Ok(Some(Ran {
+    Ok(Run::Done(Ran {
         code: status.code().filter(|_| status.signal().is_none()),
         stdout: String::from_utf8_lossy(&so).into_owned(),
         stderr: String::from_utf8_lossy(&se).into_owned(),
@@ -323,17 +370,20 @@ fn host_of(params: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// The time the wire deadline leaves (`deadline` is epoch ms; mu cancels past
-/// it). `None` field: unbounded. `Err` when it has already passed: nothing may
+/// it). `None`: unbounded. `Err` when it has already passed: nothing may
 /// start, a call delayed in delivery must not begin side effects after the
 /// caller gave up.
-fn remaining(params: &Value) -> Result<Option<Duration>, ()> {
-    let Some(deadline) = params["deadline"].as_u64() else {
+fn remaining_at(deadline: Option<u64>, now: u64) -> Result<Option<Duration>, ()> {
+    let Some(deadline) = deadline else {
         return Ok(None);
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64);
     match deadline.checked_sub(now) {
         Some(ms) if ms > 0 => Ok(Some(Duration::from_millis(ms))),
         _ => Err(()),
@@ -360,17 +410,11 @@ fn link_exec(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
             None,
         );
     };
-    let Ok(left) = remaining(params) else {
-        return expired(&ctx.out, id);
+    let Some(snap) = snapshot(ctx, id) else {
+        return;
     };
-    if drifted(ctx) {
-        return refuse_drift(&ctx.out, id);
-    }
     let cwd = params["cwd"].as_str().unwrap_or(".");
-    let mut timeout = Duration::from_millis(params["timeoutMs"].as_u64().unwrap_or(20_000));
-    if let Some(left) = left {
-        timeout = timeout.min(left);
-    }
+    let timeout = Duration::from_millis(params["timeoutMs"].as_u64().unwrap_or(20_000));
     let args: Vec<String> = [
         "exec",
         "--host",
@@ -384,7 +428,14 @@ fn link_exec(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     ]
     .map(String::from)
     .into();
-    match run_mule(ctx, live, &args, timeout) {
+    match run_mule(
+        ctx,
+        &snap,
+        live,
+        &args,
+        timeout,
+        params["deadline"].as_u64(),
+    ) {
         Err(e) => fail(
             &ctx.out,
             id,
@@ -392,9 +443,10 @@ fn link_exec(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
             &format!("cannot run mule: {e}"),
             None,
         ),
-        Ok(None) => {}                   // cancelled before dispatch: nothing ran
-        Ok(Some(r)) if r.cancelled => {} // mu ignores any answer now
-        Ok(Some(r)) => match exec_answer(&host, r) {
+        Ok(Run::Cancelled) => {} // cancelled before dispatch: nothing ran
+        Ok(Run::Expired) => expired(&ctx.out, id),
+        Ok(Run::Done(r)) if r.cancelled => {} // mu ignores any answer now
+        Ok(Run::Done(r)) => match exec_answer(&host, r) {
             Ok(v) => reply(&ctx.out, id, v),
             Err((kind, msg, remedy)) => fail(
                 &ctx.out,
@@ -422,25 +474,30 @@ fn check_steps(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     if params["phase"] != "reach" {
         return reply(&ctx.out, id, json!([]));
     }
-    let Ok(left) = remaining(params) else {
-        return expired(&ctx.out, id);
+    let Some(snap) = snapshot(ctx, id) else {
+        return;
     };
-    if drifted(ctx) {
-        return refuse_drift(&ctx.out, id);
-    }
-    let budget = left.map_or(Duration::from_secs(8), |l| l.min(Duration::from_secs(8)));
     let args = ["host", "info", "--host", &host, "--json"].map(String::from);
     let t0 = Instant::now();
-    let steps = match run_mule(ctx, live, &args, budget) {
+    let run = run_mule(
+        ctx,
+        &snap,
+        live,
+        &args,
+        Duration::from_secs(8),
+        params["deadline"].as_u64(),
+    );
+    let steps = match run {
         Err(e) => {
             vec![json!({"step": "master", "ok": false, "detail": format!("cannot run mule: {e}")})]
         }
-        Ok(None) => return,
-        Ok(Some(r)) if r.cancelled => return,
-        Ok(Some(r)) if r.code != Some(0) => {
+        Ok(Run::Cancelled) => return,
+        Ok(Run::Expired) => return expired(&ctx.out, id),
+        Ok(Run::Done(r)) if r.cancelled => return,
+        Ok(Run::Done(r)) if r.code != Some(0) => {
             vec![json!({"step": "master", "ok": false, "detail": first_line(&r.stderr)})]
         }
-        Ok(Some(r)) => {
+        Ok(Run::Done(r)) => {
             let v: Value = serde_json::from_str(&r.stdout).unwrap_or(Value::Null);
             let row = &v["items"][0];
             match row["master"].as_bool() {
@@ -484,9 +541,50 @@ fn initialize(ctx: &Ctx, id: &Value, params: &Value) {
             None,
         );
     }
-    let inst = instance(&ctx.mule);
-    *ctx.negotiated.lock().unwrap() = Some(inst.clone());
-    reply(&ctx.out, id, handshake(&inst));
+    let snap = {
+        let mut g = ctx.snap.lock().unwrap();
+        g.get_or_insert_with(|| Arc::new(take_snapshot(ctx)))
+            .clone()
+    };
+    reply(&ctx.out, id, handshake(&snap.instance));
+}
+
+/// The one read of the config file, at the handshake.
+fn take_snapshot(ctx: &Ctx) -> Snap {
+    let path = ctx
+        .config_path
+        .clone()
+        .or_else(|| mule::config::default_path().ok());
+    let read = path.map(std::fs::read);
+    let (bytes, ok) = match read {
+        Some(Ok(b)) => (b, true),
+        Some(Err(e)) => (format!("unreadable:{}", e.kind()).into(), false),
+        None => (b"unreadable:nopath".to_vec(), false),
+    };
+    let config = ok.then(|| write_copy(&bytes)).flatten();
+    Snap {
+        instance: instance(&bytes),
+        config,
+    }
+}
+
+fn copy_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("mu-plugin-mule-{}.config.toml", std::process::id()))
+}
+
+/// A private (0600) copy of the snapshot bytes for the `mule` children.
+fn write_copy(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = copy_path();
+    let _ = std::fs::remove_file(&p); // a stale file from a recycled pid
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&p)
+        .ok()?;
+    f.write_all(bytes).ok()?;
+    Some(p)
 }
 
 /// FNV-1a: stable across Rust versions, unlike `DefaultHasher`, and the
@@ -502,24 +600,15 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 }
 
 /// The backend's identity, opaque: a hash over what decides where a job goes
-/// -- the config file's bytes (or why it is unreadable) and every host's name,
+/// -- the config bytes (or why they were unreadable) and every host's name,
 /// target and master socket as mule resolves them (`~` expanded). Computed
-/// in-process from the file: a `mule host list` child probes every master in
-/// series (2 s each, measured 15.3 s with six wedged peers, past mu's 10 s
+/// in-process from the snapshot: a `mule host list` child probes every master
+/// in series (2 s each, measured 15.3 s with six wedged peers, past mu's 10 s
 /// initialize cap), and the identity needs no master state. Retarget a host
 /// and the instance changes, so mu's recovery and collect fence refuses the
 /// old jobs; a hash discloses no path or secret.
-fn instance(mule: &[String]) -> String {
-    let path = mule
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| mule.get(i + 1))
-        .map(std::path::PathBuf::from)
-        .or_else(|| mule::config::default_path().ok());
-    let bytes = path.map_or_else(Vec::new, |p| {
-        std::fs::read(&p).unwrap_or_else(|e| format!("unreadable:{}", e.kind()).into())
-    });
-    let hosts = mule::config::Config::parse(&String::from_utf8_lossy(&bytes))
+fn instance(bytes: &[u8]) -> String {
+    let hosts = mule::config::Config::parse(&String::from_utf8_lossy(bytes))
         .map(|c| {
             c.hosts()
                 .iter()
@@ -527,29 +616,36 @@ fn instance(mule: &[String]) -> String {
                 .collect::<String>()
         })
         .unwrap_or_default();
-    format!("mule-{:016x}", fnv(&[&bytes, hosts.as_bytes()]))
+    format!("mule-{:016x}", fnv(&[bytes, hosts.as_bytes()]))
 }
 
-/// A live link is bound to the instance it advertised: if the config changed
-/// under an open session, refuse before any dispatch rather than run a later
-/// step on a different backend than the one mu's identity check passed.
-fn drifted(ctx: &Ctx) -> bool {
-    ctx.negotiated
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|n| *n != instance(&ctx.mule))
-}
-
-fn refuse_drift(out: &Out, id: &Value) {
-    fail(
-        out,
-        id,
-        "permanent",
-        "mule's configuration changed since this session's handshake; nothing ran. \
-         Reopen the link to adopt the new backend",
-        None,
-    );
+/// The snapshot a dispatch must use; replies with a refusal (nothing ran) and
+/// returns `None` when there is none to use.
+fn snapshot(ctx: &Ctx, id: &Value) -> Option<Arc<Snap>> {
+    let snap = ctx.snap.lock().unwrap().clone();
+    match snap {
+        Some(s) if s.config.is_some() => Some(s),
+        Some(_) => {
+            fail(
+                &ctx.out,
+                id,
+                "permanent",
+                "mule's configuration was unreadable at this session's handshake; nothing ran",
+                None,
+            );
+            None
+        }
+        None => {
+            fail(
+                &ctx.out,
+                id,
+                "permanent",
+                "link call before initialize; nothing ran",
+                None,
+            );
+            None
+        }
+    }
 }
 
 fn handshake(instance: &str) -> Value {
@@ -610,12 +706,13 @@ fn on_message(ctx: &Ctx, msg: Value) {
 }
 
 fn main() {
-    // `--config PATH` is the only option, and goes to every mule call.
-    let mut mule = vec![mule_bin().to_string_lossy().into_owned(), "--quiet".into()];
+    // `--config PATH` is the only option; it is read once, at the handshake.
+    let mule = vec![mule_bin().to_string_lossy().into_owned(), "--quiet".into()];
+    let mut config_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match (a.as_str(), args.next()) {
-            ("--config", Some(p)) => mule.extend(["--config".to_string(), p]),
+            ("--config", Some(p)) => config_path = Some(std::path::PathBuf::from(p)),
             _ => {
                 eprintln!("usage: mu-plugin-mule [--config PATH]");
                 std::process::exit(2);
@@ -626,7 +723,9 @@ fn main() {
         out: Arc::new(Mutex::new(std::io::stdout())),
         calls: Arc::default(),
         mule: Arc::new(mule),
-        negotiated: Arc::default(),
+        config_path,
+        snap: Arc::default(),
+        spawned: Arc::default(),
     };
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -641,24 +740,27 @@ fn main() {
     // stdin EOF: mu is done or dead. Flag every call cancelled: each worker
     // TERMs its mule tree, KILLs after the grace and reaps what mule left
     // behind (run_mule). Then wait for them, and KILL any tree still up.
-    let in_flight = {
-        let calls = ctx.calls.lock().unwrap();
-        for live in calls.values() {
-            live.cancelled.store(true, Ordering::SeqCst);
-        }
-        !calls.is_empty()
-    };
+    for live in ctx.calls.lock().unwrap().values() {
+        live.cancelled.store(true, Ordering::SeqCst);
+    }
     let t = Instant::now();
     while !ctx.calls.lock().unwrap().is_empty() && t.elapsed() < STOP_GRACE + Duration::from_secs(2)
     {
         thread::sleep(Duration::from_millis(20));
     }
-    if !in_flight {
-        return; // every mule was waited for; nothing of ours can be left
+    // The private config copy goes first: the group kill below ends us.
+    if let Some(s) = ctx.snap.lock().unwrap().as_ref()
+        && let Some(c) = &s.config
+    {
+        let _ = std::fs::remove_file(c);
     }
-    // Hard bound, independent of `ps`: a call was in flight, so a helper may
-    // have outlived its mule (reparented, so no tree walk finds it -- and a
-    // failing `ps` finds nothing at all). Everything we spawned shares our
+    if !ctx.spawned.load(Ordering::SeqCst) {
+        return; // no mule was ever started: nothing of ours can be left
+    }
+    // Hard bound, independent of `ps`, in EVERY state -- an empty call map
+    // proves only that each direct mule was waited for, not that its helper
+    // died: after a timeout reply the call is gone yet a reparented ssh may
+    // still hold the capped channel (a failing `ps` finds nothing at all). Everything we spawned shares our
     // process group, never detached, so when we lead it (mu starts a plugin
     // as its own group leader) one SIGKILL to the group takes every one,
     // ourselves last. Measured: with `ps` failing, the stalled ssh survived
@@ -725,6 +827,37 @@ mod tests {
             exec_answer("h", ran(None, "")).unwrap_err().0,
             "unknown-outcome"
         );
+    }
+
+    #[test]
+    fn a_passed_deadline_spawns_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("mpm-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let bin = dir.join("mule");
+        std::fs::write(&bin, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ctx = Ctx {
+            out: Arc::new(Mutex::new(std::io::stdout())),
+            calls: Arc::default(),
+            mule: Arc::new(vec![bin.to_string_lossy().into_owned()]),
+            config_path: None,
+            snap: Arc::default(),
+            spawned: Arc::default(),
+        };
+        let snap = Snap {
+            instance: String::new(),
+            config: Some(dir.join("c.toml")),
+        };
+        let live = Live::default();
+        let past = Some(now_ms() - 1);
+        let r = run_mule(&ctx, &snap, &live, &[], Duration::from_secs(5), past).unwrap();
+        assert!(matches!(r, Run::Expired));
+        assert!(!marker.exists());
+        assert!(!ctx.spawned.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

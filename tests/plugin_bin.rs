@@ -7,8 +7,11 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use common::local::{ShimHost, tmux_available};
+use common::local::{SPAWN_GATE, ShimHost, tmux_available, write_exec};
 use serde_json::{Value, json};
 
 struct Plugin {
@@ -18,10 +21,78 @@ struct Plugin {
     next: u64,
     /// Bytes of the last reply line, newline included: mu's frame bound.
     last_len: usize,
+    /// Held for the plugin's life; see `Permit`.
+    _permit: Permit,
+    /// Set on drop: stands the watchdog down.
+    done: Arc<AtomicBool>,
+}
+
+/// At most `LIVE` plugins at once. 15 tests each spawning mule, ssh shims and
+/// tmux saturate the machine, and mule's `-O check` gives up after 2 s
+/// (CHECK_TIMEOUT): under that load a healthy shim master read as down, 2 of
+/// 10 runs. Bounded concurrency keeps the suite honest about what it tests.
+const LIVE: usize = 4;
+
+struct Permit;
+
+static LIVE_COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static LIVE_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+impl Permit {
+    fn take() -> Self {
+        let mut n = LIVE_COUNT.lock().unwrap();
+        while *n >= LIVE {
+            n = LIVE_FREED.wait(n).unwrap();
+        }
+        *n += 1;
+        Permit
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        *LIVE_COUNT.lock().unwrap() -= 1;
+        LIVE_FREED.notify_one();
+    }
+}
+
+/// No test may wait unbounded on its plugin: a missing reply, or a plugin that
+/// never exits on EOF, would otherwise hang `cargo test` forever. After this
+/// long the plugin's group is killed, so a blocked read sees EOF and the test
+/// fails instead.
+const WATCHDOG: Duration = Duration::from_secs(120);
+
+fn watchdog(pgid: i32, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        while t.elapsed() < WATCHDOG {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // SAFETY: plain kill(2) on the plugin's own group.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    });
 }
 
 impl Plugin {
+    /// Spawn and complete the handshake: a dispatch needs one.
     fn start(h: &ShimHost) -> Self {
+        let mut p = Self::start_raw(h);
+        let v = p.call(
+            "initialize",
+            json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
+        );
+        assert!(v["result"]["instance"].is_string(), "{v}");
+        p
+    }
+
+    fn start_raw(h: &ShimHost) -> Self {
+        let permit = Permit::take();
+        // Not while another test holds a shim's write fd open: a fork here
+        // would inherit it and the shim's exec would fail ETXTBSY.
+        let gate = SPAWN_GATE.read().unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_mu-plugin-mule"))
             .arg("--config")
             .arg(&h.config)
@@ -33,7 +104,12 @@ impl Plugin {
             .process_group(0)
             .spawn()
             .unwrap();
+        drop(gate);
+        let done = Arc::new(AtomicBool::new(false));
+        watchdog(child.id() as i32, done.clone());
         Self {
+            _permit: permit,
+            done,
             stdin: child.stdin.take(),
             stdout: BufReader::new(child.stdout.take().unwrap()),
             child,
@@ -74,6 +150,7 @@ impl Drop for Plugin {
     fn drop(&mut self) {
         drop(self.stdin.take()); // EOF is the stop signal
         let _ = self.child.wait();
+        self.done.store(true, Ordering::SeqCst);
     }
 }
 
@@ -216,7 +293,7 @@ fn reach_proves_remote_tmux_and_a_down_master_stops_at_the_handback() {
     // The master answers `-O check`, but the remote shell has no tmux.
     let shim = h.dir.join("ssh");
     let text = std::fs::read_to_string(&shim).unwrap();
-    std::fs::write(
+    write_exec(
         &shim,
         text.replace("exec sh -c", "PATH=/nonexistent exec /bin/sh -c"),
     )
@@ -302,7 +379,7 @@ fn eof_kills_the_local_ssh_a_stalled_call_holds() {
     let shim = h.dir.join("ssh");
     let text = std::fs::read_to_string(&shim).unwrap();
     // Every non-`-O` ssh records itself and stalls (a hung session).
-    std::fs::write(
+    write_exec(
         &shim,
         text.replace(
             "exec sh -c \"$last\"",
@@ -313,7 +390,7 @@ fn eof_kills_the_local_ssh_a_stalled_call_holds() {
     // And `ps` is useless (absent, or failing): shutdown must not depend on
     // discovering the tree. A stalled helper has to die regardless.
     let ps = h.dir.join("ps");
-    std::fs::write(&ps, "#!/bin/sh\nexit 1\n").unwrap();
+    write_exec(&ps, "#!/bin/sh\nexit 1\n").unwrap();
     std::fs::set_permissions(&ps, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let mut p = Plugin::start(&h);
     p.send(
@@ -349,7 +426,7 @@ fn eof_kills_the_local_ssh_a_stalled_call_holds() {
 fn the_instance_names_the_backend_not_the_plugin() {
     let Some(h) = host("pb-instance") else { return };
     let hello = |h: &ShimHost| {
-        let mut p = Plugin::start(h);
+        let mut p = Plugin::start_raw(h);
         let v = p.call(
             "initialize",
             json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
@@ -384,8 +461,8 @@ fn wedged_peers_do_not_delay_the_handshake() {
         ));
     }
     std::fs::write(&h.config, config).unwrap();
-    std::fs::write(h.dir.join("ssh"), "#!/bin/sh\nexec sleep 300\n").unwrap();
-    let mut p = Plugin::start(&h);
+    write_exec(h.dir.join("ssh"), "#!/bin/sh\nexec sleep 300\n").unwrap();
+    let mut p = Plugin::start_raw(&h);
     let t = std::time::Instant::now();
     let v = p.call(
         "initialize",
@@ -400,30 +477,141 @@ fn wedged_peers_do_not_delay_the_handshake() {
     );
 }
 
+/// Make the shim ssh record the argv of every non-`-O` call.
+fn log_ssh(h: &ShimHost) -> std::path::PathBuf {
+    let log = h.dir.join("ssh.log");
+    let shim = h.dir.join("ssh");
+    let text = std::fs::read_to_string(&shim).unwrap();
+    write_exec(
+        &shim,
+        text.replacen(
+            "for last; do :; done\n",
+            &format!("for last; do :; done\necho \"$*\" >> {}\n", log.display()),
+            1,
+        ),
+    )
+    .unwrap();
+    log
+}
+
 #[test]
-fn a_live_session_refuses_once_its_config_drifts() {
-    let Some(h) = host("pb-drift") else { return };
+fn a_retargeted_config_never_redirects_a_live_session() {
+    let Some(h) = host("pb-snapshot") else { return };
+    let log = log_ssh(&h);
     let mut p = Plugin::start(&h);
-    let v = p.call(
-        "initialize",
-        json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
-    );
-    assert!(v["result"]["instance"].is_string());
     assert_eq!(
         p.exec("printf before", 20_000)["result"]["stdout"],
         "before"
     );
-
+    // An atomic replace, as an editor or a deploy does it.
     let config = std::fs::read_to_string(&h.config).unwrap();
+    let new = h.dir.join("config.new");
     std::fs::write(
-        &h.config,
-        config.replace("target = \"shim\"", "target = \"elsewhere\""),
+        &new,
+        config
+            .replace("target = \"shim\"", "target = \"elsewhere\"")
+            .replace("mule.sock", "other.sock"),
     )
     .unwrap();
+    std::fs::rename(&new, &h.config).unwrap();
+    let v = p.exec("printf after", 20_000);
+    assert_eq!(v["result"]["stdout"], "after", "{v}");
+    let v = reach(&mut p);
+    assert!(v["result"].is_array(), "{v}");
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !log.contains("elsewhere") && !log.contains("other.sock"),
+        "{log}"
+    );
+    assert!(log.contains("mule.sock"), "{log}");
+}
+
+#[test]
+fn a_dispatch_before_the_handshake_runs_nothing() {
+    let Some(h) = host("pb-nohandshake") else {
+        return;
+    };
+    let mut p = Plugin::start_raw(&h);
     let ran = h.dir.join("ran");
     let v = p.exec(&format!("touch {}", ran.display()), 20_000);
-    assert_eq!(v["error"]["data"]["kind"], "permanent", "{v}");
-    assert!(!ran.exists(), "a drifted session dispatched");
-    let v = reach(&mut p);
-    assert!(v["error"].is_object(), "checkSteps ran on drift: {v}");
+    assert!(v["error"].is_object(), "{v}");
+    assert!(!ran.exists());
+}
+
+#[test]
+fn the_deadline_is_checked_at_spawn_not_before_preflight() {
+    let Some(h) = host("pb-late") else { return };
+    let log = log_ssh(&h);
+    let mut p = Plugin::start(&h);
+    // The reviewer's shape: the per-call config read blocks on a FIFO swapped
+    // in for the pathname until 201 ms past the deadline. The snapshot means
+    // nothing is read per call, so nothing may block; and whatever happens,
+    // no ssh may start after the wire deadline.
+    std::fs::remove_file(&h.config).unwrap();
+    let c = std::ffi::CString::new(h.config.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let deadline = now_ms() + 3_000;
+    let ran = h.dir.join("ran");
+    let writer = std::thread::spawn({
+        let cfg = h.config.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(20_000));
+            // Release a reader, if any ever blocked.
+            // O_NONBLOCK: without a reader a plain open blocks forever.
+            let _ = std::os::unix::fs::OpenOptionsExt::custom_flags(
+                std::fs::OpenOptions::new().write(true),
+                libc::O_NONBLOCK,
+            )
+            .open(cfg);
+        }
+    });
+    let started = std::time::Instant::now();
+    let v = p.exec_by(&format!("touch {}", ran.display()), 20_000, deadline);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(18_000),
+        "dispatch waited on the config path: {v}"
+    );
+    drop(writer); // detached: it only releases a reader that never came
+    let late = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!late.contains("elsewhere"), "{late}");
+}
+
+#[test]
+fn eof_after_a_timeout_reply_still_kills_the_stalled_helper() {
+    let Some(h) = host("pb-eof-late") else { return };
+    let pids = h.dir.join("pids");
+    let shim = h.dir.join("ssh");
+    let text = std::fs::read_to_string(&shim).unwrap();
+    write_exec(
+        &shim,
+        text.replace(
+            "exec sh -c \"$last\"",
+            &format!("echo $$ >> {}; exec sleep 300", pids.display()),
+        ),
+    )
+    .unwrap();
+    let ps = h.dir.join("ps");
+    write_exec(&ps, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&ps, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut p = Plugin::start(&h);
+    // The timeout reply empties the call map; the helper may still live.
+    let v = p.exec("true", 4_000);
+    assert!(v["result"]["exitCode"].is_null(), "{v}");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(p.stdin.take());
+    p.child.wait().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let all = std::fs::read_to_string(&pids).unwrap();
+    assert!(!all.trim().is_empty(), "ssh never ran");
+    for pid in all.lines().map(|l| l.trim().parse::<i32>().unwrap()) {
+        // SAFETY: signal 0 only probes for existence.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            !alive,
+            "ssh {pid} outlived the plugin after a timeout reply"
+        );
+    }
 }
