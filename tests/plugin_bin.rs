@@ -253,7 +253,9 @@ fn nothing_starts_after_the_wire_deadline() {
     let t = std::time::Instant::now();
     let v = p.exec_by("exec sleep 30", 30_000, now_ms() + 700);
     assert!(v["result"]["exitCode"].is_null(), "{v}");
-    assert!(t.elapsed() < std::time::Duration::from_secs(8));
+    // Not the 30 s timeoutMs. Alone it is 2-4 s (700 ms plus the stop); in a
+    // loaded 12-test run (load 12) it went past 8 s, hence the headroom.
+    assert!(t.elapsed() < std::time::Duration::from_secs(20));
 }
 
 #[test]
