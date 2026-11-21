@@ -413,9 +413,25 @@ How results map:
 | `mule exec` | link result |
 | --- | --- |
 | 3 (no master) | hand-back: a `human` error carrying the `ssh -MNf` command. The script did not run |
-| any other code | the command's result with that code. A command's own 3 reads 8 (see [Telling a command's 3 from mule's 3](#telling-a-commands-3-from-mules-3)); 7 comes with `partial: true` |
+| any other code | the command's result with that code. A command's own 3 reads 8 (see [Telling a command's 3 from mule's 3](#telling-a-commands-3-from-mules-3)); a 7 mule reports as truncation comes with `partial: true`, a command's own 7 does not |
 | no answer by `timeoutMs` | `exitCode: null`; the `mule` child is sent SIGTERM, then SIGKILL after 3 s |
 
-`host check`'s reach phase runs `mule host info --json`: a master that is up is
-a passing `mule:master` step, one that is down is a `handback` step naming the
-command to run. The plugin never opens a master itself.
+`host check`'s reach phase runs `mule host info --json` (one locked session,
+no job): a master that is up is a passing `master` step, followed by a `tmux`
+step that passes only if `tmux -V` ran on the remote shell; a master that is
+down is a `handback` step naming the command to run. The plugin never opens a
+master itself.
+
+Limits and fences:
+
+- `partial: true` when mule cut the output (`max_log_bytes`, or a process still
+  holding stdout). The plugin learns this from a file mule writes
+  (`MULE_PARTIAL_FILE`), not from exit 7, which a command can also return. It
+  is also set when the plugin shortens a stream to keep the JSON reply under
+  mu's 1 MiB frame (measured after escaping: a NUL is six bytes).
+- A request whose `deadline` has passed is refused unstarted, and a live
+  deadline shortens `timeoutMs`.
+- The handshake `instance` is `mule-<hash>` over the `--config` file and every
+  host's target and socket, so a retargeted backend is refused by mu's fence.
+- `$/cancel` before dispatch means nothing runs; on stdin EOF the plugin stops
+  mule and the `ssh` it started, and kills what mule leaves behind.

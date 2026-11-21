@@ -357,9 +357,27 @@ fn collect(
         )?;
     }
     if truncated || live {
+        note_partial();
         return Ok(EXIT_TRUNCATED);
     }
     Ok(if strict { strict_code(code) } else { code })
+}
+
+/// Env var naming a file `exec` creates when its output is partial (truncated
+/// at `max_log_bytes`, or still held open). A caller that must tell that 7 from
+/// a command's own 7 cannot use the exit code or the stderr note: both are
+/// ambiguous, and the command's stderr is attacker-shaped. The file is the one
+/// signal only mule writes. Best effort; `create_new` so it never follows a
+/// symlink planted at the path.
+pub const PARTIAL_FILE_ENV: &str = "MULE_PARTIAL_FILE";
+
+fn note_partial() {
+    if let Some(path) = std::env::var_os(PARTIAL_FILE_ENV) {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
 }
 
 /// Block this thread until the signal thread ends the process.

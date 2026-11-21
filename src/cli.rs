@@ -39,6 +39,9 @@ struct HostInfoJson<'a> {
     arch: &'a str,
     cores: Option<u64>,
     ram_gb: Option<u64>,
+    /// Whether the remote shell can run `tmux`: null when the master is down
+    /// (nothing was asked).
+    tmux: Option<bool>,
     gpu: &'a str,
     socket: String,
     remedy: &'a str,
@@ -618,6 +621,7 @@ struct HostInfo<'a> {
     arch: String,
     cores: Option<u64>,
     ram_gb: Option<u64>,
+    tmux: Option<bool>,
     gpu: String,
     remedy: Option<String>,
 }
@@ -640,6 +644,7 @@ fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: b
                 arch: "unknown".into(),
                 cores: None,
                 ram_gb: None,
+                tmux: None,
                 gpu: "unknown".into(),
                 remedy: Some(crate::errors::master_command(host)),
             });
@@ -675,6 +680,7 @@ fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: b
                 arch: &row.arch,
                 cores: row.cores,
                 ram_gb: row.ram_gb,
+                tmux: row.tmux,
                 gpu: &row.gpu,
                 socket: row.host.socket.to_string_lossy().into_owned(),
                 remedy: row.remedy.as_deref().unwrap_or(""),
@@ -770,6 +776,7 @@ fn host_info_script() -> &'static str {
        case $bytes in *[!0-9]*|'') ram=unknown;; *) ram=$((bytes / 1073741824));; esac; \
      else ram=unknown; fi; \
      [ -n \"$ram\" ] || ram=unknown; \
+     if tmux -V >/dev/null 2>&1; then tmux=yes; else tmux=no; fi; \
      if command -v nvidia-smi >/dev/null 2>&1; then \
        gpu=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | \
              awk 'NR <= 2 { if (NR > 1) printf \"; \"; printf \"%s\", $0 }'); \
@@ -778,11 +785,11 @@ fn host_info_script() -> &'static str {
              awk -F: '/Chipset Model/{sub(/^[[:space:]]*/, \"\", $2); print $2; exit}'); \
      else gpu=none; fi; \
      [ -n \"$gpu\" ] || gpu=none; \
-     printf '%s\\t%s\\t%s\\t%s\\t%s\\n' \"$os\" \"$arch\" \"$cores\" \"$ram\" \"$gpu\""
+     printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$os\" \"$arch\" \"$cores\" \"$ram\" \"$tmux\" \"$gpu\""
 }
 
 fn parse_host_info<'a>(host: &'a Host, text: &str) -> HostInfo<'a> {
-    let mut fields = text.trim_end().splitn(5, '\t');
+    let mut fields = text.trim_end().splitn(6, '\t');
     let os = fields
         .next()
         .filter(|s| !s.is_empty())
@@ -795,6 +802,12 @@ fn parse_host_info<'a>(host: &'a Host, text: &str) -> HostInfo<'a> {
         .to_string();
     let cores = fields.next().and_then(|s| s.parse().ok());
     let ram_gb = fields.next().and_then(|s| s.parse().ok());
+    // Anything but a plain yes/no (an older reply) is "not asked", never "no".
+    let tmux = match fields.next() {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => None,
+    };
     let gpu = fields
         .next()
         .filter(|s| !s.is_empty())
@@ -807,6 +820,7 @@ fn parse_host_info<'a>(host: &'a Host, text: &str) -> HostInfo<'a> {
         arch,
         cores,
         ram_gb,
+        tmux,
         gpu,
         remedy: None,
     }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,21 +26,29 @@ use serde_json::{Value, json};
 
 /// sha256 of `schemas/plugin-protocol-v1.json` in mu: mu refuses any other.
 const SCHEMA: &str = "sha256:6ea6e13cabf6baebe44e961e21370a66ddf523082bfd73bcf169ec627fc71a25";
-/// Per stream. Lossy UTF-8 can triple a byte, and a protocol line is capped at
-/// 1 MiB with both streams in it: 2 x 128 KiB x 3 stays under.
+/// Per stream, read from the child. Not the reply bound: see `ENCODED_STREAM`.
 const MAX_OUTPUT: usize = 128 * 1024;
+/// Per stream, AFTER JSON escaping. mu rejects a protocol line over 1 MiB
+/// (1,048,576) and poisons the plugin for the invocation, so the bound is on
+/// the encoded reply: NUL is six bytes (`\u0000`), measured 1,572,953 for two
+/// 128 KiB NUL streams. 2 x 480,000 leaves 88 KiB for the envelope.
+const ENCODED_STREAM: usize = 480_000;
 /// How long a terminated `mule exec` gets to run its in-process `rm`. mu's own
 /// deadline is `timeoutMs` plus 5 s, so the reply must land inside that.
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 type Out = Arc<Mutex<std::io::Stdout>>;
 
+/// A call's cancel state. Registered by the reader BEFORE its worker starts,
+/// so a `$/cancel` right behind the request always finds it; `pid` is 0 until
+/// the child exists.
+#[derive(Default)]
 struct Live {
-    pid: i32,
-    cancelled: Arc<AtomicBool>,
+    pid: AtomicI32,
+    cancelled: AtomicBool,
 }
 
-type Calls = Arc<Mutex<HashMap<String, Live>>>;
+type Calls = Arc<Mutex<HashMap<String, Arc<Live>>>>;
 
 /// Everything one call needs; cloned into its thread.
 #[derive(Clone)]
@@ -121,63 +129,157 @@ struct Ran {
 }
 
 fn signal(pid: i32, sig: i32) {
-    // SAFETY: plain kill(2) on a child pid this process spawned and has not
-    // yet reaped (we are the one waiting on it).
+    // SAFETY: plain kill(2); a stale pid at worst fails with ESRCH.
     unsafe { libc::kill(pid, sig) };
 }
 
-/// Run `mule <args>` to completion, or to `timeout`, registering it under `key`
-/// so `$/cancel` and EOF can stop it.
-fn run_mule(ctx: &Ctx, key: &str, args: &[String], timeout: Duration) -> std::io::Result<Ran> {
+/// `ps` rows as (pid, ppid). `ps` rather than /proc: macOS has none.
+fn process_table() -> Vec<(i32, i32)> {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace().map(|n| n.parse::<i32>().ok());
+            Some((f.next()??, f.next()??))
+        })
+        .collect()
+}
+
+/// Every live descendant of `root`. mule's own signal handling only reaches
+/// what it knows; the `ssh` it is blocked in is a grandchild we must stop too,
+/// from here, because it is a helper of ours that nothing else will reap when
+/// mu dies and leaves us only an EOF.
+fn descendants(root: i32) -> Vec<i32> {
+    let table = process_table();
+    let mut found = vec![root];
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i];
+        found.extend(table.iter().filter(|r| r.1 == parent).map(|r| r.0));
+        i += 1;
+    }
+    found.remove(0);
+    found
+}
+
+fn orphaned(pid: i32) -> bool {
+    process_table().iter().any(|r| r.0 == pid && r.1 == 1)
+}
+
+static PARTIALS: AtomicU64 = AtomicU64::new(0);
+
+/// Run `mule <args>` to completion, to `timeout`, or to a cancel (`live`).
+/// Starts nothing if the cancel already arrived. `Ok(None)` is that case.
+fn run_mule(
+    ctx: &Ctx,
+    live: &Live,
+    args: &[String],
+    timeout: Duration,
+) -> std::io::Result<Option<Ran>> {
+    if live.cancelled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    // mule's own word that output was cut (exec.rs): the exit code 7 and the
+    // stderr note are ambiguous with the command's.
+    let partial_file = std::env::temp_dir().join(format!(
+        "mu-plugin-mule-{}-{}.partial",
+        std::process::id(),
+        PARTIALS.fetch_add(1, Ordering::SeqCst)
+    ));
     let mut child: Child = Command::new(&*ctx.mule[0])
         .args(&ctx.mule[1..])
         .args(args)
+        .env("MULE_PARTIAL_FILE", &partial_file)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let pid = child.id() as i32;
-    let cancelled = Arc::new(AtomicBool::new(false));
-    ctx.calls.lock().unwrap().insert(
-        key.to_string(),
-        Live {
-            pid,
-            cancelled: cancelled.clone(),
-        },
-    );
+    // Publish, then re-read the flag: a cancel that set it just before we
+    // published saw pid 0 and signalled nothing, so this check is its signal.
+    live.pid.store(pid, Ordering::SeqCst);
     let so = drain(child.stdout.take().unwrap());
     let se = drain(child.stderr.take().unwrap());
     let start = Instant::now();
     let mut stopping: Option<Instant> = None;
     let mut timed_out = false;
+    let mut tracked: Vec<i32> = Vec::new();
+    let mut last_scan = Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
         }
-        if cancelled.load(Ordering::SeqCst) && stopping.is_none() {
-            stopping = Some(Instant::now());
-        }
-        if stopping.is_none() && start.elapsed() >= timeout {
-            timed_out = true;
-            signal(pid, libc::SIGTERM);
-            stopping = Some(Instant::now());
-        }
-        if stopping.is_some_and(|t| t.elapsed() >= STOP_GRACE) {
-            signal(pid, libc::SIGKILL);
+        if stopping.is_none() {
+            let cancelled = live.cancelled.load(Ordering::SeqCst);
+            if cancelled || start.elapsed() >= timeout {
+                timed_out = !cancelled;
+                stopping = Some(Instant::now());
+                // TERM mule and the helper it is blocked in, as a group
+                // signal would; the replacement `rm` ssh it starts next is
+                // left alone so the stop can finish.
+                let kids = descendants(pid);
+                signal(pid, libc::SIGTERM);
+                for k in &kids {
+                    signal(*k, libc::SIGTERM);
+                }
+                tracked.extend(kids);
+            }
+        } else if let Some(t) = stopping {
+            if t.elapsed() >= STOP_GRACE {
+                signal(pid, libc::SIGKILL);
+                for k in descendants(pid) {
+                    signal(k, libc::SIGKILL);
+                }
+            } else if last_scan.elapsed() >= Duration::from_millis(100) {
+                last_scan = Instant::now();
+                tracked.extend(descendants(pid));
+            }
         }
         thread::sleep(Duration::from_millis(10));
     };
-    ctx.calls.lock().unwrap().remove(key);
+    // mule is gone; whatever it left behind is an orphan of ours.
+    for k in tracked {
+        if orphaned(k) {
+            signal(k, libc::SIGKILL);
+        }
+    }
     let (so, cut_o) = so.join().unwrap_or_default();
     let (se, cut_e) = se.join().unwrap_or_default();
-    Ok(Ran {
+    let upstream = partial_file.exists();
+    let _ = std::fs::remove_file(&partial_file);
+    Ok(Some(Ran {
         code: status.code().filter(|_| status.signal().is_none()),
         stdout: String::from_utf8_lossy(&so).into_owned(),
         stderr: String::from_utf8_lossy(&se).into_owned(),
-        partial: cut_o || cut_e,
+        partial: cut_o || cut_e || upstream,
         timed_out,
-        cancelled: cancelled.load(Ordering::SeqCst),
-    })
+        cancelled: live.cancelled.load(Ordering::SeqCst),
+    }))
+}
+
+/// Keep a prefix of `s` whose JSON encoding is at most `max` bytes (quotes
+/// excluded), cut on a char boundary. Returns whether anything was dropped.
+fn clip_encoded(s: String, max: usize) -> (String, bool) {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        let w = match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if used + w > max {
+            return (s[..i].to_string(), true);
+        }
+        used += w;
+    }
+    (s, false)
 }
 
 /// A `mule exec --strict-codes` result as a protocol answer: 3 is mule's
@@ -203,11 +305,13 @@ fn exec_answer(host: &str, r: Ran) -> Result<Value, (&'static str, String, Strin
             String::new(),
         ));
     }
+    let (stdout, cut_o) = clip_encoded(r.stdout, ENCODED_STREAM);
+    let (stderr, cut_e) = clip_encoded(stderr, ENCODED_STREAM);
     Ok(json!({
         "exitCode": if r.timed_out { None } else { code },
-        "stdout": r.stdout,
+        "stdout": stdout,
         "stderr": stderr,
-        "partial": r.partial,
+        "partial": r.partial || cut_o || cut_e,
     }))
 }
 
@@ -217,7 +321,34 @@ fn host_of(params: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn link_exec(ctx: &Ctx, id: &Value, params: &Value) {
+/// The time the wire deadline leaves (`deadline` is epoch ms; mu cancels past
+/// it). `None` field: unbounded. `Err` when it has already passed: nothing may
+/// start, a call delayed in delivery must not begin side effects after the
+/// caller gave up.
+fn remaining(params: &Value) -> Result<Option<Duration>, ()> {
+    let Some(deadline) = params["deadline"].as_u64() else {
+        return Ok(None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    match deadline.checked_sub(now) {
+        Some(ms) if ms > 0 => Ok(Some(Duration::from_millis(ms))),
+        _ => Err(()),
+    }
+}
+
+fn expired(out: &Out, id: &Value) {
+    fail(
+        out,
+        id,
+        "permanent",
+        "the call's deadline passed before it started; nothing ran",
+        None,
+    );
+}
+
+fn link_exec(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     let (Some(host), Some(script)) = (host_of(params), params["script"].as_str()) else {
         return fail(
             &ctx.out,
@@ -227,8 +358,14 @@ fn link_exec(ctx: &Ctx, id: &Value, params: &Value) {
             None,
         );
     };
+    let Ok(left) = remaining(params) else {
+        return expired(&ctx.out, id);
+    };
     let cwd = params["cwd"].as_str().unwrap_or(".");
-    let timeout = Duration::from_millis(params["timeoutMs"].as_u64().unwrap_or(20_000));
+    let mut timeout = Duration::from_millis(params["timeoutMs"].as_u64().unwrap_or(20_000));
+    if let Some(left) = left {
+        timeout = timeout.min(left);
+    }
     let args: Vec<String> = [
         "exec",
         "--host",
@@ -242,7 +379,7 @@ fn link_exec(ctx: &Ctx, id: &Value, params: &Value) {
     ]
     .map(String::from)
     .into();
-    match run_mule(ctx, &id.to_string(), &args, timeout) {
+    match run_mule(ctx, live, &args, timeout) {
         Err(e) => fail(
             &ctx.out,
             id,
@@ -250,8 +387,9 @@ fn link_exec(ctx: &Ctx, id: &Value, params: &Value) {
             &format!("cannot run mule: {e}"),
             None,
         ),
-        Ok(r) if r.cancelled => {} // mu ignores any answer now
-        Ok(r) => match exec_answer(&host, r) {
+        Ok(None) => {}                   // cancelled before dispatch: nothing ran
+        Ok(Some(r)) if r.cancelled => {} // mu ignores any answer now
+        Ok(Some(r)) => match exec_answer(&host, r) {
             Ok(v) => reply(&ctx.out, id, v),
             Err((kind, msg, remedy)) => fail(
                 &ctx.out,
@@ -266,7 +404,7 @@ fn link_exec(ctx: &Ctx, id: &Value, params: &Value) {
 
 /// `host info --json` exits 0 with `master: false` when the master is down:
 /// that is a hand-back step, not a failure of the probe.
-fn check_steps(ctx: &Ctx, id: &Value, params: &Value) {
+fn check_steps(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     let Some(host) = host_of(params) else {
         return fail(
             &ctx.out,
@@ -279,29 +417,51 @@ fn check_steps(ctx: &Ctx, id: &Value, params: &Value) {
     if params["phase"] != "reach" {
         return reply(&ctx.out, id, json!([]));
     }
+    let Ok(left) = remaining(params) else {
+        return expired(&ctx.out, id);
+    };
+    let budget = left.map_or(Duration::from_secs(8), |l| l.min(Duration::from_secs(8)));
     let args = ["host", "info", "--host", &host, "--json"].map(String::from);
     let t0 = Instant::now();
-    let step = match run_mule(ctx, &id.to_string(), &args, Duration::from_secs(8)) {
-        Err(e) => json!({"step": "master", "ok": false, "detail": format!("cannot run mule: {e}")}),
-        Ok(r) if r.cancelled => return,
-        Ok(r) if r.code != Some(0) => {
-            json!({"step": "master", "ok": false, "detail": first_line(&r.stderr)})
+    let steps = match run_mule(ctx, live, &args, budget) {
+        Err(e) => {
+            vec![json!({"step": "master", "ok": false, "detail": format!("cannot run mule: {e}")})]
         }
-        Ok(r) => {
+        Ok(None) => return,
+        Ok(Some(r)) if r.cancelled => return,
+        Ok(Some(r)) if r.code != Some(0) => {
+            vec![json!({"step": "master", "ok": false, "detail": first_line(&r.stderr)})]
+        }
+        Ok(Some(r)) => {
             let v: Value = serde_json::from_str(&r.stdout).unwrap_or(Value::Null);
             let row = &v["items"][0];
             match row["master"].as_bool() {
-                Some(true) => json!({"step": "master", "ok": true,
-                    "detail": format!("mule {host}: master up, {} ms", t0.elapsed().as_millis())}),
-                Some(false) => json!({"step": "handback", "ok": false,
+                Some(true) => {
+                    let mut steps = vec![json!({"step": "master", "ok": true,
+                        "detail": format!("mule {host}: master up, {} ms", t0.elapsed().as_millis())})];
+                    // The probe is one locked session and dispatches no job:
+                    // it ran `tmux -V` on the remote. A host that cannot run
+                    // tmux fails every job-backed probe after this one.
+                    match row["tmux"].as_bool() {
+                        Some(true) => steps.push(
+                            json!({"step": "tmux", "ok": true, "detail": "tmux runs on the remote"}),
+                        ),
+                        Some(false) => steps.push(json!({"step": "tmux", "ok": false,
+                            "detail": format!("tmux is not runnable on {host}'s remote shell (not on its non-login PATH); mule jobs need it")})),
+                        None => steps.push(json!({"step": "tmux", "ok": false,
+                            "detail": "mule host info did not report tmux"})),
+                    }
+                    steps
+                }
+                Some(false) => vec![json!({"step": "handback", "ok": false,
                     "detail": row["remedy"].as_str().filter(|r| !r.is_empty())
-                        .unwrap_or("open mule's ssh control master")}),
-                None => json!({"step": "master", "ok": false,
-                    "detail": "mule host info gave no master field"}),
+                        .unwrap_or("open mule's ssh control master")})],
+                None => vec![json!({"step": "master", "ok": false,
+                    "detail": "mule host info gave no master field"})],
             }
         }
     };
-    reply(&ctx.out, id, json!([step]));
+    reply(&ctx.out, id, Value::Array(steps));
 }
 
 fn initialize(ctx: &Ctx, id: &Value, params: &Value) {
@@ -316,14 +476,59 @@ fn initialize(ctx: &Ctx, id: &Value, params: &Value) {
             None,
         );
     }
-    reply(&ctx.out, id, handshake());
+    reply(&ctx.out, id, handshake(&instance(&ctx.mule)));
 }
 
-fn handshake() -> Value {
+/// FNV-1a: stable across Rust versions, unlike `DefaultHasher`, and the
+/// instance must compare equal across plugin restarts.
+fn fnv(parts: &[&[u8]]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for p in parts {
+        for b in p.iter().chain(&[0u8]) {
+            h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+/// The backend's identity, opaque: a hash over what decides where a job goes
+/// -- the `--config` file's bytes (or its absence), and every host's name,
+/// target and master socket as `mule host list --json` resolves them (that
+/// verb is lock-exempt and never opens a session). Retarget a host and the
+/// instance changes, so mu's recovery and collect fence refuses the old
+/// jobs; a hash discloses no path or secret.
+fn instance(mule: &[String]) -> String {
+    let config = mule
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| mule.get(i + 1))
+        .map(|p| std::fs::read(p).unwrap_or_else(|e| format!("unreadable:{}", e.kind()).into()))
+        .unwrap_or_default();
+    let hosts = Command::new(&mule[0])
+        .args(&mule[1..])
+        .args(["host", "list", "--json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .map(|v| {
+            v["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|h| format!("{}\t{}\t{}\n", h["name"], h["target"], h["socket"]))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    format!("mule-{:016x}", fnv(&[&config, hosts.as_bytes()]))
+}
+
+fn handshake(instance: &str) -> Value {
     json!({
         "protocol": 1,
         "plugin": {"name": "mule", "version": env!("CARGO_PKG_VERSION")},
-        "instance": "mule",
+        "instance": instance,
         "schema": SCHEMA,
         "seams": {"link": {
             "fetch": false,
@@ -343,22 +548,27 @@ fn on_message(ctx: &Ctx, msg: Value) {
     match msg["method"].as_str().unwrap_or("") {
         "initialize" => initialize(ctx, &id, &params),
         "$/cancel" => {
-            let key = params["id"].to_string();
-            if let Some(live) = ctx.calls.lock().unwrap().get(&key) {
+            // Only flags: the call's own worker stops its tree (run_mule).
+            if let Some(live) = ctx.calls.lock().unwrap().get(&params["id"].to_string()) {
                 live.cancelled.store(true, Ordering::SeqCst);
-                signal(live.pid, libc::SIGTERM);
             }
         }
         "shutdown" => reply(&ctx.out, &id, Value::Null),
         m @ ("link.exec" | "link.checkSteps") => {
             let ctx = ctx.clone();
             let m = m.to_string();
+            // Registered here, on the reader, before the worker exists: a
+            // `$/cancel` on the next line must find it.
+            let key = id.to_string();
+            let live = Arc::new(Live::default());
+            ctx.calls.lock().unwrap().insert(key.clone(), live.clone());
             thread::spawn(move || {
                 if m == "link.exec" {
-                    link_exec(&ctx, &id, &params)
+                    link_exec(&ctx, &live, &id, &params)
                 } else {
-                    check_steps(&ctx, &id, &params)
+                    check_steps(&ctx, &live, &id, &params)
                 }
+                ctx.calls.lock().unwrap().remove(&key);
             });
         }
         m => fail(
@@ -399,18 +609,25 @@ fn main() {
             Err(e) => eprintln!("mu-plugin-mule: bad message: {e}"),
         }
     }
-    // stdin EOF: mu is done or dead. Stop what runs: TERM lets `exec
-    // --no-detach` run its rm, KILL after the grace, then leave.
+    // stdin EOF: mu is done or dead. Flag every call cancelled: each worker
+    // TERMs its mule tree, KILLs after the grace and reaps what mule left
+    // behind (run_mule). Then wait for them, and KILL any tree still up.
     for live in ctx.calls.lock().unwrap().values() {
-        signal(live.pid, libc::SIGTERM);
+        live.cancelled.store(true, Ordering::SeqCst);
     }
     let t = Instant::now();
-    while !ctx.calls.lock().unwrap().is_empty() && t.elapsed() < STOP_GRACE + Duration::from_secs(1)
+    while !ctx.calls.lock().unwrap().is_empty() && t.elapsed() < STOP_GRACE + Duration::from_secs(2)
     {
         thread::sleep(Duration::from_millis(20));
     }
     for live in ctx.calls.lock().unwrap().values() {
-        signal(live.pid, libc::SIGKILL);
+        let pid = live.pid.load(Ordering::SeqCst);
+        if pid > 0 {
+            for k in descendants(pid) {
+                signal(k, libc::SIGKILL);
+            }
+            signal(pid, libc::SIGKILL);
+        }
     }
 }
 
@@ -461,7 +678,7 @@ mod tests {
 
     #[test]
     fn the_handshake_declares_the_link_only() {
-        let h = handshake();
+        let h = handshake("mule-x");
         assert_eq!(h["seams"].as_object().unwrap().len(), 1);
         assert_eq!(h["seams"]["link"]["fetch"], false);
         assert_eq!(h["seams"]["link"]["slots"], "self");
