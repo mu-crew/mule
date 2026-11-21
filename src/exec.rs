@@ -335,6 +335,11 @@ fn collect(
     }
     err.write_all(&bytes[log_len..log_len + err_len])?;
     if output.code == REMOVAL_FAILED {
+        // Cleanup failing says nothing about whether the bytes were clipped:
+        // the caller reads the flag, not the (error) exit code.
+        if truncated || live {
+            note_partial();
+        }
         bail!(
             "could not remove job {id} on {}: {}",
             host.name,
