@@ -383,3 +383,39 @@ unchanged, so a command that itself exits 8 also reads 8: 8 is ambiguous. The
 stderr note is diagnostic only, is not proof of the original status, and may
 not be the first line (`run --wait` can print dispatch notices before it). Rely
 only on '3 = handback'.
+
+## As a mu plugin: `mu-plugin-mule`
+
+`mu-plugin-mule` is a second binary in this package. It serves
+[mu](https://github.com/mu-crew/mu)'s plugin protocol (v1) over stdio, so a mu
+host can use mule as its link instead of `--shell`/`--exec` templates. It looks
+for `mule` beside itself, then on `PATH`.
+
+```sh
+mu plugin add mule -- /abs/path/to/mu-plugin-mule [--config PATH]
+mu host add box --plugin mule --fetch '<your fetch command>'
+mu host check box
+```
+
+The mu host's name is the mule host's name. `--config` is passed to every
+`mule` call. mu needs the file to be named `mu-plugin-mule`, owned by you and
+writable by nobody else.
+
+What it declares: the **link** seam only, with `exec` served by
+`mule exec --no-detach --strict-codes`. `fetch` is false (mule has no fetch, so
+the host keeps its own `--fetch` template), `slots` is `self` (mule's ticket
+lock arbitrates; mu holds no channel), `quiescence` is `provable`, and
+`remoteOnTimeout` is `unknown` (the stop `exec` runs on a cancel can outlast
+mu's grace).
+
+How results map:
+
+| `mule exec` | link result |
+| --- | --- |
+| 3 (no master) | hand-back: a `human` error carrying the `ssh -MNf` command. The script did not run |
+| any other code | the command's result with that code. A command's own 3 reads 8 (see [Telling a command's 3 from mule's 3](#telling-a-commands-3-from-mules-3)); 7 comes with `partial: true` |
+| no answer by `timeoutMs` | `exitCode: null`; the `mule` child is sent SIGTERM, then SIGKILL after 3 s |
+
+`host check`'s reach phase runs `mule host info --json`: a master that is up is
+a passing `mule:master` step, one that is down is a `handback` step naming the
+command to run. The plugin never opens a master itself.

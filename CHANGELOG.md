@@ -4,6 +4,9 @@
 
 ### Added
 
+- `mu-plugin-mule`: a second binary serving mu's plugin protocol (v1) for the
+  link seam: `exec` via `mule exec --no-detach --strict-codes`, `slots: self`,
+  provable quiescence, no fetch. Strict 3 is a hand-back; see docs/usage.md.
 - `--strict-codes` on `exec`, `wait` and `run --wait`: a command's own exit 3 is
   reported as 8 (new, documented), so a caller can treat 3 as mule's handback
   (no master) without misreading a command. 8 may also be the command's own 8;

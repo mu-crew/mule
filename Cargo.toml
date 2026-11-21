@@ -34,6 +34,12 @@ path = "src/lib.rs"
 name = "mule"
 path = "src/main.rs"
 
+# `mu plugin add mule -- <path>/mu-plugin-mule`: mu requires the executable's
+# basename to be `mu-plugin-<name>`, so the plugin is its own target.
+[[bin]]
+name = "mu-plugin-mule"
+path = "src/bin/mu-plugin-mule.rs"
+
 [dependencies]
 # CLI parsing
 clap = { version = "4", features = ["derive"] }
