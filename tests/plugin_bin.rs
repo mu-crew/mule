@@ -369,3 +369,59 @@ fn the_instance_names_the_backend_not_the_plugin() {
     .unwrap();
     assert_ne!(a, hello(&h), "a retargeted host kept its instance");
 }
+
+#[test]
+fn wedged_peers_do_not_delay_the_handshake() {
+    let Some(h) = host("pb-wedged") else { return };
+    // Six more configured hosts, and an ssh that never answers a `-O check`.
+    let mut config = std::fs::read_to_string(&h.config).unwrap();
+    for i in 0..6 {
+        config.push_str(&format!(
+            "[hosts.peer{i}]\ntarget = \"peer{i}\"\nsocket = \"{}\"\n",
+            h.dir.join(format!("peer{i}.sock")).display()
+        ));
+    }
+    std::fs::write(&h.config, config).unwrap();
+    std::fs::write(h.dir.join("ssh"), "#!/bin/sh\nexec sleep 300\n").unwrap();
+    let mut p = Plugin::start(&h);
+    let t = std::time::Instant::now();
+    let v = p.call(
+        "initialize",
+        json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
+    );
+    assert!(v["result"]["instance"].is_string(), "{v}");
+    // mu caps the initialize read at 10 s; before, six wedged peers took 15 s.
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "initialize took {:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn a_live_session_refuses_once_its_config_drifts() {
+    let Some(h) = host("pb-drift") else { return };
+    let mut p = Plugin::start(&h);
+    let v = p.call(
+        "initialize",
+        json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
+    );
+    assert!(v["result"]["instance"].is_string());
+    assert_eq!(
+        p.exec("printf before", 20_000)["result"]["stdout"],
+        "before"
+    );
+
+    let config = std::fs::read_to_string(&h.config).unwrap();
+    std::fs::write(
+        &h.config,
+        config.replace("target = \"shim\"", "target = \"elsewhere\""),
+    )
+    .unwrap();
+    let ran = h.dir.join("ran");
+    let v = p.exec(&format!("touch {}", ran.display()), 20_000);
+    assert_eq!(v["error"]["data"]["kind"], "permanent", "{v}");
+    assert!(!ran.exists(), "a drifted session dispatched");
+    let v = reach(&mut p);
+    assert!(v["error"].is_object(), "checkSteps ran on drift: {v}");
+}

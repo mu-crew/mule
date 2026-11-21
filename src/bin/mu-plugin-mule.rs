@@ -56,6 +56,8 @@ struct Ctx {
     out: Out,
     calls: Calls,
     mule: Arc<Vec<String>>,
+    /// The instance the handshake advertised; `None` before it.
+    negotiated: Arc<Mutex<Option<String>>>,
 }
 
 fn send(out: &Out, msg: &Value) {
@@ -361,6 +363,9 @@ fn link_exec(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     let Ok(left) = remaining(params) else {
         return expired(&ctx.out, id);
     };
+    if drifted(ctx) {
+        return refuse_drift(&ctx.out, id);
+    }
     let cwd = params["cwd"].as_str().unwrap_or(".");
     let mut timeout = Duration::from_millis(params["timeoutMs"].as_u64().unwrap_or(20_000));
     if let Some(left) = left {
@@ -420,6 +425,9 @@ fn check_steps(ctx: &Ctx, live: &Live, id: &Value, params: &Value) {
     let Ok(left) = remaining(params) else {
         return expired(&ctx.out, id);
     };
+    if drifted(ctx) {
+        return refuse_drift(&ctx.out, id);
+    }
     let budget = left.map_or(Duration::from_secs(8), |l| l.min(Duration::from_secs(8)));
     let args = ["host", "info", "--host", &host, "--json"].map(String::from);
     let t0 = Instant::now();
@@ -476,7 +484,9 @@ fn initialize(ctx: &Ctx, id: &Value, params: &Value) {
             None,
         );
     }
-    reply(&ctx.out, id, handshake(&instance(&ctx.mule)));
+    let inst = instance(&ctx.mule);
+    *ctx.negotiated.lock().unwrap() = Some(inst.clone());
+    reply(&ctx.out, id, handshake(&inst));
 }
 
 /// FNV-1a: stable across Rust versions, unlike `DefaultHasher`, and the
@@ -492,36 +502,54 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 }
 
 /// The backend's identity, opaque: a hash over what decides where a job goes
-/// -- the `--config` file's bytes (or its absence), and every host's name,
-/// target and master socket as `mule host list --json` resolves them (that
-/// verb is lock-exempt and never opens a session). Retarget a host and the
-/// instance changes, so mu's recovery and collect fence refuses the old
-/// jobs; a hash discloses no path or secret.
+/// -- the config file's bytes (or why it is unreadable) and every host's name,
+/// target and master socket as mule resolves them (`~` expanded). Computed
+/// in-process from the file: a `mule host list` child probes every master in
+/// series (2 s each, measured 15.3 s with six wedged peers, past mu's 10 s
+/// initialize cap), and the identity needs no master state. Retarget a host
+/// and the instance changes, so mu's recovery and collect fence refuses the
+/// old jobs; a hash discloses no path or secret.
 fn instance(mule: &[String]) -> String {
-    let config = mule
+    let path = mule
         .iter()
         .position(|a| a == "--config")
         .and_then(|i| mule.get(i + 1))
-        .map(|p| std::fs::read(p).unwrap_or_else(|e| format!("unreadable:{}", e.kind()).into()))
-        .unwrap_or_default();
-    let hosts = Command::new(&mule[0])
-        .args(&mule[1..])
-        .args(["host", "list", "--json"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
-        .map(|v| {
-            v["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|h| format!("{}\t{}\t{}\n", h["name"], h["target"], h["socket"]))
+        .map(std::path::PathBuf::from)
+        .or_else(|| mule::config::default_path().ok());
+    let bytes = path.map_or_else(Vec::new, |p| {
+        std::fs::read(&p).unwrap_or_else(|e| format!("unreadable:{}", e.kind()).into())
+    });
+    let hosts = mule::config::Config::parse(&String::from_utf8_lossy(&bytes))
+        .map(|c| {
+            c.hosts()
+                .iter()
+                .map(|h| format!("{}\t{}\t{}\n", h.name, h.target, h.socket.display()))
                 .collect::<String>()
         })
         .unwrap_or_default();
-    format!("mule-{:016x}", fnv(&[&config, hosts.as_bytes()]))
+    format!("mule-{:016x}", fnv(&[&bytes, hosts.as_bytes()]))
+}
+
+/// A live link is bound to the instance it advertised: if the config changed
+/// under an open session, refuse before any dispatch rather than run a later
+/// step on a different backend than the one mu's identity check passed.
+fn drifted(ctx: &Ctx) -> bool {
+    ctx.negotiated
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|n| *n != instance(&ctx.mule))
+}
+
+fn refuse_drift(out: &Out, id: &Value) {
+    fail(
+        out,
+        id,
+        "permanent",
+        "mule's configuration changed since this session's handshake; nothing ran. \
+         Reopen the link to adopt the new backend",
+        None,
+    );
 }
 
 fn handshake(instance: &str) -> Value {
@@ -598,6 +626,7 @@ fn main() {
         out: Arc::new(Mutex::new(std::io::stdout())),
         calls: Arc::default(),
         mule: Arc::new(mule),
+        negotiated: Arc::default(),
     };
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
