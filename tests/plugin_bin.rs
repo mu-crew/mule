@@ -5,6 +5,7 @@
 mod common;
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use common::local::{ShimHost, tmux_available};
@@ -28,6 +29,8 @@ impl Plugin {
             .env("XDG_STATE_HOME", &h.state)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            // Its own group, as mu runs a plugin: mu kills that group.
+            .process_group(0)
             .spawn()
             .unwrap();
         Self {
@@ -305,6 +308,11 @@ fn eof_kills_the_local_ssh_a_stalled_call_holds() {
         ),
     )
     .unwrap();
+    // And `ps` is useless (absent, or failing): shutdown must not depend on
+    // discovering the tree. A stalled helper has to die regardless.
+    let ps = h.dir.join("ps");
+    std::fs::write(&ps, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&ps, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let mut p = Plugin::start(&h);
     p.send(
         1,

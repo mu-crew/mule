@@ -612,14 +612,36 @@ fn main() {
     // stdin EOF: mu is done or dead. Flag every call cancelled: each worker
     // TERMs its mule tree, KILLs after the grace and reaps what mule left
     // behind (run_mule). Then wait for them, and KILL any tree still up.
-    for live in ctx.calls.lock().unwrap().values() {
-        live.cancelled.store(true, Ordering::SeqCst);
-    }
+    let in_flight = {
+        let calls = ctx.calls.lock().unwrap();
+        for live in calls.values() {
+            live.cancelled.store(true, Ordering::SeqCst);
+        }
+        !calls.is_empty()
+    };
     let t = Instant::now();
     while !ctx.calls.lock().unwrap().is_empty() && t.elapsed() < STOP_GRACE + Duration::from_secs(2)
     {
         thread::sleep(Duration::from_millis(20));
     }
+    if !in_flight {
+        return; // every mule was waited for; nothing of ours can be left
+    }
+    // Hard bound, independent of `ps`: a call was in flight, so a helper may
+    // have outlived its mule (reparented, so no tree walk finds it -- and a
+    // failing `ps` finds nothing at all). Everything we spawned shares our
+    // process group, never detached, so when we lead it (mu starts a plugin
+    // as its own group leader) one SIGKILL to the group takes every one,
+    // ourselves last. Measured: with `ps` failing, the stalled ssh survived
+    // the plugin 3 of 3 runs before this.
+    // SAFETY: plain getpgrp/getpid/kill; no memory is touched.
+    unsafe {
+        if libc::getpgrp() == libc::getpid() {
+            libc::kill(-libc::getpid(), libc::SIGKILL);
+        }
+    }
+    // Not a leader (a harness that shares its group with us): the best left is
+    // the tree walk, which only works when `ps` does.
     for live in ctx.calls.lock().unwrap().values() {
         let pid = live.pid.load(Ordering::SeqCst);
         if pid > 0 {
