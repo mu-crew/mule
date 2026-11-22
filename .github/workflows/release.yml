@@ -36,12 +36,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Add Rust target
         run: rustup target add "${{ matrix.target }}"
-      - name: Build binary
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Build binaries and reject embedded home or build paths
+        run: python3 scripts/build-release.py "${{ matrix.target }}"
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.package }}
-          path: target/${{ matrix.target }}/release/mule
+          if-no-files-found: error
+          path: |
+            target/${{ matrix.target }}/release/mule
+            target/${{ matrix.target }}/release/mu-plugin-mule
 
   publish:
     needs: build
@@ -65,8 +68,7 @@ jobs:
         run: |
           for package in mule-linux-x64 mule-linux-arm64 mule-darwin-arm64; do
             mkdir -p "npm/$package/bin"
-            cp "artifacts/$package/mule" "npm/$package/bin/mule"
-            chmod +x "npm/$package/bin/mule"
+            install -m 0755 "artifacts/$package/mule" "artifacts/$package/mu-plugin-mule" "npm/$package/bin/"
           done
       # Trusted publishing (OIDC) needs npm 11.5.1+; older npm fails with a
       # misleading 404.
@@ -93,8 +95,8 @@ jobs:
           mkdir dist
           for pair in x86_64-unknown-linux-musl:mule-linux-x64 aarch64-unknown-linux-musl:mule-linux-arm64 aarch64-apple-darwin:mule-darwin-arm64; do
             target="${pair%%:*}" package="${pair#*:}"
-            chmod +x "artifacts/$package/mule"
-            tar -C "artifacts/$package" -czf "dist/mule-$version-$target.tar.gz" mule
+            chmod +x "artifacts/$package/mule" "artifacts/$package/mu-plugin-mule"
+            tar -C "artifacts/$package" -czf "dist/mule-$version-$target.tar.gz" mule mu-plugin-mule
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" --title "mule $version" --notes-file notes.md --verify-tag dist/*

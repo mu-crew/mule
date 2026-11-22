@@ -23,6 +23,23 @@ The workflow checks that the tag, Cargo version and all npm package versions
 agree, publishes the three platform packages, then `@mu-crew/mule`, then
 `mule-cli`.
 
+## Local release builds
+
+Use the same build and path check as CI, from the repo root:
+
+```sh
+# Substitute the matching musl target on Linux; see release.yml.
+python3 scripts/build-release.py aarch64-apple-darwin
+install -d npm/mule-darwin-arm64/bin
+install -m 0755 target/aarch64-apple-darwin/release/mule \
+  target/aarch64-apple-darwin/release/mu-plugin-mule npm/mule-darwin-arm64/bin/
+npm pack ./npm/mule-darwin-arm64 ./npm/mule
+```
+
+The build remaps the home, Cargo home, and worktree prefixes and checks both
+binaries before they can be packaged. The root npm package launches the native
+`mule`, which finds `mu-plugin-mule` beside itself; keep the pair together.
+
 ## Trust setup
 
 Each package trusts owner `mu-crew`, repository `mule`, workflow `release.yml`:
@@ -39,4 +56,5 @@ add the trusted publisher, and let CI publish from then on.
 The workflow also creates the GitHub release for the tag, with the matching
 CHANGELOG section as its notes. It fails if that section is missing, so add
 the CHANGELOG entry before tagging. The release carries a `mule-<version>-<target>.tar.gz`
-per platform (Linux x64/arm64 musl, macOS arm64) and a `SHA256SUMS`.
+per platform (Linux x64/arm64 musl, macOS arm64), each containing both
+executables, and a `SHA256SUMS` covering those archives.

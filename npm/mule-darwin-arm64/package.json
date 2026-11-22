@@ -14,6 +14,7 @@
     "arm64"
   ],
   "files": [
-    "bin/mule"
+    "bin/mule",
+    "bin/mu-plugin-mule"
   ]
 }

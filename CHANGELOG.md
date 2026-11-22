@@ -24,6 +24,9 @@
 
 ### Fixed
 
+- npm platform packages and GitHub release archives bundle `mu-plugin-mule`
+  beside `mule` so `mule init` can register it. Release builds remap local
+  paths and check both binaries for embedded home or build paths.
 - `exec` rejects a remote script over 112 KiB before opening an SSH session,
   with a size diagnostic instead of a broken pipe. If a bounded result is
   truncated and cleanup also fails, it is still reported as partial.
