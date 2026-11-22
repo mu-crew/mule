@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,8 +56,8 @@ type Calls = Arc<Mutex<HashMap<String, Arc<Live>>>>;
 struct Ctx {
     out: Out,
     calls: Calls,
-    /// `[mule, --quiet]`: the config is never here, only in the snapshot.
-    mule: Arc<Vec<String>>,
+    /// The companion binary takes precedence over PATH.
+    mule: Option<PathBuf>,
     /// The `--config PATH` this plugin was started with, read once, at the
     /// handshake.
     config_path: Option<std::path::PathBuf>,
@@ -103,14 +104,12 @@ fn fail(out: &Out, id: &Value, kind: &str, message: &str, remedy: Option<&str>) 
     );
 }
 
-/// The `mule` to run: the one beside this binary (a `cargo install` or a build
-/// puts both in one directory), else the first on PATH.
-fn mule_bin() -> std::path::PathBuf {
+/// A `cargo install` or a build puts both binaries in one directory.
+fn bundled_mule() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("mule")))
         .filter(|p| p.is_file())
-        .unwrap_or_else(|| "mule".into())
 }
 
 fn first_line(s: &str) -> String {
@@ -159,12 +158,12 @@ fn signal(pid: i32, sig: i32) {
 
 /// `ps` rows as (pid, ppid). `ps` rather than /proc: macOS has none.
 fn process_table() -> Vec<(i32, i32)> {
-    let Ok(out) = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+    let Ok(out) = mule::helper::PS.command().and_then(|mut cmd| {
+        cmd.args(["-A", "-o", "pid=,ppid="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    }) else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -234,14 +233,18 @@ fn run_mule(
         std::process::id(),
         PARTIALS.fetch_add(1, Ordering::SeqCst)
     ));
+    let mule = ctx
+        .mule
+        .as_deref()
+        .map_or_else(|| mule::helper::MULE.path(), Ok);
     match remaining_at(deadline, now_ms()) {
         Err(()) => return Ok(Run::Expired),
         Ok(Some(left)) => timeout = timeout.min(left),
         Ok(None) => {}
     }
     ctx.spawned.store(true, Ordering::SeqCst);
-    let mut child: Child = Command::new(&*ctx.mule[0])
-        .args(&ctx.mule[1..])
+    let mut child: Child = Command::new(mule?)
+        .arg("--quiet")
         .arg("--config")
         .arg(config)
         .args(args)
@@ -706,8 +709,8 @@ fn on_message(ctx: &Ctx, msg: Value) {
 }
 
 fn main() {
+    mule::helper::snapshot_path();
     // `--config PATH` is the only option; it is read once, at the handshake.
-    let mule = vec![mule_bin().to_string_lossy().into_owned(), "--quiet".into()];
     let mut config_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -722,7 +725,7 @@ fn main() {
     let ctx = Ctx {
         out: Arc::new(Mutex::new(std::io::stdout())),
         calls: Arc::default(),
-        mule: Arc::new(mule),
+        mule: bundled_mule(),
         config_path,
         snap: Arc::default(),
         spawned: Arc::default(),
@@ -842,7 +845,7 @@ mod tests {
         let ctx = Ctx {
             out: Arc::new(Mutex::new(std::io::stdout())),
             calls: Arc::default(),
-            mule: Arc::new(vec![bin.to_string_lossy().into_owned()]),
+            mule: Some(bin),
             config_path: None,
             snap: Arc::default(),
             spawned: Arc::default(),

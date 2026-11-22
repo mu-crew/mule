@@ -16,7 +16,7 @@
 //! `unknown`, with `mule rm <id>` as the human path. This is mu's
 //! creator-gone gate (mu plugins spec, D4) applied to mule's own claim.
 
-use std::process::Command;
+use crate::helper::PS;
 
 /// One claimer, as recorded in a claim's `claim` file: one line,
 /// `pid=<pid> host=<host> start=<start>`, start last because it has spaces.
@@ -96,7 +96,9 @@ pub fn local_host() -> Option<String> {
 /// for an abandoned one (review of P7a, round 4: `Tue Nov 10 00:26:13 2026`
 /// under UTC is `Mon Nov  9 19:26:13 2026` in New York).
 pub fn start_time(pid: u32) -> Option<String> {
-    let out = Command::new("ps")
+    let out = PS
+        .command()
+        .ok()?
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .env("LC_ALL", "C")
         .env("TZ", "UTC")

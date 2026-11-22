@@ -144,7 +144,7 @@ impl Sshd {
             .arg("-E")
             .arg(dir.join("sshd.log")));
 
-        // An `ssh` shim on PATH, so mule's own `Command::new("ssh")` reaches
+        // An `ssh` shim on PATH, so mule's local `ssh` lookup reaches
         // this daemon with the right key and port. mule must not learn about
         // test ports.
         let shim = dir.join("ssh");

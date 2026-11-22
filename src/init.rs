@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -41,8 +41,8 @@ pub(crate) fn run(config_path: Option<&Path>, quiet: bool) -> Result<i32> {
         )?;
     }
 
-    let mu = find_mu();
-    if let Some(mu) = &mu {
+    let mu = crate::helper::mu_on_path();
+    if let Some(mu) = mu {
         if let Err(e) = register(mu, explicit) {
             let _ = writeln!(io::stderr(), "mule: {e:#}");
             return Ok(EXIT_REGISTRATION);
@@ -65,13 +65,6 @@ pub(crate) fn run(config_path: Option<&Path>, quiet: bool) -> Result<i32> {
         let _ = writeln!(io::stderr(), "next: {hint}");
     }
     Ok(0)
-}
-
-fn find_mu() -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|dir| dir.join("mu"))
-        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0))
-        .and_then(|p| std::path::absolute(p).ok())
 }
 
 #[derive(Deserialize)]

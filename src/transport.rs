@@ -289,7 +289,10 @@ pub fn run_args(host: &Host, script: &str) -> Vec<String> {
 }
 
 fn ssh_agent_state() -> crate::errors::AgentState {
-    match Command::new("ssh-add").arg("-l").output() {
+    match crate::helper::SSH_ADD
+        .command()
+        .and_then(|mut cmd| cmd.arg("-l").output())
+    {
         Ok(output) if output.status.success() => crate::errors::AgentState::Keys,
         Ok(output) if output.status.code() == Some(1) => crate::errors::AgentState::NoKeys,
         Ok(output) if output.status.code() == Some(2) => crate::errors::AgentState::Unreachable,
@@ -307,7 +310,9 @@ impl Transport for Ssh {
         // remote script's stderr: only they may drive a retry. See
         // `errors::classify_attempt` for the spoof that made this necessary.
         let log = SshLog::create()?;
-        let mut cmd = Command::new("ssh");
+        let mut cmd = crate::helper::SSH
+            .command()
+            .with_context(|| format!("spawning ssh for host {}", host.name))?;
         cmd.arg("-E").arg(&log.0).args(run_args(host, script));
         let out = cmd
             .output()
@@ -330,7 +335,9 @@ impl Transport for Ssh {
     }
 
     fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output> {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = crate::helper::SSH
+            .command()
+            .with_context(|| format!("spawning ssh for host {}", host.name))?;
         cmd.args(mux_args(host, &op));
         let out = if op == MuxOp::Check {
             match output_within(&mut cmd, CHECK_TIMEOUT)

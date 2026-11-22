@@ -3,6 +3,7 @@ use std::io::Write;
 use clap::Parser;
 
 fn main() {
+    mule::helper::snapshot_path();
     let cli = mule::cli::Cli::parse();
     match mule::cli::dispatch(cli) {
         Ok(code) => std::process::exit(code),

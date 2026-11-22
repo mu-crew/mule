@@ -12,6 +12,8 @@ mod dispatch_warn;
 pub mod errors;
 pub mod exec;
 pub mod forward;
+#[doc(hidden)]
+pub mod helper;
 mod init;
 pub mod jobs;
 pub mod key;
