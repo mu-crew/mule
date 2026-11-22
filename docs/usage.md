@@ -131,11 +131,11 @@ reattached; a lease always passes the generation it owned at dispatch. A lease's
 `<job_file>.<id>.stop-failed`:
 
 ```text
-3a043f on dev1 not stopped: no control master (gave up after 0 attempts, 600s; at unix 1762270000)
+3a043f on box not stopped: no control master (gave up after 0 attempts, 600s; at unix 1762270000)
 ```
 
 That file means the job may still be running: open the master, then
-`mule ls --host dev1`, then `mule rm --host dev1 3a043f`.
+`mule ls --host box`, then `mule rm --host box 3a043f`.
 
 ## Status for a program: `poll --json`
 
@@ -225,8 +225,10 @@ mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] \
   --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>
 ```
 
-For a local pane whose life must be the job's: a mu remote worker, run by mu's
-lease profile. It is `run --tui` plus a foreground holder, and holds no session
+For a local pane whose life must be the job's. **Status: pending as a mu job
+kind.** The verb works and is tested here, but mu's wire for it is in progress,
+and `mu-plugin-mule` does not serve it yet (it serves `exec` only). Meant for a
+mu remote worker, run by mu's lease profile. It is `run --tui` plus a foreground holder, and holds no session
 in between: a probe per tick (1s settling to 5s) over mule's own connection.
 
 - **The id is in `F` before the job exists** (one line, mode 0600, written
@@ -254,7 +256,7 @@ in between: a probe per tick (1s settling to 5s) over mule's own connection.
   the tsesh agents view to interact.
 
 ```sh
-mule run --host dev --lease --human --cwd ~/w --job-file /tmp/w1.job \
+mule run --host box --lease --human --cwd ~/w --job-file /tmp/w1.job \
   --forward-unix /tmp/w1.sock:/home/me/.mu/w1.sock -- env K=v sh -c 'pi'
 ```
 
@@ -325,7 +327,8 @@ is the command's own.
   that queues like any caller and retries for up to 10 minutes. Give it a moment before you tear the machine
   down. `run --wait` is the opposite: its job continues.
 - **Exit 3** is still "no master: stop and ask a human".
-- **A command whose dispatch script passes 112 KiB** (roughly 80KB of command)
+- **A command whose dispatch script passes 112 KiB** (the dispatch size cap, set
+  below Linux's 128 KiB per-argument limit; roughly 80KB of command)
   exits 1 with `command too large for one dispatch (<n> bytes of remote script,
   limit <m>)`, before any ssh call. Put big payloads in a file and run that.
 - **`--no-detach`** stops the job from exec itself on a signal: one `mule rm`
@@ -383,6 +386,18 @@ unchanged, so a command that itself exits 8 also reads 8: 8 is ambiguous. The
 stderr note is diagnostic only, is not proof of the original status, and may
 not be the first line (`run --wait` can print dispatch notices before it). Rely
 only on '3 = handback'.
+
+## Local helpers (`ssh`, `ps`, `mule`)
+
+mule snapshots `PATH` once on entry and resolves each local helper (`ssh`,
+`ssh-add`, `ps`, `mule`) to the first executable regular file, once per
+process. This matters on macOS with a long `PATH`: a bare `ssh` under a
+70-entry `PATH` made 54 failed spawn attempts per check; resolving once cut
+200 checks from 10,800 spawn attempts to 200. Empty and relative `PATH`
+entries still resolve (relative to the starting directory), `PATH` changes
+after start are not seen, and a missing `ssh` still exits 3 with the same
+message. The bundled `mule` and cleanup executable beside the running binary
+come before `PATH`. Remote commands are not resolved this way.
 
 ## As a mu plugin: `mu-plugin-mule`
 
