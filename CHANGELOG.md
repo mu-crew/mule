@@ -4,58 +4,37 @@
 
 ### Added
 
-- `mule init` seeds the config, prints master commands without opening them,
-  and registers `mu-plugin-mule` when mu is installed. Rerun after an upgrade
-  to refresh the registration if the plugin version or schema digest changed.
-- `mu-plugin-mule`: a second binary serving mu's plugin protocol (v1) for the
-  link seam: `exec` via `mule exec --no-detach --strict-codes`, `slots: self`,
-  provable quiescence, no fetch. Strict 3 is a hand-back; see docs/usage.md.
-- `--strict-codes` on `exec`, `wait` and `run --wait`: a command's own exit 3 is
-  reported as 8 (new, documented), so a caller can treat 3 as mule's handback
-  (no master) without misreading a command. 8 may also be the command's own 8;
-  the `mule: command exited 3 (remapped to 8)` stderr note is diagnostic only
-  and may not be the first line (`run --wait` can print notices before it).
-  Rely only on '3 = handback'. Opt-in; default behaviour is unchanged.
+- **Use mule as a mu link.** `mu-plugin-mule` runs commands through a mule SSH
+  master with `exec --no-detach --strict-codes`. The link manages its own slots,
+  supports cancellation and does not fetch files. `mule init` seeds a config,
+  prints master commands without opening them and registers the companion
+  plugin when mu is on PATH. Rerun init after an upgrade to refresh the
+  registration if its version or schema changed.
+- **`--strict-codes`** on `exec`, `wait` and `run --wait` reserves exit 3 for a
+  hand-back (no master). A command's own 3 becomes 8; a command can also
+  return 8 itself, so the remap notice is diagnostic only. Default exit
+  codes are unchanged.
+
+### Changed
+
+- Local helpers such as ssh and ps are resolved once per mule process to
+  avoid repeated PATH probes. The Rust build requires 1.88, matching the
+  language features already in use.
+- The job-view hint points to the agents view in tsesh (Ctrl-g).
 
 ### Fixed
 
-- The per-call `ssh -E` log is created, passed to ssh and read back through
-  the canonical, verified path, so a symlinked state-dir alias swapped after
-  the check cannot redirect it.
-- The per-call `ssh -E` log dir check now also refuses an unsafe ancestor
-  (not owned by you or root, or group/other writable), like ssh's
-  StrictModes, naming the path. A root-owned sticky dir such as `/tmp` is
-  accepted.
-- `exec` of a command too big for one dispatch (remote script over 112 KiB, set
-  below Linux's 128 KiB per-argument limit) now exits 1 with `command too large
-  for one dispatch (<n> bytes of remote script, limit <m>)` before any ssh
-  call, not a bare `Broken pipe`.
-
-- The missing-tool hint after a failed `run --wait` now fires on hosts whose
-  `/bin/sh` is dash (Debian, Ubuntu), which word the error
-  `sh: 1: <cmd>: not found` rather than `command not found`.
-- A signal that stops a lease or `exec` during a locked call now refuses
-  every new locked call at once. The gate used to stay open while the stop
-  waited for the call in flight, so a call queued behind it could start and
-  hold the one session as the process exited.
-- A signal that lands while a lease's or `exec`'s named dispatch is still
-  waiting for its ticket now stops the job from ever starting. The signal
-  path used to wait for that dispatch, so the command ran after the signal
-  and the `rm` that followed could not undo what it had done. A dispatch
-  already admitted to the ssh gate is still waited for, up to 3s.
-- A signal-path stop's clean-finish report is now read before the clock, so
-  it no longer counts a call still in flight at the deadline as finished. The
-  report is a best-effort observation (no call was seen in flight at the last
-  look before the deadline) and nothing relies on it. What callers rely on is
-  unchanged: the gate closes before the wait and stays closed on a timeout, a
-  queued dispatch never launches after the signal, and an admitted one gets a
-  bounded best-effort wait of up to 3s.
-- The per-call `ssh -E` log that proves a session refusal now lives in
-  `~/.local/state/mule/ssh` (under `$XDG_STATE_HOME` when set), not the
-  shared temp dir. Each call checks that the directory is a real directory,
-  owned by the user and 0700, and fails rather than use one that is not.
-- `rust-version` is now 1.88, the real floor (let-chains). It claimed 1.85,
-  where the build fails.
+- `exec` rejects a remote script over 112 KiB before opening an SSH session,
+  with a size diagnostic instead of a broken pipe. If a bounded result is
+  truncated and cleanup also fails, it is still reported as partial.
+- Stopping a lease or `exec` on a signal closes the dispatch gate immediately:
+  a queued command won't start. An already admitted call gets a bounded
+  best-effort wait of up to 3 s.
+- SSH refusal logs live in a private per-user directory under the state root,
+  not in the shared temp directory. Mule validates the canonical path and
+  its ancestors before use, so swapping a symlink alias can't redirect a
+  log. Root-owned sticky directories such as `/tmp` are allowed ancestors.
+- A failed `run --wait` shows the missing-tool hint on hosts that use dash.
 
 ## 0.5.0 — 2026-11-11
 
