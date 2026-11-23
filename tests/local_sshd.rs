@@ -79,6 +79,72 @@ fn stdout(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pi_ops_over_a_capped_master() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    require_sshd!();
+    if !Command::new("node")
+        .args(["-e", "process.exit(process.features.typescript ? 0 : 1)"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        eprintln!("skipping Pi loopback test: Node with TypeScript stripping is not installed");
+        return;
+    }
+    let sshd = Sshd::start();
+    let tmux = Tmux::new(&sshd, "pi");
+    let config = sshd.write_config(&tmux.name);
+    let root = sshd.dir.join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let calls = sshd.dir.join("calls");
+    std::fs::File::create(&calls).unwrap();
+    let bin = sshd.dir.join("mule-count");
+    writeln!(
+        std::fs::File::create(&bin).unwrap(),
+        // Log the verb: after `--quiet`, and after `--config <file>` if given.
+        "#!/bin/sh\nv=$2; [ \"$v\" = --config ] && v=$4\n\
+         printf '%s\\n' \"$v\" >>\"$MULE_PI_TEST_CALLS\"\nexec \"$MULE_PI_REAL_BIN\" \"$@\""
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut node = Command::new("node");
+    node.current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("--test")
+        .env("PATH", sshd.path_env())
+        .env("XDG_STATE_HOME", &sshd.state_root)
+        .env("MULE_PI_TEST_ROOT", &root)
+        .env("MULE_PI_TEST_CONFIG", &config)
+        .env("MULE_PI_TEST_CALLS", &calls)
+        .env("MULE_PI_TEST_BIN", &bin)
+        .env("MULE_PI_REAL_BIN", env!("CARGO_BIN_EXE_mule"));
+    let master = sshd.open_master(&sshd.socket);
+    let out = node
+        .args(["pi/loopback.test.ts", "pi/routing.test.ts"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Visible under --nocapture: which cases ran and which skipped (no Pi).
+    eprintln!("{}", stdout(&out));
+    drop(master);
+    let out = node.env("MULE_PI_TEST_NO_MASTER", "1").output().unwrap();
+    eprintln!("{}", stdout(&out));
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn the_cap_refuses_a_second_session_on_one_connection() {
     require_sshd!();

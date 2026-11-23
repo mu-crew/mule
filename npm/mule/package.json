@@ -7,15 +7,39 @@
     "type": "git",
     "url": "git+https://github.com/mu-crew/mule.git"
   },
+  "keywords": [
+    "pi-package"
+  ],
   "bin": {
     "mule": "bin/mule"
   },
   "files": [
-    "bin/mule"
+    "bin/mule",
+    "pi/"
   ],
+  "pi": {
+    "extensions": [
+      "./pi/mule.ts"
+    ]
+  },
+  "scripts": {
+    "prepack": "node ../../scripts/npm-pi.js"
+  },
   "optionalDependencies": {
     "@mu-crew/mule-linux-x64": "0.6.0",
     "@mu-crew/mule-linux-arm64": "0.6.0",
     "@mu-crew/mule-darwin-arm64": "0.6.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   }
 }

@@ -24,6 +24,15 @@
   work stays a detached job. Cargo feature `serve`, on by default.
 - `Transport::run_with_stdin`: the ticket-locked, refusal-retrying stdin path
   `serve` rides, so its lock is the transport's like every other verb's.
+- **Pi remote workspace.** `@mu-crew/mule` is also a Pi package. With
+  `--mule host[:/root]` (or a `"mule"` key in a trusted project's
+  `.pi/settings.json`) the extension sends `read`, `write` and `edit` to the
+  host over `mule serve --stdio`, and `bash`, `grep`, `find`, `ls` and `!`
+  to detached mule jobs (a command's exit 3 is its own; mule's 3 is only a
+  hand-back). The remote `AGENTS.md` goes
+  into the system prompt and the status line shows `host:root`. `mu`,
+  `mu_delegate`, skills and the loop's own files stay local. The extension
+  uses the binary from its own package, never one on `PATH`. Off by default.
 
 ## [0.6.0] — 2026-11-23
 

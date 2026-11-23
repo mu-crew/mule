@@ -2,3 +2,6 @@
 
 # Editor/tooling scratch files
 .m-reflow*
+
+# Copied from pi/ by scripts/npm-pi.js at pack time
+/npm/mule/pi/
