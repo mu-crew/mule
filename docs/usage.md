@@ -396,7 +396,8 @@ process. This matters on macOS with a long `PATH`: a bare `ssh` under a
 200 checks from 10,800 spawn attempts to 200. Empty and relative `PATH`
 entries still resolve (relative to the starting directory), `PATH` changes
 after start are not seen, and a missing `ssh` still exits 3 with the same
-message. The bundled `mule` and cleanup executable beside the running binary
+message from commands that need a live master; `mule host list` instead reports
+the host down and succeeds. The bundled `mule` and cleanup executable beside the running binary
 come before `PATH`. Remote commands are not resolved this way.
 
 ## As a mu plugin: `mu-plugin-mule`
