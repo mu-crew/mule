@@ -100,6 +100,11 @@ test("policy over one capped master: kill, reattach, key prefix, caps, own exit 
 	assert.deepEqual(await collect(once), { exitCode: 0, text: "answer\n" });
 	assert.deepEqual(await collect(once), { exitCode: 0, text: "answer\n" });
 	assert.equal(readFileSync(join(root, "count"), "utf8"), "ran\n");
+	// A restarted Pi finds an interrupted call's job by its key, without
+	// starting one for a key that never ran.
+	assert.equal(await ops.lookup(once.key), await ops.exec(once));
+	assert.equal(await ops.lookup("pi-loopback-never-ran"), undefined);
+	assert.equal(readFileSync(join(root, "count"), "utf8"), "ran\n");
 
 	// MULE_PI_JOB_PREFIX's contract: mu finds a worker's jobs by key prefix.
 	const key = jobKey("session", "call", "mu.loopback.1.");
@@ -135,6 +140,11 @@ test("policy over one capped master: kill, reattach, key prefix, caps, own exit 
 		assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-capped", command: "printf 0123456789abcdef; exit 7" }), {
 			exitCode: 7, text: "0123456789\n[mule: the log reached max_log_bytes (10 bytes); later output was discarded]\n",
 		});
+		// rc lands while a child the command left still writes: the cap
+		// marker comes only when the log drains, and the answer waits for it.
+		assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-late-cap", command: "echo early; (sleep 1; printf 0123456789abcdef) & exit 7" }), {
+			exitCode: 7, text: "early\n0123\n[mule: the log reached max_log_bytes (10 bytes); later output was discarded]\n",
+		});
 	} finally {
 		writeFileSync(config, readFileSync(config, "utf8").replace("max_log_bytes = 10\n", ""));
 	}
@@ -157,6 +167,20 @@ esac
 	const light = bashJob("echo light; exit 3", { muzzle: fake, timeout: 5 });
 	assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-light", ...light }), { exitCode: 3, text: "light\n" });
 	assert.equal(readFileSync(join(root, "muzzle-calls"), "utf8").match(/^run /gm)?.length, 1);
+
+	// Abort a light command under Pi's timeout: timeout(1) leads a process
+	// group of its own, which the hangup of `mule kill` does not reach. The
+	// job's shell must stop it, or the command runs on and writes.
+	const timedAbort = new AbortController();
+	const pid = join(root, "child.pid");
+	const timed = bashJob(`echo $$ > ${quote(pid)}; sleep 2; touch ${quote(join(root, "survived"))}`, { muzzle: fake, timeout: 7 });
+	const aborted = runJob(ops, { cwd: root, key: "pi-loopback-timed-kill", ...timed }, { signal: timedAbort.signal, onData: () => {} });
+	for (let i = 0; i < 400 && !(existsSync(pid) && readFileSync(pid, "utf8").trim()); i++) await delay(25);
+	timedAbort.abort();
+	await assert.rejects(aborted, /aborted/);
+	await delay(2_500);
+	assert.ok(!existsSync(join(root, "survived")), "nothing of the aborted job ran on");
+	assert.throws(() => process.kill(Number(readFileSync(pid, "utf8")), 0), "the timed child is gone");
 });
 
 test("no-master is a handback, not an empty successful batch or a retry", { skip: !process.env.MULE_PI_TEST_NO_MASTER }, async () => {

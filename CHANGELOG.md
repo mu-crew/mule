@@ -45,6 +45,13 @@
   has one (`MULE_PI_MUZZLE` to pin or turn it off), with the Pi timeout
   counted from admission. A log cut at `max_log_bytes` or a tail clipped at
   64 KiB is a note after the output; a command's own 3 or 7 is its result.
+  Reopening Pi reattaches to the jobs of `bash` calls left without a
+  result (found with `mule lookup`, never restarted) and reports their
+  outcome to the model.
+- `poll --json` reports `drained` for a `done` job: whether its log
+  pipeline has ended, so the log and its `truncated` marker are final.
+  `rc` lands first when a process the command left behind still holds
+  stdout.
 
 ## [0.6.0] — 2026-11-23
 

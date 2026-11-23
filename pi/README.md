@@ -85,10 +85,21 @@ Keyed artifacts are retained by mule until explicitly removed.
   `!` waits for the dispatch answer, then stops exactly that job with
   `mule kill`. An abort before dispatch starts nothing. A cancelled file op
   is cancelled alone in serve (queued: dropped; in flight: killed), and the
-  serve child keeps serving.
+  serve child keeps serving. Under muzzle, a light command with a timeout
+  runs `timeout(1)` in a process group of its own, which `mule kill`'s
+  hangup does not reach; the job's shell takes the hangup and kills that
+  group, so nothing of an aborted command runs on.
 - **Reattach.** A job's key is a hash of the Pi session id and the tool
-  call id, so a restarted Pi that replays a call gets the job already
-  running, or its result, instead of running it again. With
+  call id, so a replayed call gets the job already running, or its result,
+  instead of running it again. Pi itself does not replay an interrupted
+  call on reopen (its next prompt gets a synthetic "No result provided"),
+  so at startup the extension looks for `bash` calls on the session's
+  branch that have no result, finds each one's job with `mule lookup`
+  (never `run --key`, which would start one), and watches it: a message
+  says the job is still running and must not be run again, and a second
+  one carries its exit code and output when it ends. A call whose job
+  never started is left alone, and a reported result is not reported
+  again on the next reopen. With
   `MULE_PI_JOB_PREFIX` set, it is prepended verbatim to every detached job
   key, so mu can find and stop a worker's jobs with `mule ls --key-prefix`
   across Pi sessions. A prefix that would make an invalid key (more than
@@ -109,8 +120,12 @@ Keyed artifacts are retained by mule until explicitly removed.
   runs read-only. `write` and `edit` are hidden and refuse if called; the
   agent's `bash` runs only commands whose every simple command is a known
   reader (`cat`, `rg`, `git log`/`diff`/`show`/`status`, `find` without
-  `-exec`/`-delete`, `sed` without `-i`, ...) with no output redirection
-  other than to `/dev/null` and no command substitution. This guards
+  `-exec`/`-delete`, ...) with no output redirection
+  other than to `/dev/null` and no command substitution. `sed` and `awk`
+  are languages that can write files themselves, so only a subset passes:
+  sed with print, delete, `s`, `y`, blocks and branches (no `w`, `W`, `e`,
+  `r`, `-i` or `-f`), awk with `-F`/`-v` only and no `print > file`, pipe,
+  `system` or `getline`. This guards
   against accidents; like mu's role it is not a security boundary. `!` is
   the user's own command and is not filtered.
 - **muzzle.** The root probe also looks for `muzzle` on the jobs' `PATH`
@@ -124,7 +139,11 @@ Keyed artifacts are retained by mule until explicitly removed.
 - **Output caps.** A `bash` result is the last 64 KiB of the job's log.
   When the job outran `max_log_bytes` (`mule tail` says so on stderr), or
   the log is longer than that tail, a `[mule: ...]` note follows the
-  output, where Pi's own tail truncation keeps it. A command's own exit 7
+  output, where Pi's own tail truncation keeps it. `rc` lands before the
+  log drains when a process the command started still holds its output,
+  so the result waits for `poll --json`'s `drained` (up to 5 s, as `exec`
+  does) before reading the log and the cap marker; a log that never
+  drains gets a note saying it may be incomplete. A command's own exit 7
   (or 3) is its result. For file ops, exec's 7 means mule cut the output;
   a file-op script's own 7 is reported as 1, so the two cannot be confused.
 

@@ -235,6 +235,48 @@ fn poll_json_reports_all_five_states_with_exit_zero() {
     }
 }
 
+/// `rc` lands before the log pipeline drains: a child the command left
+/// holding stdout keeps writing after it. `drained` says when the log (and
+/// a `truncated` marker) is final, so a caller never takes an early read
+/// as the whole output.
+#[test]
+fn poll_json_says_when_a_done_job_has_drained() {
+    if skip() {
+        return;
+    }
+    let host = ShimHost::new("status-drain");
+    let gate = host.dir.join("release");
+    let id = stdout(&host.mule(&[
+        "run",
+        "--quiet",
+        &format!(
+            "echo early; (while [ ! -f '{}' ]; do sleep 0.05; done; echo late) & exit 7",
+            gate.display()
+        ),
+    ]));
+    wait_until("rc", 10, || host.jobs().join(&id).join("rc").exists());
+    let (_, value) = poll_json(&host, &id);
+    assert_eq!(
+        (
+            value["state"].as_str(),
+            value["rc"].as_i64(),
+            value["drained"].as_bool()
+        ),
+        (Some("done"), Some(7), Some(false)),
+        "{value}"
+    );
+    std::fs::write(&gate, "").unwrap();
+    wait_until("the drain", 10, || {
+        poll_json(&host, &id).1["drained"] == serde_json::json!(true)
+    });
+    let log = std::fs::read_to_string(host.jobs().join(&id).join("log")).unwrap();
+    assert_eq!(log, "early\nlate\n");
+    // Only `done` has a drain to report.
+    let running = stdout(&host.mule(&["run", "--quiet", "sleep 30"]));
+    assert!(poll_json(&host, &running).1.get("drained").is_none());
+    assert!(host.mule(&["kill", &running]).status.success());
+}
+
 /// Run `f` with the jobs root at mode 0000, or `None` if modes are not
 /// enforced for this user (root).
 fn with_unsearchable_jobs_root<T>(host: &ShimHost, f: impl FnOnce() -> T) -> Option<T> {

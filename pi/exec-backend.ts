@@ -244,8 +244,8 @@ else printf missing; fi`, 9, signal);
 	async poll(job: string): Promise<JobState> {
 		const status = JSON.parse((await this.#call("poll", [job, "--json"])).toString());
 		if (status.state === "running") return { state: "running" };
-		if (status.state === "done" && Number.isInteger(status.rc) && Number.isSafeInteger(status.log_size) && status.log_size >= 0) {
-			return { state: "done", exitCode: status.rc, logBytes: status.log_size };
+		if (status.state === "done" && Number.isInteger(status.rc) && Number.isSafeInteger(status.log_size) && status.log_size >= 0 && typeof status.drained === "boolean") {
+			return { state: "done", exitCode: status.rc, logBytes: status.log_size, drained: status.drained };
 		}
 		throw new Error(`Mule cannot collect job ${job} (${String(status.state)})`);
 	}
@@ -258,4 +258,13 @@ else printf missing; fi`, 9, signal);
 		return { data: stdout, ...(capped ? { cappedAt: Number(capped[1]) } : {}) };
 	}
 	async kill(job: string) { await this.#call("kill", [job]); }
+
+	async lookup(key: string) {
+		// mule's exact key lookup: the id as JSON, or null. It ignores ls's
+		// 24-hour window, so an old finished job is still found.
+		const id: unknown = JSON.parse((await this.#call("lookup", [key])).toString());
+		if (id === null) return undefined;
+		if (typeof id !== "string" || !/^[0-9a-f]{6}$/.test(id)) throw new Error("Mule did not return a job id");
+		return id;
+	}
 }

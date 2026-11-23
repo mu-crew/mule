@@ -144,16 +144,22 @@ That file means the job may still be running: open the master, then
 | `state` | Meaning |
 | --- | --- |
 | `running` | the session exists and there is no `rc` |
-| `done` | `rc` exists; it is in `rc` |
+| `done` | `rc` exists; it is in `rc`. `drained` says whether the log is final |
 | `orphan` | the state is there, the session is gone, and no `rc` will come |
 | `missing` | no state directory and no session: proven, as `rm` proves a stop |
 | `unknown` | mule could not tell; `reason` says why |
 
 ```json
 {"state":"running","rc":null,"runtime_secs":12,"log_size":0}
+{"state":"done","rc":0,"runtime_secs":40,"log_size":5120,"drained":true}
 {"state":"missing","rc":null,"runtime_secs":null,"log_size":null}
 {"state":"unknown","rc":null,"runtime_secs":null,"log_size":null,"reason":"cannot tell the state of job 3a043f: cannot verify state dir ...: Permission denied"}
 ```
+
+`rc` is written when the command exits, but a process it left behind can
+still hold its output: the log keeps growing, and the `truncated` marker
+that `tail` reports comes only when the log pipeline ends. `drained: false`
+means exactly that; read the log as final only once `drained` is `true`.
 
 `unknown` covers every probe that did not complete: a state path behind an
 unsearchable directory, a tmux that cannot be queried, a tool that failed, an

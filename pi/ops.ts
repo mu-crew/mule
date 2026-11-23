@@ -10,7 +10,10 @@ export class MasterRequired extends Error {}
 export type JobOutput = { data: Buffer; cappedAt?: number };
 
 export type FileKind = "file" | "directory" | "other" | "missing";
-export type JobState = { state: "running" } | { state: "done"; exitCode: number; logBytes: number };
+// `drained`: the job's log pipeline has ended, so the log and mule's cap
+// marker are final. `rc` lands first when a process the command left behind
+// still holds its stdout.
+export type JobState = { state: "running" } | { state: "done"; exitCode: number; logBytes: number; drained: boolean };
 
 // Paths and cwd are absolute on the workspace host. A read returns the whole
 // file (at most MAX_FILE_BYTES), or undefined only for an absent path.
@@ -22,4 +25,6 @@ export interface WorkspaceOps {
 	poll(job: string): Promise<JobState>;
 	output(job: string): Promise<JobOutput>;
 	kill(job: string): Promise<void>;
+	/** The job a key started, in any state, or undefined when the key started none. */
+	lookup(key: string): Promise<string | undefined>;
 }

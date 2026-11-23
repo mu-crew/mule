@@ -23,8 +23,20 @@ export function bashJob(command: string, options: { muzzle?: string; timeout?: n
 	const timeout = options.timeout && options.timeout > 0 ? Math.ceil(options.timeout) : undefined;
 	if (!options.muzzle) return { command, timeout };
 	const limit = timeout ? ` --run-timeout ${timeout}` : "";
+	// timeout(1) leads a process group of its own, so the hangup `mule kill`
+	// sends the pane's group never reached it: an aborted command ran on and
+	// wrote to the workspace (review, 2026-11-23). This shell stays in the
+	// pane's group, takes the hangup, and kills timeout's whole group. muzzle
+	// needs none of this: measured under tmux kill-session, its command dies
+	// with the pane's group.
 	const light = timeout
-		? `if command -v timeout >/dev/null 2>&1; then exec timeout ${timeout} bash -c "$c"; fi\n`
+		? `if command -v timeout >/dev/null 2>&1; then
+  p=
+  trap '[ -n "$p" ] && kill -KILL -- -"$p" "$p" 2>/dev/null; exit 129' HUP TERM INT
+  timeout ${timeout} bash -c "$c" & p=$!
+  wait "$p"; exit
+fi
+`
 		: "";
 	const script = `c=${quote(command)}
 m=${quote(options.muzzle)}
@@ -56,8 +68,13 @@ function refuseSimple(words: string[]): string | undefined {
 	const [program, ...args] = words;
 	if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(program)) return "an environment assignment";
 	if (!READERS.has(program)) return `\`${program}\` is not a known read-only command`;
-	if (program === "sed" && args.some((a) => /^-[a-zA-Z]*i|^--in-place/.test(a))) return "`sed -i`";
-	if (program === "awk" && args.some((a) => /system\s*\(|getline|fflush/.test(a))) return "awk running commands";
+	if (program === "sed") return refuseSed(args);
+	if (program === "awk") return refuseAwk(args);
+	if (program === "tree" && args.some((a) => /^-[a-zA-Z]*o|^--output/.test(a))) return "`tree -o`";
+	if (program === "rg" && args.some((a) => /^--pre(?:=|$)/.test(a))) return "rg running a preprocessor";
+	if ((program === "uniq" || program === "xxd") && operands(args, program === "uniq" ? /^-[fsw]$/ : /^-[cglosnC]$/).length > 1) {
+		return `\`${program}\` with an output file`;
+	}
 	if (program === "sort" && args.some((a) => /^-[a-zA-Z]*o|^--output/.test(a))) return "`sort -o`";
 	if (program === "find" && args.some((a) => /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(a))) {
 		return "find with an action that runs or writes";
@@ -66,10 +83,148 @@ function refuseSimple(words: string[]): string | undefined {
 	if (program === "git") {
 		let i = 0;
 		// Global options before the subcommand: -C dir, -c k=v, --no-pager, ...
-		while (i < args.length && args[i].startsWith("-")) i += args[i] === "-C" || args[i] === "-c" ? 2 : 1;
+		// -c can set a pager, an external diff or an fsmonitor: a command to run.
+		while (i < args.length && args[i].startsWith("-")) {
+			if (/^-c|^--config-env/.test(args[i])) return "`git -c`, which can make git run a command";
+			i += args[i] === "-C" ? 2 : 1;
+		}
 		const sub = args[i];
 		if (sub === undefined || !GIT_READERS.has(sub)) return `\`git ${sub ?? ""}\` is not a read-only git command`;
 		if (args.some((a) => /^--output(?:=|$)|^--ext-diff$/.test(a))) return "git writing output to a file";
+		if (sub === "grep" && args.some((a) => /^-O|^--open-files-in-pager/.test(a))) return "git grep running a pager";
+	}
+	return undefined;
+}
+
+// Arguments that are not options, skipping the values of `valued` options.
+function operands(args: string[], valued: RegExp) {
+	const found: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		if (args[i] === "--") { found.push(...args.slice(i + 1)); break; }
+		if (valued.test(args[i])) i++;
+		else if (!args[i].startsWith("-") || args[i] === "-") found.push(args[i]);
+	}
+	return found;
+}
+
+// sed and awk are languages, and both can write files from inside a script
+// (`sed -n 'w out'`, `awk '{print > "out"}'`): an option check alone let
+// those through (review, 2026-11-23). Allow a conservative subset, refuse
+// the rest.
+const SED_OPTIONS = /^-[nErsuz]+$|^--(?:quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|sandbox)$/;
+
+function refuseSed(args: string[]): string | undefined {
+	const scripts: string[] = [];
+	let files = false;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") { files = true; continue; }
+		if (files || !arg.startsWith("-") || arg === "-") {
+			if (!scripts.length && !args.some((a) => /^-[a-zA-Z]*e|^--expression/.test(a))) scripts.push(arg);
+			continue;
+		}
+		if (SED_OPTIONS.test(arg)) continue;
+		const e = /^-([nErsuz]*)e(.*)$/.exec(arg) ?? /^--expression(?:=(.*))?$/.exec(arg);
+		if (e) {
+			const inline = e.length === 3 ? e[2] : e[1];
+			if (inline) scripts.push(inline);
+			else if (i + 1 < args.length) scripts.push(args[++i]);
+			continue;
+		}
+		if (/^-[a-zA-Z]*i|^--in-place/.test(arg)) return "`sed -i`";
+		return `sed option \`${arg}\` (a script file, or not known to be read-only)`;
+	}
+	for (const script of scripts) {
+		const why = sedScriptRefusal(script);
+		if (why) return why;
+	}
+	return undefined;
+}
+
+// Commands that only print, edit the pattern space or move between lines
+// (with blocks, labels, s and y handled apart). Missing on purpose: w and W (write a file), e (run a command), r
+// and R (read one), and a, i and c, whose text this does not parse.
+const SED_SIMPLE = new Set("pPdDnNgGhHxlz=qQ}".split(""));
+
+function sedScriptRefusal(script: string): string | undefined {
+	let i = 0;
+	// The body of a regex or s/// part up to its unescaped delimiter.
+	const until = (delim: string) => {
+		for (; i < script.length && script[i] !== delim; i++) {
+			if (script[i] === "\\") i++;
+			else if (script[i] === "\n") return false;
+		}
+		if (i >= script.length) return false;
+		i++;
+		return true;
+	};
+	const address = () => {
+		if (/\d/.test(script[i] ?? "")) { while (/[\d~]/.test(script[i] ?? "")) i++; return true; }
+		if (script[i] === "$") { i++; return true; }
+		if (script[i] === "/" || script[i] === "\\") {
+			const delim = script[i] === "\\" ? script[++i] : "/";
+			i++;
+			if (!delim || !until(delim)) return false;
+			while (script[i] === "I" || script[i] === "M") i++;
+			return true;
+		}
+		return true;
+	};
+	while (i < script.length) {
+		while (/[\s;]/.test(script[i] ?? "")) i++;
+		if (i >= script.length) break;
+		if (!address()) return "a sed script this guard cannot read";
+		if (script[i] === ",") { i++; if (script[i] === "+" || script[i] === "~") i++; if (!address()) return "a sed script this guard cannot read"; }
+		while (/[\s!]/.test(script[i] ?? "")) i++;
+		const command = script[i++];
+		if (command === "s" || command === "y") {
+			const delim = script[i++];
+			if (!delim || delim === "\\" || delim === "\n" || !until(delim) || !until(delim)) return "a sed script this guard cannot read";
+			if (command === "s") {
+				const flags = /^[gpiImM0-9]*/.exec(script.slice(i))![0];
+				i += flags.length;
+				if (/^[we]/.test(script.slice(i))) return "sed writing a file or running a command (`s///w`, `s///e`)";
+			}
+		} else if (command === "{") {
+			continue;
+		} else if (command === ":" || command === "b" || command === "t" || command === "T") {
+			// A label or a branch to one: control flow, no I/O.
+			while (i < script.length && !/[;\n]/.test(script[i])) i++;
+		} else if (!command || !SED_SIMPLE.has(command)) {
+			return command && /[wWe]/.test(command) ? "sed writing a file or running a command (`w`, `W`, `e`)" : `sed command \`${command ?? ""}\``;
+		}
+		if (command === "q" || command === "Q") while (/\d/.test(script[i] ?? "")) i++;
+		while (/[ \t]/.test(script[i] ?? "")) i++;
+		if (i < script.length && !/[;\n}]/.test(script[i])) return "a sed script this guard cannot read";
+	}
+	return undefined;
+}
+
+function refuseAwk(args: string[]): string | undefined {
+	let program: string | undefined;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") { program ??= args[i + 1]; break; }
+		if (/^-[Fv]$/.test(arg)) { i++; continue; }
+		if (/^-[Fv]./.test(arg)) continue;
+		if (arg.startsWith("-") && arg !== "-") return `awk option \`${arg}\` (a program file, in-place edit, or not known to be read-only)`;
+		program = arg;
+		break;
+	}
+	if (program === undefined) return "awk without a program";
+	// Strings and regex literals may hold any character; only code counts.
+	const code = program
+		.replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
+		.replace(/(^|[\s{(,;!~&|])\/(?:[^/\\\n]|\\.)*\//g, "$1//");
+	if (/system\s*\(|getline|fflush|close\s*\(/.test(code)) return "awk running commands";
+	if (/(?<!\|)\|(?!\|)/.test(code)) return "awk piping to a command";
+	// In a print statement, > is output redirection: `print $1 > 5` writes
+	// to a file named 5. Elsewhere it is a comparison.
+	for (const statement of code.split(/[;{}\n]/)) {
+		const print = /(?:^|[^\w$])printf?(?!\w)/.exec(statement);
+		if (print && statement.slice(print.index).includes(">")) {
+			return "awk writing a file (`print > file`)";
+		}
 	}
 	return undefined;
 }

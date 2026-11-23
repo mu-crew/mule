@@ -86,6 +86,52 @@ export function checkedKey(prefix: string, key: string) {
 	return prefix + key;
 }
 
+// How long a done job may take to drain its log before the answer is given
+// without that proof. exec waits the same 5 s (SESSION_END_WAIT): a drain is
+// milliseconds; a process the command left holding stdout can take forever.
+export const DRAIN_WAIT_MS = 5_000;
+const POLL_MS = 250;
+const DRAIN_POLL_MS = 100;
+
+type JobOps = Pick<WorkspaceOps, "poll" | "output">;
+
+/**
+ * Poll one job to its end and hand its tail to `onData`. A job is over when
+ * `rc` exists and its log has drained: `rc` lands first, and a tail read
+ * then can miss the last bytes and mule's cap marker, so a capped log would
+ * pass for whole and a command's own 7 for mule's cap (review, 2026-11-23).
+ * A log still undrained after DRAIN_WAIT_MS is reported as unfinished.
+ */
+export async function watchJob(ops: JobOps, job: string, options: { signal?: AbortSignal; onData: (data: Buffer) => void; drainWait?: number }) {
+	const { signal, onData, drainWait = DRAIN_WAIT_MS } = options;
+	let settling: number | undefined;
+	for (;;) {
+		signal?.throwIfAborted();
+		const poll = await ops.poll(job);
+		signal?.throwIfAborted();
+		if (poll.state === "done") {
+			settling ??= performance.now();
+			if (!poll.drained && performance.now() - settling < drainWait) {
+				await delay(DRAIN_POLL_MS, undefined, { signal });
+				continue;
+			}
+			const { data, cappedAt } = await ops.output(job);
+			signal?.throwIfAborted();
+			// mule's caps, reported as text beside the command's own rc: a job
+			// that exits 7 exited 7, and a capped log is not an exit code.
+			// Notes go last: Pi keeps the tail of a long result.
+			onData(data);
+			const notes: string[] = [];
+			if (cappedAt !== undefined) notes.push(`[mule: the log reached max_log_bytes (${cappedAt} bytes); later output was discarded]`);
+			if (poll.logBytes > data.length) notes.push(`[mule: showing the last ${data.length} of ${poll.logBytes} log bytes]`);
+			if (!poll.drained) notes.push(`[mule: the command exited ${poll.exitCode}, but a process it started still holds its output; the log may be incomplete]`);
+			if (notes.length) onData(Buffer.from(`${data.length && data[data.length - 1] !== 10 ? "\n" : ""}${notes.join("\n")}\n`));
+			return { exitCode: poll.exitCode };
+		}
+		await delay(POLL_MS, undefined, { signal });
+	}
+}
+
 /**
  * One detached job, start to collected tail. Abort stops exactly this job
  * with `mule kill` (the dispatch answer is awaited first so the id is
@@ -101,24 +147,7 @@ export async function runJob(ops: Pick<WorkspaceOps, "exec" | "poll" | "output" 
 	// Even on abort, collect the dispatch answer so we can stop the exact job.
 	const job = await ops.exec(request);
 	try {
-		for (;;) {
-			signal?.throwIfAborted();
-			const poll = await ops.poll(job);
-			signal?.throwIfAborted();
-			if (poll.state === "done") {
-				const { data, cappedAt } = await ops.output(job);
-				signal?.throwIfAborted();
-				// mule's caps, reported as text beside the command's own rc: a job
-				// that exits 7 exited 7, and a capped log is not an exit code.
-				// Notes go last: Pi keeps the tail of a long result.
-				onData(data);
-				const end = data.length && data[data.length - 1] !== 10 ? "\n" : "";
-				if (cappedAt !== undefined) onData(Buffer.from(`${end}[mule: the log reached max_log_bytes (${cappedAt} bytes); later output was discarded]\n`));
-				if (poll.logBytes > data.length) onData(Buffer.from(`${cappedAt === undefined ? end : ""}[mule: showing the last ${data.length} of ${poll.logBytes} log bytes]\n`));
-				return { exitCode: poll.exitCode };
-			}
-			await delay(250, undefined, { signal });
-		}
+		return await watchJob(ops, job, { signal, onData });
 	} catch (error) {
 		// Don't issue another mule call if a concurrent abort met a handback.
 		if (signal?.aborted && !(error instanceof MasterRequired) && handedBack?.()) {

@@ -151,6 +151,7 @@ export class MuleServeBackend implements WorkspaceOps {
 	poll(job: string) { return this.jobs.poll(job); }
 	output(job: string) { return this.jobs.output(job); }
 	kill(job: string) { return this.jobs.kill(job); }
+	lookup(key: string) { return this.jobs.lookup(key); }
 
 	/** Hang up: serve exits when its stdin closes. */
 	close() {

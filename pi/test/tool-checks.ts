@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -7,6 +8,7 @@ import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-w
 import { createFindToolDefinition } from "@earendil-works/pi-coding-agent";
 import { quote } from "../exec-backend.ts";
 import mule from "../mule.ts";
+import { jobKey } from "../routing.ts";
 
 const builtins = ["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"];
 const dir = process.env.MULE_TOOL_TEST_DIR!;
@@ -14,19 +16,20 @@ const cwd = join(dir, "local");
 const root = join(dir, "remote [root]");
 const calls = () => readFileSync(join(dir, "calls"), "utf8");
 
-function register(flag?: string, settings: Record<string, unknown> = {}, flags: Record<string, string> = {}) {
+function register(flag?: string, settings: Record<string, unknown> = {}, flags: Record<string, string> = {}, branch: unknown[] = []) {
 	const tools = new Map<string, ToolDefinition>();
 	const handlers = new Map<string, Function>();
 	const statuses: string[] = [];
 	const notices: string[] = [];
 	const localMu: unknown[] = [];
+	const messages: { content: string; details?: Record<string, unknown> }[] = [];
 	let active = [...builtins];
 	let id = 0;
 	const aborts: number[] = [];
 	let idle = true;
 	const ctx = {
 		cwd, ui: { setStatus: (_name: string, status: string) => statuses.push(status), notify: (message: string) => notices.push(message) },
-		sessionManager: { getSessionId: () => "fixture-session" },
+		sessionManager: { getSessionId: () => "fixture-session", getBranch: () => branch },
 		isIdle: () => idle, abort: () => aborts.push(Date.now()),
 	} as unknown as ExtensionContext;
 	mule({
@@ -34,6 +37,7 @@ function register(flag?: string, settings: Record<string, unknown> = {}, flags: 
 		on: (name: string, handler: Function) => handlers.set(name, handler),
 		registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
 		getActiveTools: () => active,
+		sendMessage: (message: { content: string; details?: Record<string, unknown> }) => messages.push(message),
 		setActiveTools: (names: string[]) => { active = names; },
 		exec: async (program: string, args: string[], options: { cwd: string }) => {
 			localMu.push([program, args, options.cwd]);
@@ -41,7 +45,7 @@ function register(flag?: string, settings: Record<string, unknown> = {}, flags: 
 		},
 	} as unknown as ExtensionAPI);
 	return {
-		tools, active: () => active, statuses, notices, localMu, aborts,
+		tools, active: () => active, statuses, notices, localMu, aborts, messages,
 		/** A turn is running: a handback may stop it. */
 		busy(value = true) { idle = !value; },
 		start: () => handlers.get("session_start")!({}, ctx),
@@ -63,6 +67,10 @@ function register(flag?: string, settings: Record<string, unknown> = {}, flags: 
 			return Buffer.concat(parts).toString().trim();
 		},
 	};
+}
+
+async function waitFor(what: string, done: () => boolean, ms = 10_000) {
+	for (const end = Date.now() + ms; !done(); await delay(25)) if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
 }
 
 // A tool's text whether Pi returns it or throws it (a nonzero exit).
@@ -339,6 +347,50 @@ const checks = {
 		} finally {
 			delete process.env.MULE_PI_JOB_PREFIX;
 		}
+
+		// Pi stopped mid-call: the branch holds the call with no result, and
+		// its job runs on. Pi does not replay the call on reopen, so the
+		// extension finds the job by its key and reports its result.
+		const prefix = process.env.MULE_PI_JOB_PREFIX = "mu.machine-1.8.";
+		try {
+			const gate = join(dir, "lost-gate");
+			const lost = `while [ ! -f ${quote(gate)} ]; do sleep 0.05; done; echo ran >> ${quote(join(dir, "lost-count"))}; echo lost answer; exit 4`;
+			const seeded = spawnSync(join(dir, "mule"), ["--quiet", "run", "--host", "fixture", "--key", jobKey("fixture-session", "toolu_lost", prefix), "--cwd", root, "--", `exec bash -c ${quote(lost)}`], { encoding: "utf8" });
+			assert.equal(seeded.status, 0, seeded.stderr);
+			const job = seeded.stdout.trim();
+			const call = (id: string, command: string) => ({ type: "toolCall", id, name: "bash", arguments: { command } });
+			const branch: unknown[] = [
+				{ type: "message", message: { role: "user", content: "go" } },
+				{ type: "message", message: { role: "assistant", content: [call("toolu_lost", lost), call("toolu_never", "touch never"), call("toolu_done", "true")] } },
+				{ type: "message", message: { role: "toolResult", toolCallId: "toolu_done", content: [] } },
+			];
+			const runs = readFileSync(join(dir, "runs"), "utf8");
+			const before = calls().length;
+			const reopened = register(`fixture:${root}`, {}, {}, branch);
+			await reopened.start();
+			await waitFor("the reattach notice", () => reopened.messages.length > 0);
+			assert.match(reopened.messages[0].content, new RegExp(`toolu_lost[\\s\\S]*job ${job} kept running[\\s\\S]*Do not run it again`));
+			writeFileSync(gate, "");
+			await waitFor("the reattached result", () => reopened.messages.length > 1);
+			assert.match(reopened.messages[1].content, /exited with code 4[\s\S]*lost answer/);
+			assert.deepEqual(reopened.messages[1].details, { toolCallId: "toolu_lost", job, exitCode: 4 });
+			assert.equal(readFileSync(join(dir, "lost-count"), "utf8"), "ran\n", "watched, never run again");
+			assert.equal(readFileSync(join(dir, "runs"), "utf8"), runs, "nothing dispatched: not the lost call, not the one never started");
+			assert.equal(calls().slice(before).match(/^lookup$/gm)?.length, 2, "one lookup per call without a result");
+			assert.ok(!existsSync(join(root, "never")));
+			await reopened.stop();
+
+			// Reported once: the next reopen sees the result in the branch.
+			const after = calls().length;
+			const again = register(`fixture:${root}`, {}, {}, [...branch.slice(0, 3), { type: "custom_message", customType: "mule-reattach", details: reopened.messages[1].details }]);
+			await again.start();
+			await delay(300);
+			assert.equal(calls().slice(after).match(/^lookup$/gm)?.length, 1, "only the call never started is looked up");
+			assert.deepEqual(again.messages, []);
+			await again.stop();
+		} finally {
+			delete process.env.MULE_PI_JOB_PREFIX;
+		}
 	},
 	async handback() {
 		const s = enabled();
@@ -381,11 +433,13 @@ const checks = {
 			const before = calls();
 			await assert.rejects(s.run("write", { path: "shared.txt", content: "x" }), /Read-only role/);
 			await assert.rejects(s.run("edit", { path: "shared.txt", edits: [{ oldText: "remote", newText: "x" }] }), /Read-only role/);
-			for (const command of ["echo x > shared.txt", "rm -rf src", "sed -i s/a/b/ shared.txt", "cat shared.txt | tee copy", "git commit -m x", "find . -delete", "echo $(rm x)", "make", "X=1 cat a"]) {
+			for (const command of ["echo x > shared.txt", "rm -rf src", "sed -i s/a/b/ shared.txt", "cat shared.txt | tee copy", "git commit -m x", "find . -delete", "echo $(rm x)", "make", "X=1 cat a",
+				"sed -n 'w report.txt' shared.txt", "awk '{print > \"report.txt\"}' shared.txt"]) {
 				await assert.rejects(s.run("bash", { command }), /Read-only role: refused/, command);
 			}
 			assert.equal(calls(), before, "refused before any mule call");
 			assert.equal(readFileSync(join(root, "shared.txt"), "utf8"), "remote text\n");
+			assert.ok(!existsSync(join(root, "report.txt")));
 			assert.match(await s.run("bash", { command: "cat shared.txt 2>/dev/null | grep -c 'remote|x' ; ls src >/dev/null && echo ok" }), /ok/);
 			assert.match(await s.run("read", { path: "shared.txt" }), /remote text/);
 			// `!` is the user's own command, not the agent's.
@@ -439,6 +493,17 @@ esac
 			assert.equal(light.trim(), "light");
 			assert.equal(muzzleCalls().match(/^run /gm)?.length, 1, "a light command is not queued");
 			assert.equal(runs().at(-1).maxSecs, undefined);
+			// Esc on a light command with a timeout: timeout(1) leads a process
+			// group of its own, and the abort must stop that too.
+			const controller = new AbortController();
+			const pid = join(root, "child.pid");
+			const timed = s.run("bash", { command: `echo $$ > ${quote(pid)}; sleep 2; touch ${quote(join(root, "survived"))}`, timeout: 7 }, { signal: controller.signal });
+			await waitFor("the timed child", () => existsSync(pid) && readFileSync(pid, "utf8").trim() !== "");
+			controller.abort();
+			await assert.rejects(timed, /abort/i);
+			await delay(2_500);
+			assert.ok(!existsSync(join(root, "survived")), "nothing of the aborted job ran on");
+			assert.throws(() => process.kill(Number(readFileSync(pid, "utf8")), 0), "the timed child is gone");
 			// Gone since startup: the command still runs, unwrapped.
 			rmSync(fake);
 			assert.equal((await s.run("bash", { command: "echo HEAVY gone" })).trim(), "HEAVY gone");
@@ -469,6 +534,11 @@ esac
 		writeFileSync(join(dir, "max_log"), "1000");
 		const capped = await s.run("bash", { command: "head -c 5000 /dev/zero | tr '\\0' x; echo" });
 		assert.equal(capped.trimEnd(), `${"x".repeat(1000)}\n[mule: the log reached max_log_bytes (1000 bytes); later output was discarded]`);
+		// The cap lands after rc: a child the command left still writes, and
+		// mule marks the cap only when the log drains. The answer waits for it.
+		writeFileSync(join(dir, "max_log"), "10");
+		const late = await settle(s.run("bash", { command: "echo early; (sleep 0.5; printf 0123456789abcdef) & exit 7" }));
+		assert.match(late, /^early\n0123\n\[mule: the log reached max_log_bytes \(10 bytes\); later output was discarded\]\n[\s\S]*Command exited with code 7$/);
 		rmSync(join(dir, "max_log"));
 		// One tail reads the last 64 KiB of a longer log, and says so.
 		const long = await s.run("bash", { command: "head -c 100000 /dev/zero | tr '\\0' y; echo end" });

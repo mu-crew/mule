@@ -12,7 +12,7 @@ import {
 import { muleBinary } from "./binary.ts";
 import { quote } from "./exec-backend.ts";
 import { MuleServeBackend } from "./serve-backend.ts";
-import { checkedKey, jobKey, loopResources, runJob, workspaceRouter } from "./routing.ts";
+import { checkedKey, jobKey, loopResources, runJob, watchJob, workspaceRouter } from "./routing.ts";
 import { MasterRequired } from "./ops.ts";
 import { bashJob, readOnlyRefusal } from "./policy.ts";
 
@@ -20,6 +20,40 @@ const extensionDir = dirname(fileURLToPath(import.meta.url));
 const AGENTS_BYTES = 64 * 1024;
 const STARTUP_BACKOFF_MS = 250;
 const MAX_STARTUP_BACKOFF_MS = 2_000;
+// A reattached job's result goes to the model as a message. Pi keeps about
+// this much of a bash result, from the end.
+const REATTACH_TAIL_BYTES = 50 * 1024;
+
+type Entry = {
+	type: string; message?: { role?: string; content?: unknown; toolCallId?: string };
+	customType?: string; details?: { toolCallId?: unknown; exitCode?: unknown };
+};
+
+/**
+ * bash calls on this branch that never got a result: Pi was closed or
+ * crashed while they ran. Pi does not replay them on reopen -- its next
+ * prompt gets a synthetic "No result provided" -- so their jobs, still
+ * keyed by session and call id, are found here instead.
+ */
+export function interruptedBashCalls(branch: Entry[]) {
+	// A result reported by an earlier reattach answers the call too, or each
+	// reopen would report it again.
+	const answered = new Set(branch.flatMap((entry) => {
+		if (entry.message?.role === "toolResult" && entry.message.toolCallId) return [entry.message.toolCallId];
+		const reported = entry.type === "custom_message" && entry.customType === "mule-reattach" && entry.details?.exitCode !== undefined;
+		return reported && typeof entry.details?.toolCallId === "string" ? [entry.details.toolCallId] : [];
+	}));
+	const calls: { id: string; command: string }[] = [];
+	for (const entry of branch) {
+		if (entry.type !== "message" || entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
+		for (const block of entry.message.content as { type?: string; id?: unknown; name?: unknown; arguments?: { command?: unknown } }[]) {
+			if (block?.type === "toolCall" && block.name === "bash" && typeof block.id === "string" && !answered.has(block.id)) {
+				calls.push({ id: block.id, command: typeof block.arguments?.command === "string" ? block.arguments.command : "" });
+			}
+		}
+	}
+	return calls;
+}
 
 function fdPattern(raw: string, path: string) {
 	// Same order as pi's local find: strip leading ./ before deciding whether
@@ -75,6 +109,8 @@ export default function (pi: ExtensionAPI) {
 	let startupError: unknown;
 	let loop: ReturnType<typeof loopResources> | undefined;
 	let serve: MuleServeBackend | undefined;
+	// Stops watching reattached jobs (never kills them) when the session goes.
+	let watching: AbortController | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Off unless asked for: the flag, else a "mule" key in settings
@@ -146,6 +182,39 @@ export default function (pi: ExtensionAPI) {
 			if (agents && agents.length >= AGENTS_BYTES) throw new Error("Remote AGENTS.md must be under 64 KiB");
 			return { ops, root, router, agents: agents?.toString("utf8") };
 		};
+		const sessionKey = (id: string) => jobKey(ctx.sessionManager.getSessionId(), id, prefix);
+		let reattaching: Promise<void> | undefined;
+		watching?.abort();
+		const watch = watching = new AbortController();
+		const reattach = async (ops: MuleServeBackend) => {
+			const lost = interruptedBashCalls((ctx.sessionManager.getBranch?.() ?? []) as Entry[]);
+			await Promise.all(lost.map(async ({ id, command }) => {
+				try {
+					// Look up, never `run --key`: that would start a job the
+					// lost call may never have dispatched.
+					const job = await ops.lookup(sessionKey(id));
+					if (!job || watch.signal.aborted) return;
+					const what = `bash call ${id}${command ? ` (\`${command.length > 200 ? `${command.slice(0, 200)}...` : command}\`)` : ""}`;
+					ctx.ui.notify(`mule: reattached to job ${job} on ${host}, from ${what} before Pi restarted`, "info");
+					pi.sendMessage({
+						customType: "mule-reattach", display: true, details: { toolCallId: id, job },
+						content: `${what} was interrupted when Pi stopped, but its job ${job} kept running on ${host}. mule is watching it and will report its result here. Do not run it again.`,
+					});
+					const parts: Buffer[] = [];
+					const { exitCode } = await watchJob(ops, job, { signal: watch.signal, onData: (data) => parts.push(data) });
+					const output = Buffer.concat(parts);
+					const tail = output.length > REATTACH_TAIL_BYTES ? `[mule: showing the last ${REATTACH_TAIL_BYTES} bytes]\n${output.subarray(-REATTACH_TAIL_BYTES).toString()}` : output.toString();
+					pi.sendMessage({
+						customType: "mule-reattach", display: true, details: { toolCallId: id, job, exitCode },
+						content: `${what}, reattached as job ${job}, exited with code ${exitCode}. This is its result; do not run it again.\n\n${tail.trimEnd() || "(no output)"}`,
+					}, { deliverAs: "steer" });
+				} catch (error) {
+					if (watch.signal.aborted) return;
+					// The job keeps its key: a later restart looks again.
+					ctx.ui.notify(`mule: could not reattach ${id}'s job: ${String(error instanceof Error ? error.message : error)}`, "error");
+				}
+			}));
+		};
 		let pending: ReturnType<typeof initialize> | undefined;
 		let retryAt = 0;
 		let backoff = STARTUP_BACKOFF_MS;
@@ -157,6 +226,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			try {
 				const workspace = await initialize();
+				// Once per session, and not awaited: a job from before a restart
+				// may run for hours, and startup must not wait on it.
+				reattaching ??= reattach(workspace.ops);
 				prompt = { host, root: workspace.root, agents: workspace.agents };
 				startupError = undefined;
 				ctx.ui.setStatus("mule", `mule ${host}:${workspace.root}`);
@@ -183,7 +255,6 @@ export default function (pi: ExtensionAPI) {
 			bash: createBashToolDefinition(cwd), grep: createGrepToolDefinition(cwd),
 			find: createFindToolDefinition(cwd), ls: createLsToolDefinition(cwd), powershell: createPowerShellToolDefinition(cwd),
 		};
-		const sessionKey = (id: string) => jobKey(ctx.sessionManager.getSessionId(), id, prefix);
 		const isHandedBack = () => handedBack;
 		const number = (value: number | undefined, fallback: number) => Number.isFinite(value) ? Math.max(1, Math.floor(value!)) : fallback;
 		const remoteSearch = async (id: string, command: string, signal?: AbortSignal, noMatches = false) => {
@@ -305,6 +376,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		watching?.abort();
+		watching = undefined;
 		serve?.close();
 		serve = undefined;
 	});

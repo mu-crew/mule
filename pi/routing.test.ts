@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { muleBinary } from "./binary.ts";
-import { checkedKey, jobKey, loopResources, runJob, workspaceRouter } from "./routing.ts";
+import { checkedKey, jobKey, loopResources, runJob, watchJob, workspaceRouter } from "./routing.ts";
 import { bashJob, MUZZLE_QUEUE_SECS, readOnlyRefusal } from "./policy.ts";
 import { MasterRequired, type WorkspaceOps } from "./ops.ts";
 
@@ -103,7 +103,7 @@ test("job keys: deterministic per session and call, MULE_PI_JOB_PREFIX verbatim,
 
 const finished = (exitCode: number, data: string, extra: { logBytes?: number; cappedAt?: number } = {}) => ({
 	async exec() { return "123abc"; },
-	async poll() { return { state: "done" as const, exitCode, logBytes: extra.logBytes ?? data.length }; },
+	async poll() { return { state: "done" as const, exitCode, logBytes: extra.logBytes ?? data.length, drained: true }; },
 	async output() { return { data: Buffer.from(data), ...(extra.cappedAt === undefined ? {} : { cappedAt: extra.cappedAt }) }; },
 	async kill() { assert.fail("no kill"); },
 }) satisfies Pick<WorkspaceOps, "exec" | "kill" | "output" | "poll">;
@@ -122,6 +122,35 @@ test("mule's output caps are notes after the output, never an exit code", async 
 	assert.deepEqual(await collect(finished(1, "tail\n", { logBytes: 99 })), {
 		exitCode: 1, text: "tail\n[mule: showing the last 5 of 99 log bytes]\n",
 	});
+});
+
+test("a done job's log is read once it has drained, so a cap that lands after rc is not lost", async () => {
+	// rc lands first; a child the command left still writes, and mule's cap
+	// marker comes at the end of the drain.
+	let polls = 0;
+	let reads = 0;
+	const ops = {
+		async exec() { return "123abc"; },
+		async poll() {
+			const drained = ++polls >= 3;
+			return { state: "done" as const, exitCode: 7, logBytes: drained ? 10 : 6, drained };
+		},
+		async output() {
+			reads++;
+			return polls >= 3 ? { data: Buffer.from("early\n0123"), cappedAt: 10 } : { data: Buffer.from("early\n") };
+		},
+		async kill() { assert.fail("no kill"); },
+	} satisfies Pick<WorkspaceOps, "exec" | "kill" | "output" | "poll">;
+	const parts: Buffer[] = [];
+	assert.deepEqual(await runJob(ops, { command: "c", cwd: "/r", key: "k" }, { onData: (d) => parts.push(d) }), { exitCode: 7 });
+	assert.equal(Buffer.concat(parts).toString(), "early\n0123\n[mule: the log reached max_log_bytes (10 bytes); later output was discarded]\n");
+	assert.equal(reads, 1, "one read, after the drain");
+
+	// A log that never drains is not passed off as whole.
+	const stuck = { ...ops, async poll() { return { state: "done" as const, exitCode: 7, logBytes: 6, drained: false }; }, async output() { return { data: Buffer.from("early\n") }; } };
+	const text: Buffer[] = [];
+	assert.deepEqual(await watchJob(stuck, "123abc", { onData: (d) => text.push(d), drainWait: 50 }), { exitCode: 7 });
+	assert.equal(Buffer.concat(text).toString(), "early\n[mule: the command exited 7, but a process it started still holds its output; the log may be incomplete]\n");
 });
 
 test("abort kills the running job; after a handback it leaves the job running for its key", async () => {
@@ -156,6 +185,9 @@ test("read-only bash: readers pass, anything that may write is refused", () => {
 		"cat a.txt", "ls -la src", "rg -n 'a|b' src", "grep -c x a 2>/dev/null", "git log --oneline -5 | head -3",
 		"git -C sub diff --stat", "cd src && ls", "find . -name '*.ts' -type f", "sed -n 1,5p a", "awk '{print $1}' a",
 		"wc -l a; echo done", "true", "cat a >/dev/null 2>&1", "echo \"a > b\"", "fd -e ts", "sort a | uniq -c",
+		"sed -n '/err/p; 3q' a", "sed -E 's/(a|b)+/x/g' a", "sed -e '1d' -e 's|/|:|2' a", "sed ':a;N;$!ba;s/\\n/ /g' a",
+		"sed -n '/^start/,/^end/{/x/p}' a", "awk -F: '$3 > 100 {print $1}' /etc/passwd", "awk '/a|b/ {n++} END {print n}' a",
+		"awk -v x=1 'NR > x' a", "awk '{print \"a > b\", $2}' a", "uniq -c a", "xxd -l 64 a", "tree -L 2", "git grep -n x",
 	]) assert.equal(readOnlyRefusal(command), undefined, command);
 	for (const [command, why] of [
 		["echo x > a", /redirection/], ["echo x >> a", /redirection/], ["cat a | tee b", /tee/], ["rm -rf src", /rm/],
@@ -163,7 +195,14 @@ test("read-only bash: readers pass, anything that may write is refused", () => {
 		["fd -x rm", /fd/], ["sort -o a a", /sort -o/], ["git commit -m x", /git commit/], ["git push", /git push/],
 		["git -C . checkout main", /git checkout/], ["git diff --output=x", /output/], ["awk 'BEGIN{system(\"rm a\")}'", /awk/],
 		["echo $(rm a)", /substitution/], ["echo `rm a`", /substitution/], ["echo \"$(rm a)\"", /substitution/],
-		["cat <<EOF\nx\nEOF", /heredoc/], ["diff <(ls) a", /process substitution/], ["X=1 ls", /assignment/],
+		["cat <<EOF\nx\nEOF", /heredoc/], ["sed -n 'w report.txt' a", /sed writing/],
+		["sed 's/a/b/w out' a", /sed writing/], ["sed '1e date' a", /sed writing/], ["sed -n '/x/W out' a", /sed writing/],
+		["sed -f script.sed a", /sed option/], ["sed --in-place=.bak s/a/b/ a", /sed -i/], ["sed '1r other' a", /sed command/],
+		["awk '{print > \"out\"}' a", /awk writing/], ["awk '{print $1 >> \"out\"}' a", /awk writing/],
+		["awk '{printf \"%s\\n\", $1 > \"out\"}' a", /awk writing/], ["awk '{print | \"sh\"}' a", /awk piping/],
+		["awk '{\"date\" | getline d}' a", /awk/], ["awk -f prog.awk a", /awk option/], ["awk -i inplace '{print}' a", /awk option/],
+		["uniq a out", /output file/], ["xxd a out", /output file/], ["tree -o out", /tree -o/], ["rg --pre ./run x", /preprocessor/],
+		["git -c core.pager=sh log", /git -c/], ["git grep -O x", /pager/], ["diff <(ls) a", /process substitution/], ["X=1 ls", /assignment/],
 		["bash -c 'rm a'", /bash/], ["npm test", /npm/], ["make", /make/], ["ls; python3 x.py", /python3/],
 		["echo 'unterminated", /quote/], ["ls && (( x = 1 ))", /arithmetic/], ["xargs rm < list", /xargs/],
 	] as const) assert.match(readOnlyRefusal(command) ?? "allowed", why, command);
@@ -176,8 +215,9 @@ test("bash jobs: plain without a muzzle; with one, heavy commands queue and the 
 	assert.equal(job.timeout, 10 + MUZZLE_QUEUE_SECS + 30);
 	assert.match(job.command, /^c='it'\\''s heavy'\nm='\/opt\/m z\/muzzle'\n/);
 	assert.match(job.command, /exec "\$m" run --rule="\$r" --slots "\$\{BASH_REMATCH\[1\]\}" --timeout 900 --run-timeout 10 -- bash -c "\$c"/);
-	assert.match(job.command, /exec timeout 10 bash -c "\$c"; fi\nexec bash -c "\$c"$/);
+	// Light: timeout's own process group is killed on the hangup mule kill sends.
+	assert.match(job.command, /trap '\[ -n "\$p" \] && kill -KILL -- -"\$p" "\$p" 2>\/dev\/null; exit 129' HUP TERM INT\n  timeout 10 bash -c "\$c" & p=\$!\n  wait "\$p"; exit\nfi\nexec bash -c "\$c"$/);
 	const untimed = bashJob("x", { muzzle: "/m" });
 	assert.equal(untimed.timeout, undefined);
-	assert.doesNotMatch(untimed.command, /run-timeout|exec timeout/);
+	assert.doesNotMatch(untimed.command, /run-timeout|command -v timeout/);
 });

@@ -80,6 +80,14 @@ struct PollJson {
     rc: Option<i32>,
     runtime_secs: Option<u64>,
     log_size: Option<u64>,
+    /// `done` only: whether the job's session has ended. `rc` is written by
+    /// the left end of the log pipeline, so it can land while a process the
+    /// command left behind still writes the log and before the `truncated`
+    /// marker exists. Only `drained: true` says the log and that marker are
+    /// final -- exec waits on the same gap, and Pi's bash showed a capped job
+    /// as uncapped with an empty log without it (review, 2026-11-23).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drained: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
 }
@@ -920,7 +928,12 @@ fn poll_json_verdict(
     quiet: bool,
 ) -> Result<i32> {
     let json = match &probed {
-        Ok(result) => poll_json(&result.state, result.runtime_secs, result.log_size),
+        Ok(result) => poll_json(
+            &result.state,
+            result.runtime_secs,
+            result.log_size,
+            result.alive,
+        ),
         Err(error) => poll_json_unknown(&format!("{error:#}")),
     };
     println!("{json}");
@@ -936,7 +949,7 @@ fn poll_json_verdict(
     Ok(0)
 }
 
-fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String {
+fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64, alive: bool) -> String {
     let (state, rc) = match state {
         State::Running => ("running", None),
         State::Done(code) => ("done", Some(*code)),
@@ -948,6 +961,7 @@ fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String 
                 rc: None,
                 runtime_secs: None,
                 log_size: None,
+                drained: None,
                 reason: None,
             })
             .expect("poll json is numbers and static strings");
@@ -958,6 +972,7 @@ fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64) -> String 
         rc,
         runtime_secs,
         log_size: Some(log_size),
+        drained: (state == "done").then_some(!alive),
         reason: None,
     })
     .expect("poll json is numbers and static strings")
@@ -969,6 +984,7 @@ fn poll_json_unknown(reason: &str) -> String {
         rc: None,
         runtime_secs: None,
         log_size: None,
+        drained: None,
         reason: Some(reason.to_string()),
     })
     .expect("poll json is numbers and strings")
@@ -1960,15 +1976,19 @@ mod tests {
         // regress the moment a string needed escaping. serde is the contract
         // the other emitters already use.
         assert_eq!(
-            poll_json(&State::Running, Some(7), 12),
+            poll_json(&State::Running, Some(7), 12, true),
             r#"{"state":"running","rc":null,"runtime_secs":7,"log_size":12}"#
         );
         assert_eq!(
-            poll_json(&State::Done(5), Some(3), 0),
-            r#"{"state":"done","rc":5,"runtime_secs":3,"log_size":0}"#
+            poll_json(&State::Done(5), Some(3), 0, false),
+            r#"{"state":"done","rc":5,"runtime_secs":3,"log_size":0,"drained":true}"#
         );
         assert_eq!(
-            poll_json(&State::Orphan, None, 99),
+            poll_json(&State::Done(7), Some(1), 4, true),
+            r#"{"state":"done","rc":7,"runtime_secs":1,"log_size":4,"drained":false}"#
+        );
+        assert_eq!(
+            poll_json(&State::Orphan, None, 99, false),
             r#"{"state":"orphan","rc":null,"runtime_secs":null,"log_size":99}"#
         );
     }

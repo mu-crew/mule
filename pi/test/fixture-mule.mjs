@@ -39,7 +39,13 @@ if (verb === "exec") {
 	const job = join(dir, "jobs", id);
 	mkdirSync(job, { recursive: true });
 	if (key) writeFileSync(join(dir, "keys", key), id);
-	const child = spawn("/bin/sh", ["-c", '/bin/sh -c "$1" >"$2/log" 2>&1; echo $? >"$2/rc.tmp"; mv "$2/rc.tmp" "$2/rc"', "sh", args.at(-1), job], {
+	// mule's pipeline: the left end writes rc when the command exits, the
+	// right end caps the log and marks a cap only when every writer is gone,
+	// so rc can land before the log is final (poll's `drained`).
+	const max = existsSync(join(dir, "max_log")) ? readFileSync(join(dir, "max_log"), "utf8").trim() : "1000000000000";
+	writeFileSync(join(job, "max"), max);
+	const child = spawn("/bin/sh", ["-c", `{ /bin/sh -c "$1" 2>&1; echo $? >"$2/rc.tmp"; mv "$2/rc.tmp" "$2/rc"; } | {
+head -c "$3" >"$2/log"; cat >"$2/.overflow"; if [ -s "$2/.overflow" ]; then echo 1 >"$2/truncated"; fi; rm -f "$2/.overflow"; : >"$2/drained"; }`, "sh", args.at(-1), job, max], {
 		cwd: flag("--cwd") ?? join(dir, "remote [root]"), detached: true, stdio: "ignore",
 	});
 	writeFileSync(join(job, "pid"), String(child.pid));
@@ -50,26 +56,38 @@ if (verb === "exec") {
 } else if (verb === "poll") {
 	const job = join(dir, "jobs", args[0]);
 	if (!existsSync(job)) process.exit(99);
+	// Drained read before rc, as mule reads `alive` before `rc`.
+	const drained = existsSync(join(job, "drained"));
 	const rc = existsSync(join(job, "rc")) ? Number(readFileSync(join(job, "rc"), "utf8")) : null;
 	const size = existsSync(join(job, "log")) ? statSync(join(job, "log")).size : 0;
-	const max = existsSync(join(dir, "max_log")) ? Number(readFileSync(join(dir, "max_log"), "utf8")) : Infinity;
-	process.stdout.write(JSON.stringify(rc === null ? { state: "running", rc: null, log_size: Math.min(size, max) } : { state: "done", rc, log_size: Math.min(size, max) }));
+	process.stdout.write(JSON.stringify(rc === null ? { state: "running", rc: null, log_size: size } : { state: "done", rc, log_size: size, drained }));
 } else if (verb === "tail") {
 	const job = join(dir, "jobs", args[0]);
 	if (!existsSync(job)) process.exit(99);
 	// mule's caps: the log stops at max_log_bytes (noted on stderr) and one
 	// tail reads its last 64 KiB.
-	const max = existsSync(join(dir, "max_log")) ? Number(readFileSync(join(dir, "max_log"), "utf8")) : Infinity;
-	const log = readFileSync(join(job, "log"));
-	const kept = log.subarray(0, Math.min(log.length, max));
-	process.stdout.write(kept.subarray(Math.max(0, kept.length - 65536)));
-	if (log.length > max) console.error(`mule: log was capped at ${max} bytes; the job ran to completion but later output was discarded`);
+	const log = existsSync(join(job, "log")) ? readFileSync(join(job, "log")) : Buffer.alloc(0);
+	process.stdout.write(log.subarray(Math.max(0, log.length - 65536)));
+	if (existsSync(join(job, "truncated"))) console.error(`mule: log was capped at ${readFileSync(join(job, "max"), "utf8")} bytes; the job ran to completion but later output was discarded`);
 } else if (verb === "kill") {
 	const job = join(dir, "jobs", args[0]);
 	if (!existsSync(job)) process.exit(99);
 	appendFileSync(join(dir, "killed"), `${args[0]}\n`);
-	try { process.kill(-Number(readFileSync(join(job, "pid"), "utf8")), "SIGKILL"); } catch { /* already done */ }
 	if (!existsSync(join(job, "rc"))) writeFileSync(join(job, "rc"), "137");
+	// tmux kill-session hangs up the pane: SIGHUP to its process group, and
+	// nothing more. A group the job made for itself (GNU timeout's) is not
+	// signalled. The SIGKILL after it only clears what ignored the hangup.
+	const group = -Number(readFileSync(join(job, "pid"), "utf8"));
+	try { process.kill(group, "SIGHUP"); } catch { /* already done */ }
+	for (let i = 0; i < 50; i++) {
+		try { process.kill(group, 0); } catch { break; }
+		spawnSync("sleep", ["0.02"]);
+	}
+	try { process.kill(group, "SIGKILL"); } catch { /* gone */ }
+	writeFileSync(join(job, "drained"), "");
+} else if (verb === "lookup") {
+	const key = join(dir, "keys", args[0]);
+	console.log(JSON.stringify(existsSync(key) ? readFileSync(key, "utf8") : null));
 } else if (verb === "serve") {
 	// The reply shapes of mule serve's read, stat and write, run locally.
 	// Real serve is exercised against sshd by the loopback test.
