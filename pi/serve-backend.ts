@@ -44,6 +44,7 @@ export class MuleServeBackend implements WorkspaceOps {
 	}
 
 	resolveRoot(cwd?: string) { return this.jobs.resolveRoot(cwd); }
+	probe(cwd?: string, muzzle?: string) { return this.jobs.probe(cwd, muzzle); }
 
 	// The child is per caller and lives only as long as it is needed: a
 	// dropped master ends it (exit 3) and the next op starts a fresh one.

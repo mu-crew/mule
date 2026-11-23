@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,7 +25,7 @@ export function runPiCase(name: string, setup?: (dir: string) => Record<string, 
 			PATH: `${dir}:${process.env.PATH}`, HOME: join(dir, "home"), PI_CODING_AGENT_DIR: join(dir, "agent"),
 			XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"),
 			LC_ALL: "C", PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1",
-			MULE_PI_BIN: bin, MULE_TOOL_TEST_DIR: dir, MULE_TOOL_TEST_CASE: name,
+			MULE_PI_BIN: bin, MULE_TOOL_TEST_DIR: dir, MULE_TOOL_TEST_CASE: name, MULE_PI_MUZZLE: "off",
 			...setup?.(dir),
 		};
 		return spawnSync(pi, ["--mode", "rpc", "--no-session", "--no-extensions", "--no-skills",
@@ -33,6 +33,10 @@ export function runPiCase(name: string, setup?: (dir: string) => Record<string, 
 			cwd: dir, encoding: "utf8", timeout: 60_000, killSignal: "SIGKILL", env,
 		});
 	} finally {
+		// The fixture's jobs are detached; none may outlive the case.
+		for (const job of existsSync(join(dir, "jobs")) ? readdirSync(join(dir, "jobs")) : []) {
+			try { process.kill(-Number(readFileSync(join(dir, "jobs", job, "pid"), "utf8")), "SIGKILL"); } catch { /* finished */ }
+		}
 		rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
 	}
 }

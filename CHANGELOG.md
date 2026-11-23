@@ -33,6 +33,18 @@
   into the system prompt and the status line shows `host:root`. `mu`,
   `mu_delegate`, skills and the loop's own files stay local. The extension
   uses the binary from its own package, never one on `PATH`. Off by default.
+- **Pi workspace policy.** Esc on a running remote command stops it with
+  `mule kill`; a cancelled file op is cancelled alone. Each detached tool job
+  is keyed by session and tool call, so a replayed call reattaches instead of
+  running twice; `MULE_PI_JOB_PREFIX` prefixes every key so mu can find a
+  worker's jobs with `mule ls --key-prefix`. mule's exit 3 stops the turn
+  and tells the user once (`HANDBACK`), without retrying or killing jobs
+  through the missing master; the next call reconnects. `--mule-role
+  read-only` (or `MULE_PI_ROLE`) hides `write` and `edit` and runs only
+  known read-only bash. Heavy bash queues on the host's `muzzle` when it
+  has one (`MULE_PI_MUZZLE` to pin or turn it off), with the Pi timeout
+  counted from admission. A log cut at `max_log_bytes` or a tail clipped at
+  64 KiB is a note after the output; a command's own 3 or 7 is its result.
 
 ## [0.6.0] — 2026-11-23
 

@@ -78,7 +78,55 @@ Detached commands use keyed dispatch and `poll --json`. Repeating the same
 session/tool-call ID reattaches; a new call (including a new `!` invocation)
 gets a new key. Completed commands return the bounded tail, not live output.
 Keyed artifacts are retained by mule until explicitly removed.
-Role/admission policy is separate work.
+
+## Policy
+
+- **Cancellation.** Esc (a tool abort) on `bash`, `grep`, `find`, `ls` or
+  `!` waits for the dispatch answer, then stops exactly that job with
+  `mule kill`. An abort before dispatch starts nothing. A cancelled file op
+  is cancelled alone in serve (queued: dropped; in flight: killed), and the
+  serve child keeps serving.
+- **Reattach.** A job's key is a hash of the Pi session id and the tool
+  call id, so a restarted Pi that replays a call gets the job already
+  running, or its result, instead of running it again. With
+  `MULE_PI_JOB_PREFIX` set, it is prepended verbatim to every detached job
+  key, so mu can find and stop a worker's jobs with `mule ls --key-prefix`
+  across Pi sessions. A prefix that would make an invalid key (more than
+  128 characters, or outside `A-Z a-z 0-9 . _ -`) fails the call before
+  anything runs.
+- **Handback (mule's exit 3).** Only mule's own 3 is a handback: file ops
+  use `exec --strict-codes` (a script's 3 comes back as 8), and a detached
+  job's code is the `rc` in `poll --json`. On a handback the extension
+  stops the turn (`ctx.abort()`), notifies the user once with the master
+  command, shows `SSH master down` in the footer, and returns a `HANDBACK:`
+  error telling the model not to retry. Jobs the stopped turn was waiting
+  on are left running on the host (a kill could not reach them) and keep
+  their keys. Nothing retries in a loop; the first tool call after the
+  user's next message reconnects.
+- **Read-only role.** mu records `--role read-only` but does not pass it to
+  the pane, so the pane's command carries it: `--mule-role read-only`, else
+  `MULE_PI_ROLE=read-only`, else a `"muleRole"` setting. An unknown value
+  runs read-only. `write` and `edit` are hidden and refuse if called; the
+  agent's `bash` runs only commands whose every simple command is a known
+  reader (`cat`, `rg`, `git log`/`diff`/`show`/`status`, `find` without
+  `-exec`/`-delete`, `sed` without `-i`, ...) with no output redirection
+  other than to `/dev/null` and no command substitution. This guards
+  against accidents; like mu's role it is not a security boundary. `!` is
+  the user's own command and is not filtered.
+- **muzzle.** The root probe also looks for `muzzle` on the jobs' `PATH`
+  (one round trip, at startup). When found, each `bash` job asks the
+  host's `muzzle wrap` whether the command is heavy and, if so, runs it
+  under `muzzle run --rule R --slots N --timeout 900`, with Pi's timeout as
+  `--run-timeout` (counted from admission) and mule's deadline widened to
+  timeout + 930 s as a backstop; a light command keeps Pi's timeout via
+  `timeout(1)`. A muzzle that is gone or answers nothing usable runs the
+  command unwrapped. `MULE_PI_MUZZLE=off` skips it; an absolute path pins it.
+- **Output caps.** A `bash` result is the last 64 KiB of the job's log.
+  When the job outran `max_log_bytes` (`mule tail` says so on stderr), or
+  the log is longer than that tail, a `[mule: ...]` note follows the
+  output, where Pi's own tail truncation keeps it. A command's own exit 7
+  (or 3) is its result. For file ops, exec's 7 means mule cut the output;
+  a file-op script's own 7 is reported as 1, so the two cannot be confused.
 
 `npm pack ./npm/mule` copies this directory's runtime files (not tests)
 into the package first (`scripts/npm-pi.js`, the package's `prepack`).

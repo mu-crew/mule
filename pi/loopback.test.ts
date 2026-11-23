@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
 import { join } from "node:path";
 import test from "node:test";
 import { MuleExecBackend, quote } from "./exec-backend.ts";
 import { MasterRequired } from "./ops.ts";
-import { loopResources, runJob, workspaceRouter } from "./routing.ts";
+import { bashJob } from "./policy.ts";
+import { jobKey, loopResources, runJob, workspaceRouter } from "./routing.ts";
 import { MuleServeBackend } from "./serve-backend.ts";
 import { havePi, runPiCase } from "./test/run-pi.ts";
 
@@ -80,6 +83,80 @@ test("workspace ops work over one capped SSH master", { skip: noFixture, timeout
 		const config = readFileSync(limited, "utf8").replace("max_log_bytes = 10\n", "");
 		writeFileSync(limited, config);
 	}
+});
+
+test("policy over one capped master: kill, reattach, key prefix, caps, own exit codes, muzzle", { skip: noFixture, timeout: 60_000 }, async () => {
+	const root = join(fixture!, "policy");
+	mkdirSync(root, { recursive: true });
+	const ops = backend();
+	const collect = async (request: Parameters<typeof ops.exec>[0]) => {
+		const parts: Buffer[] = [];
+		const result = await runJob(ops, request, { onData: (data) => parts.push(data) });
+		return { ...result, text: Buffer.concat(parts).toString() };
+	};
+
+	// Reattach: the same key is the same job, so a replay never runs twice.
+	const once = { cwd: root, key: "pi-loopback-once", command: "echo ran >> count; echo answer" };
+	assert.deepEqual(await collect(once), { exitCode: 0, text: "answer\n" });
+	assert.deepEqual(await collect(once), { exitCode: 0, text: "answer\n" });
+	assert.equal(readFileSync(join(root, "count"), "utf8"), "ran\n");
+
+	// MULE_PI_JOB_PREFIX's contract: mu finds a worker's jobs by key prefix.
+	const key = jobKey("session", "call", "mu.loopback.1.");
+	const prefixed = await ops.exec({ cwd: root, key, command: "true" });
+	const listed = execFileSync(process.env.MULE_PI_TEST_BIN!, ["--quiet", "--config", process.env.MULE_PI_TEST_CONFIG!, "ls", "--host", "live", "--key-prefix", "mu.loopback.1.", "--json"]).toString();
+	assert.ok(listed.includes(key) && listed.includes(prefixed), listed);
+
+	// Abort: `mule kill` stops the job; nothing of it runs on.
+	const controller = new AbortController();
+	const marker = "sleep 20.4321";
+	const running = runJob(ops, { cwd: root, key: "pi-loopback-kill", command: `touch started; ${marker}; touch finished` }, { signal: controller.signal, onData: () => {} });
+	for (let i = 0; i < 400 && !existsSync(join(root, "started")); i++) await delay(25);
+	assert.ok(existsSync(join(root, "started")));
+	const before = mark();
+	controller.abort();
+	await assert.rejects(running, /aborted/);
+	assert.match(verbs(before), /^kill$/m);
+	await delay(500);
+	assert.ok(!existsSync(join(root, "finished")));
+	assert.notEqual(spawnSync("pgrep", ["-f", marker]).status, 0, "no process of the killed job is left");
+
+	// A command's own 3 and 7 are results, never a handback or a partial answer.
+	assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-own", command: "echo own; exit 3" }), { exitCode: 3, text: "own\n" });
+	assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-seven", command: "echo seven; exit 7" }), { exitCode: 7, text: "seven\n" });
+	for (const code of [3, 7]) {
+		await assert.rejects(ops.command(`exit ${code}`), (error) => !(error instanceof MasterRequired) && !/incomplete/.test(String(error)) && /mule exec failed/.test(String(error)), `exec ${code}`);
+	}
+
+	// mule's cap on a detached log is a note, beside the command's own code.
+	const config = process.env.MULE_PI_TEST_CONFIG!;
+	appendFileSync(config, "max_log_bytes = 10\n");
+	try {
+		assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-capped", command: "printf 0123456789abcdef; exit 7" }), {
+			exitCode: 7, text: "0123456789\n[mule: the log reached max_log_bytes (10 bytes); later output was discarded]\n",
+		});
+	} finally {
+		writeFileSync(config, readFileSync(config, "utf8").replace("max_log_bytes = 10\n", ""));
+	}
+
+	// The host's muzzle: found in the root probe, heavy commands queue there.
+	const fake = join(root, "fake muzzle");
+	writeFileSync(fake, `#!/bin/bash
+echo "$*" >> ${quote(join(root, "muzzle-calls"))}
+case $1 in
+  wrap) if [[ \${@: -1} == *HEAVY* ]]; then echo '{"command":"x","rule":"fake-heavy","slots":2}'; else echo '{"command":null}'; fi ;;
+  run) while [ "$1" != -- ]; do shift; done; shift; echo "muzzle: admitted (fake)"; exec "$@" ;;
+esac
+`, { mode: 0o755 });
+	assert.deepEqual(await ops.probe(root, fake), { root, muzzle: fake });
+	assert.deepEqual(await ops.probe(root, "off"), { root, muzzle: undefined });
+	assert.deepEqual(await ops.probe(root, join(root, "absent")), { root, muzzle: undefined });
+	const heavy = bashJob("echo HEAVY", { muzzle: fake, timeout: 5 });
+	assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-heavy", ...heavy }), { exitCode: 0, text: "muzzle: admitted (fake)\nHEAVY\n" });
+	assert.match(readFileSync(join(root, "muzzle-calls"), "utf8"), /^run --rule=fake-heavy --slots 2 --timeout 900 --run-timeout 5 -- bash -c echo HEAVY$/m);
+	const light = bashJob("echo light; exit 3", { muzzle: fake, timeout: 5 });
+	assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-light", ...light }), { exitCode: 3, text: "light\n" });
+	assert.equal(readFileSync(join(root, "muzzle-calls"), "utf8").match(/^run /gm)?.length, 1);
 });
 
 test("no-master is a handback, not an empty successful batch or a retry", { skip: !process.env.MULE_PI_TEST_NO_MASTER }, async () => {

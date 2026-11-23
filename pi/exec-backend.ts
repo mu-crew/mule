@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { isAbsolute, posix } from "node:path";
-import { MasterRequired, MAX_FILE_BYTES, READ_PAGE_BYTES, type FileKind, type JobState, type WorkspaceOps } from "./ops.ts";
+import { MasterRequired, MAX_FILE_BYTES, READ_PAGE_BYTES, type FileKind, type JobOutput, type JobState, type WorkspaceOps } from "./ops.ts";
 
 export const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 // mule base64-wraps the script and caps the full dispatch at 112 KiB. Leave
@@ -61,10 +61,16 @@ export class MuleExecBackend implements WorkspaceOps {
 	}
 
 	#call(verb: string, args: string[], budget = 128 * 1024): Promise<Buffer> {
+		return this.#run(verb, args, budget).then(({ stdout }) => stdout);
+	}
+
+	#run(verb: string, args: string[], budget = 128 * 1024): Promise<{ stdout: Buffer; stderr: string }> {
 		return new Promise((resolve, reject) => {
 			execFile(this.#bin, ["--quiet", ...(this.#config ? ["--config", this.#config] : []), verb, "--host", this.#host, ...args],
 				{ encoding: "buffer", maxBuffer: budget }, (error, stdout, stderr) => {
-					if (!error) resolve(stdout);
+					// With --strict-codes (exec) or a detached verb, 3 is only ever
+					// mule's own: a job's 3 arrives as 8, or as `rc` in poll's JSON.
+					if (!error) resolve({ stdout, stderr: stderr.toString() });
 					else if (error.code === 3) reject(new MasterRequired(stderr.toString().trim() || "Mule needs an operator to open its SSH master"));
 					else if (verb === "exec" && error.code === 7) reject(new Error("Mule file-op output incomplete (exit 7)"));
 					else {
@@ -76,17 +82,35 @@ export class MuleExecBackend implements WorkspaceOps {
 	}
 
 	#fixed(script: string, cwd: string | null = "/") {
-		if (Buffer.byteLength(script) + Buffer.byteLength(cwd ?? "") > SCRIPT_BYTES) throw new Error("File operation exceeds dispatch budget");
-		return this.#call("exec", ["--strict-codes", "--max-secs", String(FILE_OP_SECONDS), ...(cwd ? ["--cwd", cwd] : []), "--", script], BATCH_OUTPUT_BYTES + 4096);
+		// exec's 7 means mule cut the output. Keep it that: a script's own 7
+		// leaves as 1, so a partial answer can never pass for a script error
+		// and no script error can pass for a partial answer.
+		const guarded = `(\n${script}\n)\nrc=$?; [ "$rc" -eq 7 ] && rc=1; exit "$rc"`;
+		if (Buffer.byteLength(guarded) + Buffer.byteLength(cwd ?? "") > SCRIPT_BYTES) throw new Error("File operation exceeds dispatch budget");
+		return this.#call("exec", ["--strict-codes", "--max-secs", String(FILE_OP_SECONDS), ...(cwd ? ["--cwd", cwd] : []), "--", guarded], BATCH_OUTPUT_BYTES + 4096);
 	}
 
 	/** A short fixed script on the host, its output discarded. */
 	async command(script: string) { await this.#fixed(script); }
 
 	async resolveRoot(cwd?: string) {
-		const out = (await this.#fixed("pwd -P", cwd ?? null)).toString().replace(/\n$/, "");
-		if (!out.startsWith("/") || /[\x00-\x1f\x7f]/.test(out)) throw new Error("Invalid remote workspace root");
-		return out;
+		return (await this.probe(cwd, "off")).root;
+	}
+
+	/**
+	 * The workspace root and, in the same round trip, the host's muzzle: an
+	 * absolute path the jobs will run, or undefined. `muzzle` is "off", an
+	 * absolute path to check, or undefined to look it up on the jobs' PATH.
+	 */
+	async probe(cwd?: string, muzzle?: string) {
+		if (muzzle !== undefined && muzzle !== "off" && !muzzle.startsWith("/")) throw new Error("MULE_PI_MUZZLE must be off or an absolute path");
+		const find = muzzle === "off" ? "" : muzzle === undefined
+			? `\nm=$(command -v muzzle 2>/dev/null) && [ -x "$m" ] && printf '%s\\n' "$m"; :`
+			: `\n[ -x ${quote(muzzle)} ] && printf '%s\\n' ${quote(muzzle)}; :`;
+		const [root, found] = (await this.#fixed(`pwd -P${find}`, cwd ?? null)).toString().replace(/\n$/, "").split("\n");
+		const valid = (path?: string) => path !== undefined && path.startsWith("/") && !/[\x00-\x1f\x7f]/.test(path);
+		if (!valid(root)) throw new Error("Invalid remote workspace root");
+		return { root, muzzle: valid(found) ? found : undefined };
 	}
 
 	#submit(script: string, bytes: number, signal?: AbortSignal): Promise<Reply> {
@@ -226,6 +250,12 @@ else printf missing; fi`, 9, signal);
 		throw new Error(`Mule cannot collect job ${job} (${String(status.state)})`);
 	}
 
-	output(job: string) { return this.#call("tail", [job]); }
+	async output(job: string): Promise<JobOutput> {
+		// tail reads the last 64 KiB and says on stderr when the job outran
+		// max_log_bytes. The note is mule's, not the job's: the log is stdout.
+		const { stdout, stderr } = await this.#run("tail", [job]);
+		const capped = /log was capped at (\d+) bytes/.exec(stderr);
+		return { data: stdout, ...(capped ? { cappedAt: Number(capped[1]) } : {}) };
+	}
 	async kill(job: string) { await this.#call("kill", [job]); }
 }

@@ -65,16 +65,38 @@ export function workspaceRouter(cwd: string, root: string, loop: ReturnType<type
 	};
 }
 
-export function jobKey(session: string, invocation: string) {
-	// Both identifiers survive a replay of the same tool call. Hashing keeps the
-	// key valid for mule and avoids putting session paths or commands in it.
-	return `pi-${createHash("sha256").update(JSON.stringify([session, invocation])).digest("hex")}`;
+const KEY = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * mule's idempotency key for one tool call. Both identifiers survive a
+ * replay of the same call, so a restarted Pi that runs it again gets the
+ * job already running (or its result), never a second run. Hashing keeps
+ * the key valid for mule and keeps session paths and commands out of it.
+ *
+ * `prefix` is MULE_PI_JOB_PREFIX, prepended verbatim: mu sets it per worker
+ * so closing the worker can find its outstanding jobs with
+ * `mule ls --key-prefix` across Pi sessions.
+ */
+export function jobKey(session: string, invocation: string, prefix = "") {
+	return checkedKey(prefix, `pi-${createHash("sha256").update(JSON.stringify([session, invocation])).digest("hex")}`);
 }
 
+export function checkedKey(prefix: string, key: string) {
+	if (!KEY.test(prefix + key)) throw new Error(`MULE_PI_JOB_PREFIX makes an invalid mule key: use at most ${128 - key.length} of A-Z a-z 0-9 . _ -`);
+	return prefix + key;
+}
+
+/**
+ * One detached job, start to collected tail. Abort stops exactly this job
+ * with `mule kill` (the dispatch answer is awaited first so the id is
+ * known), unless `handedBack()` says the master is gone: then the job keeps
+ * running on the host, a kill could not reach it anyway, and its key lets
+ * the next call (or mu's close) find it. A handback is never retried here.
+ */
 export async function runJob(ops: Pick<WorkspaceOps, "exec" | "poll" | "output" | "kill">, request: Parameters<WorkspaceOps["exec"]>[0], options: {
-	signal?: AbortSignal; onData: (data: Buffer) => void;
+	signal?: AbortSignal; onData: (data: Buffer) => void; handedBack?: () => boolean;
 }) {
-	const { signal, onData } = options;
+	const { signal, onData, handedBack } = options;
 	if (signal?.aborted) throw new Error("aborted");
 	// Even on abort, collect the dispatch answer so we can stop the exact job.
 	const job = await ops.exec(request);
@@ -84,16 +106,24 @@ export async function runJob(ops: Pick<WorkspaceOps, "exec" | "poll" | "output" 
 			const poll = await ops.poll(job);
 			signal?.throwIfAborted();
 			if (poll.state === "done") {
-				const data = await ops.output(job);
+				const { data, cappedAt } = await ops.output(job);
 				signal?.throwIfAborted();
-				if (poll.logBytes > data.length) onData(Buffer.from("[Remote log clipped; showing its tail]\n"));
+				// mule's caps, reported as text beside the command's own rc: a job
+				// that exits 7 exited 7, and a capped log is not an exit code.
+				// Notes go last: Pi keeps the tail of a long result.
 				onData(data);
+				const end = data.length && data[data.length - 1] !== 10 ? "\n" : "";
+				if (cappedAt !== undefined) onData(Buffer.from(`${end}[mule: the log reached max_log_bytes (${cappedAt} bytes); later output was discarded]\n`));
+				if (poll.logBytes > data.length) onData(Buffer.from(`${cappedAt === undefined ? end : ""}[mule: showing the last ${data.length} of ${poll.logBytes} log bytes]\n`));
 				return { exitCode: poll.exitCode };
 			}
 			await delay(250, undefined, { signal });
 		}
 	} catch (error) {
 		// Don't issue another mule call if a concurrent abort met a handback.
+		if (signal?.aborted && !(error instanceof MasterRequired) && handedBack?.()) {
+			throw new MasterRequired(`mule's SSH master is gone; job ${job} was left running on the host`, { cause: error });
+		}
 		if (signal?.aborted && !(error instanceof MasterRequired)) {
 			await ops.kill(job);
 			throw new Error("aborted", { cause: error });
