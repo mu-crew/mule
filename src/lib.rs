@@ -22,6 +22,7 @@ pub mod lock;
 pub mod probe;
 pub mod remote;
 pub mod run;
+pub mod serve;
 pub mod stopfence;
 pub mod tail;
 pub mod transport;

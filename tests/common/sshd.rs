@@ -225,6 +225,38 @@ impl Sshd {
             .expect("ssh shim failed to spawn")
     }
 
+    /// Does a `true` multiplexed over `socket` succeed within `limit`, with
+    /// no fallback? `ssh_via` is no oracle for a session: when the master
+    /// refuses the channel, ssh prints `Session open refused by peer` and
+    /// opens a fresh authenticated connection with a cap of its own, so it
+    /// returned 0 with the master's only session held (review, 2026-11-22).
+    /// `ProxyCommand=false` makes that fallback fail instead (255 while held,
+    /// 0 once free, measured), and `limit` bounds a stopped master.
+    pub fn mux_true(&self, socket: &Path, limit: std::time::Duration) -> bool {
+        let mut child = Command::new(self.dir.join("ssh"))
+            .arg("-S")
+            .arg(socket)
+            .args(["-o", "BatchMode=yes", "-o", "ProxyCommand=/usr/bin/false"])
+            .args(["127.0.0.1", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ssh shim failed to spawn");
+        let t = std::time::Instant::now();
+        loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                return s.success();
+            }
+            if t.elapsed() > limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Open a control master on `socket` and wait for it to answer.
     pub fn open_master(&self, socket: &Path) -> Master {
         self.open_master_with(socket, &[])

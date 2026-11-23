@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- `mule serve --stdio`: bounded synchronous file ops (read, stat, write,
+  cancel; no arbitrary command) for one caller over JSON lines, one
+  ticket-locked round trip per batch, ~0.35s p50 per op against ~1.5s for
+  `exec`. The batch runs under `/bin/sh` whatever the login shell (zsh
+  aborted it). Every op runs in its own session (a process group without
+  `setsid`) under a 1s remote deadline that kills it whole, children of its
+  host tools in groups of their own (GNU `timeout`'s) included, and
+  whatever an op leaves behind dies when that op ends, not when the batch
+  does; payload, delivery and output (per op and per batch, on disk) are bounded on the
+  host, with a local hard kill behind them that outlives serve itself. A
+  cancel that loses the race to an op's end reports the real result. `write`
+  takes an absolute path and replaces exactly that file, keeping its mode
+  from the moment the new bytes are visible. A host without
+  `timeout`, `base64`, `mktemp`, `sleep`, process groups, or a way to find
+  an op's processes (`pkill -s`, or `ps` and `awk`) fails every op closed.
+  A child of its caller, not a daemon: it exits when stdin closes, and 3 when the master
+  goes. SPEC's invariant 3 gains this as a third class of ssh use; longer
+  work stays a detached job. Cargo feature `serve`, on by default.
+- `Transport::run_with_stdin`: the ticket-locked, refusal-retrying stdin path
+  `serve` rides, so its lock is the transport's like every other verb's.
+
 ## [0.6.0] — 2026-11-23
 
 ### Added

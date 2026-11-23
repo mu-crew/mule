@@ -489,6 +489,20 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Bounded file ops (read, stat, write) for one caller over stdio
+    ///
+    /// JSON lines in, JSON lines out; one locked round trip per batch, every
+    /// op under a hard 1s remote timeout. A child of its caller, not a
+    /// daemon: it exits when stdin closes. No commands: those belong in `run`
+    /// or `exec`. See docs/usage.md for the protocol.
+    #[cfg(feature = "serve")]
+    Serve {
+        #[command(flatten)]
+        host: HostArg,
+        /// Speak JSON lines on stdin/stdout (the only mode)
+        #[arg(long, required = true)]
+        stdio: bool,
+    },
     /// Forward a local unix socket to a remote one over mule's master
     ///
     /// For control-sized traffic only (a ctl socket, RPC). A forward is a
@@ -1191,6 +1205,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 },
                 strict_codes,
             )
+        }
+        #[cfg(feature = "serve")]
+        Commands::Serve { host, stdio: _ } => {
+            crate::serve::run_cli(cfg.host(host.host.as_deref())?)
         }
         Commands::Forward { host, unix } => {
             let host = cfg.host(host.host.as_deref())?;

@@ -157,6 +157,33 @@ pub trait Transport {
     fn run(&self, host: &Host, script: &str) -> Result<Output> {
         run_within(self, host, script, REFUSAL_RECOVERY)
     }
+
+    /// Run a script with a session stdin, WITHOUT the ticket lock: the
+    /// unlocked primitive behind [`Transport::run_with_stdin`].
+    ///
+    /// Same rule as [`Transport::run_unlocked`]: implement it, never call it
+    /// from outside this module. Provided as a refusal so the many
+    /// transports that never carry stdin (test fakes, [`InFlight`]) need no
+    /// change; [`Ssh`] and [`Fake`] implement it.
+    fn run_with_stdin_unlocked(&self, host: &Host, script: &str, feed: &Feed) -> Result<Output> {
+        let _ = (host, script, feed);
+        anyhow::bail!("this transport cannot carry a session's stdin")
+    }
+
+    /// [`Transport::run`] for a session that also carries stdin: a payload,
+    /// then a control stream (`mule serve`'s cancels), bounded locally by
+    /// [`Feed`]. Takes the ticket lock and retries a proven pre-exec refusal
+    /// exactly as `run` does, so the lock stays the transport's, not the
+    /// caller's (SPEC § Contention and fairness).
+    ///
+    /// A retried attempt replays every control line sent so far: a cancel
+    /// written into the refused attempt's stdin would otherwise be lost and
+    /// the op run anyway.
+    fn run_with_stdin(&self, host: &Host, script: &str, feed: &Feed) -> Result<Output> {
+        locked_with_recovery(self, host, REFUSAL_RECOVERY, || {
+            self.run_with_stdin_unlocked(host, script, feed)
+        })
+    }
 }
 
 /// [`Transport::run`] with the refusal-recovery budget as a parameter, so a
@@ -181,10 +208,21 @@ pub fn run_within<T: Transport + ?Sized>(
     script: &str,
     budget: Duration,
 ) -> Result<Output> {
+    locked_with_recovery(t, host, budget, || t.run_unlocked(host, script))
+}
+
+/// The lock and the refusal-recovery loop, shared by every locked method so
+/// the stdin path cannot drift from `run`'s.
+fn locked_with_recovery<T: Transport + ?Sized>(
+    t: &T,
+    host: &Host,
+    budget: Duration,
+    mut attempt: impl FnMut() -> Result<Output>,
+) -> Result<Output> {
     let deadline = Instant::now() + budget;
     let mut backoff = FIRST_BACKOFF;
     loop {
-        let result = crate::lock::with_lock(&host.name, || t.run_unlocked(host, script))?;
+        let result = crate::lock::with_lock(&host.name, &mut attempt)?;
         let refused = matches!(
             result
                 .as_ref()
@@ -338,6 +376,32 @@ impl Transport for Ssh {
         })
     }
 
+    fn run_with_stdin_unlocked(&self, host: &Host, script: &str, feed: &Feed) -> Result<Output> {
+        use std::os::unix::process::CommandExt;
+        let log = SshLog::create()?;
+        // Under a watchdog that outlives this process: see [`WATCHDOG`].
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(WATCHDOG)
+            .arg("mule-watchdog")
+            .arg((feed.kill_after + WATCHDOG_SLACK).as_secs().to_string())
+            .arg("ssh")
+            .arg("-E")
+            .arg(&log.0)
+            .args(run_args(host, script))
+            .process_group(0);
+        let out = spawn_fed(&mut cmd, feed)
+            .with_context(|| format!("ssh with stdin for host {}", host.name))?;
+        let ssh_log = std::fs::read_to_string(&log.0).unwrap_or_default();
+        if let Some(error) = crate::errors::classify_attempt(&ssh_log, &out.stdout, ssh_agent_state)
+        {
+            return Err(error.into());
+        }
+        let mut stderr = out.stderr;
+        stderr.push_str(&ssh_log);
+        Ok(Output { stderr, ..out })
+    }
+
     fn mux_op(&self, host: &Host, op: MuxOp) -> Result<Output> {
         let mut cmd = crate::helper::SSH
             .command()
@@ -374,6 +438,28 @@ impl Transport for Ssh {
     }
 }
 
+/// Runs `$2...` (ssh) and KILLs it `$1` seconds after the start, whatever
+/// becomes of the process that spawned it.
+///
+/// `spawn_fed`'s own kill is a loop in the caller's thread: it died with
+/// `mule serve`, and a session whose caller hung up (stdin EOF, then serve's
+/// exit) or was SIGKILLed lived on past 16s with the only session slot taken
+/// (review, 2026-11-20, local CLI repro). This shell is the session's parent
+/// and in its own process group, so neither serve's death nor a hangup sent
+/// to the caller's group reaches it, and it ignores SIGHUP besides (as ssh
+/// then does). Its timer's stdio is `/dev/null`, so it holds none of the
+/// session's pipes; it is TERMed, and kills its `sleep`, once ssh ends.
+pub const WATCHDOG: &str = "trap '' HUP; n=$1; shift; exec 3<&0\n\
+\"$@\" <&3 3<&- & c=$!\n\
+exec 3<&- < /dev/null\n\
+( sleep \"$n\" & s=$!; trap 'kill $s; exit 0' TERM; wait $s; kill -KILL $c ) \
+< /dev/null > /dev/null 2>&1 & k=$!\n\
+wait $c; r=$?; kill $k 2>/dev/null; exit $r";
+
+/// The watchdog fires this long after `spawn_fed`'s own kill, so in a live
+/// serve the in-process kill, which reports why, always comes first.
+const WATCHDOG_SLACK: Duration = Duration::from_secs(1);
+
 /// Run `cmd` to completion, or kill it at `limit` and return `None`.
 ///
 /// For replies of a few bytes only: the pipes are drained after exit, so an
@@ -399,6 +485,247 @@ fn output_within(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// What a session with stdin carries, and the local bounds on it.
+///
+/// For `mule serve`'s one round trip per batch (SPEC § Bounded synchronous
+/// ops). The remote script bounds the session itself; these are the local
+/// backstops for when the host or the link cannot be trusted to answer.
+pub struct Feed<'a> {
+    /// Written to the session's stdin first.
+    pub payload: &'a [u8],
+    /// Where the session's stdin goes once the payload is written, for
+    /// control lines, until the session ends.
+    pub control: &'a Control,
+    /// Hard local kill, counted from the spawn -- before the payload write.
+    pub kill_after: Duration,
+    /// The session is killed, and the call fails, past this much stdout.
+    pub max_stdout: usize,
+}
+
+/// Bytes of a session's stderr kept; the rest is read and dropped, so a
+/// chatty remote can neither stall the session nor grow this process.
+const MAX_FED_STDERR: usize = 64 << 10;
+
+/// After the session process exits, how long its pipes may take to close.
+/// With ssh multiplexing the master holds the pipe fds, not the client, and
+/// closes them as it tears the channel down; a master that never does must
+/// not hang the caller.
+const FED_DRAIN: Duration = Duration::from_secs(2);
+
+/// A session's stdin after its payload: the control stream of one round trip.
+///
+/// Writes are non-blocking: a control line is a few bytes, below `PIPE_BUF`,
+/// so each write is atomic -- whole or `EAGAIN`, never a torn line that names
+/// the wrong op. One a wedged reader cannot take is dropped rather than
+/// blocking the caller, whose next act on a wedge is the hard kill anyway.
+#[derive(Default)]
+pub struct ControlStream {
+    stdin: Option<std::process::ChildStdin>,
+    /// Bumped by each spawn and each close, so a writer thread that parks
+    /// late (its attempt already over) parks nothing.
+    attempt: u64,
+    /// Every line of this round trip, replayed into a retried attempt.
+    sent: Vec<Vec<u8>>,
+    abandoned: bool,
+}
+
+pub type Control = std::sync::Arc<std::sync::Mutex<ControlStream>>;
+
+impl ControlStream {
+    /// Send one control line to the session in flight, or hold it for the
+    /// session about to start.
+    pub fn send(&mut self, line: &[u8]) {
+        self.sent.push(line.to_vec());
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = std::io::Write::write(stdin, line);
+        }
+    }
+
+    /// Start a new round trip: forget the last one's lines.
+    pub fn reset(&mut self) {
+        self.sent.clear();
+    }
+
+    /// The caller is gone: close the session's stdin now (the remote reads
+    /// EOF as cancel-all) and refuse to start another session.
+    pub fn abandon(&mut self) {
+        self.abandoned = true;
+        self.stdin = None;
+    }
+
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned
+    }
+
+    fn open(&mut self) -> Option<u64> {
+        if self.abandoned {
+            return None;
+        }
+        self.attempt += 1;
+        Some(self.attempt)
+    }
+
+    fn park(&mut self, attempt: u64, stdin: std::process::ChildStdin) {
+        if attempt != self.attempt || self.abandoned {
+            return;
+        }
+        use std::os::fd::AsRawFd;
+        // SAFETY: fcntl on an fd this ChildStdin owns, with no pointers.
+        unsafe {
+            let fd = stdin.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+        let mut stdin = stdin;
+        for line in &self.sent {
+            let _ = std::io::Write::write(&mut stdin, line);
+        }
+        self.stdin = Some(stdin);
+    }
+
+    fn close(&mut self, attempt: u64) {
+        if attempt == self.attempt {
+            self.stdin = None;
+            self.attempt += 1;
+        }
+    }
+}
+
+/// Spawn `cmd` as a session with stdin, bounded by `feed`.
+///
+/// The hard kill is armed at the spawn, before a byte of payload: a payload
+/// write into a session nobody reads blocks, and the prototype started its
+/// clock only after the write, so a wedged link hung it unbounded (course
+/// check #3). The write therefore runs on its own thread, as do both reads;
+/// the calling thread only watches the clock and the stdout bound.
+///
+/// A child that leads its own process group is killed as a group: ssh's
+/// [`WATCHDOG`] parent with its timer, or a local `sh` standing in for ssh
+/// (tests) with its background jobs.
+#[doc(hidden)]
+pub fn spawn_fed(cmd: &mut Command, feed: &Feed) -> Result<Output> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    let attempt = feed
+        .control
+        .lock()
+        .unwrap()
+        .open()
+        .ok_or_else(|| anyhow::anyhow!("not started: the caller is gone"))?;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning a session with stdin")?;
+    let deadline = Instant::now() + feed.kill_after;
+    let mut stdin = child.stdin.take().expect("piped");
+    let mut so = child.stdout.take().expect("piped");
+    let mut se = child.stderr.take().expect("piped");
+    let overflow = Arc::new(AtomicBool::new(false));
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    let (wrote_tx, wrote_rx) = mpsc::channel();
+    {
+        let (overflow, max) = (overflow.clone(), feed.max_stdout);
+        std::thread::spawn(move || {
+            let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 64 << 10]);
+            loop {
+                match so.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) if buf.len() + n > max => {
+                        overflow.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = out_tx.send(buf);
+        });
+    }
+    std::thread::spawn(move || {
+        let (mut buf, mut chunk) = (Vec::new(), vec![0u8; 16 << 10]);
+        while let Ok(n) = se.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            let keep = n.min(MAX_FED_STDERR.saturating_sub(buf.len()));
+            buf.extend_from_slice(&chunk[..keep]);
+        }
+        let _ = err_tx.send(buf);
+    });
+    {
+        // Owned copies: the writer may outlive this call, blocked on a pipe a
+        // wedged master still holds, and must borrow nothing from it.
+        let payload: Arc<[u8]> = feed.payload.into();
+        let control = feed.control.clone();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+            let _ = stdin.flush();
+            control.lock().unwrap().park(attempt, stdin);
+            let _ = wrote_tx.send(());
+        });
+    }
+    let pid = child.id() as libc::pid_t;
+    let kill = |child: &mut std::process::Child| {
+        // SAFETY: getpgid/kill take plain integers.
+        if unsafe { libc::getpgid(pid) } == pid {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+        let _ = child.kill();
+    };
+    let (mut killed, mut too_big) = (false, false);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if overflow.load(Ordering::SeqCst) {
+            too_big = true;
+            kill(&mut child);
+            break child.wait()?;
+        }
+        if Instant::now() >= deadline {
+            killed = true;
+            kill(&mut child);
+            break child.wait()?;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let drain = Instant::now() + FED_DRAIN;
+    let left = || drain.saturating_duration_since(Instant::now());
+    // The writer first, then the close: a park that lands after the close
+    // would leave the control stream open on a finished session.
+    let _ = wrote_rx.recv_timeout(left());
+    feed.control.lock().unwrap().close(attempt);
+    let stdout = out_rx.recv_timeout(left());
+    let stderr = err_rx.recv_timeout(left()).unwrap_or_default();
+    if too_big || overflow.load(Ordering::SeqCst) {
+        anyhow::bail!("session output passed {} bytes; killed it", feed.max_stdout);
+    }
+    if killed {
+        anyhow::bail!(
+            "session killed after {}s: the host or the link is wedged",
+            feed.kill_after.as_secs()
+        );
+    }
+    let Ok(stdout) = stdout else {
+        anyhow::bail!(
+            "session output did not close {}s after exit",
+            FED_DRAIN.as_secs()
+        );
+    };
+    Ok(Output {
+        stdout,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        code: status.code().unwrap_or(-1),
+    })
 }
 
 /// One call's private `ssh -E` file, removed on drop.
@@ -666,6 +993,7 @@ impl Stopper {
 /// logic is actually verified.
 pub struct Fake {
     scripts: std::sync::Mutex<Vec<String>>,
+    payloads: std::sync::Mutex<Vec<Vec<u8>>>,
     outputs: std::sync::Mutex<std::collections::VecDeque<Output>>,
     mux_ops: std::sync::Mutex<Vec<MuxOp>>,
     mux_outputs: std::sync::Mutex<std::collections::VecDeque<Output>>,
@@ -694,6 +1022,7 @@ impl Default for Fake {
     fn default() -> Self {
         Self {
             scripts: Default::default(),
+            payloads: Default::default(),
             outputs: Default::default(),
             mux_ops: Default::default(),
             mux_outputs: Default::default(),
@@ -759,6 +1088,11 @@ impl Fake {
         self.scripts.lock().unwrap().clone()
     }
 
+    /// Every payload handed to `run_with_stdin`, in order.
+    pub fn payloads(&self) -> Vec<Vec<u8>> {
+        self.payloads.lock().unwrap().clone()
+    }
+
     /// Every mux op, in order, `Check` included. The assertion surface for
     /// forward sequencing.
     pub fn mux_ops(&self) -> Vec<MuxOp> {
@@ -775,6 +1109,13 @@ impl Transport for Fake {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Output::ok("")))
+    }
+
+    /// Records the script and the payload; the control stream is never
+    /// opened, since nothing reads it.
+    fn run_with_stdin_unlocked(&self, host: &Host, script: &str, feed: &Feed) -> Result<Output> {
+        self.payloads.lock().unwrap().push(feed.payload.to_vec());
+        self.run_unlocked(host, script)
     }
 
     fn mux_op(&self, _host: &Host, op: MuxOp) -> Result<Output> {

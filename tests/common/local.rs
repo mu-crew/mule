@@ -66,6 +66,44 @@ pub fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+/// A FIFO nobody writes: an op's `head` of it blocks in `open` until
+/// something kills the op, which stands in for a slow host op.
+///
+/// Dropped, it releases any reader still blocked and removes the name, so a
+/// test that fails before the op is killed leaves nothing behind. Without
+/// that, a reader in an op's own session outlived the test: the test's group
+/// kill does not reach it, and unlinking the FIFO, killing serve or closing
+/// the master do not end an `open` already blocked (review, 2026-11-22: a
+/// `head` still blocked after the test exited 101). An `O_RDWR` open never
+/// blocks and is a writer, so it completes the reader's `open`; the name goes
+/// before the fd closes, so no later reader can block, and the close hands
+/// every reader EOF.
+pub struct Fifo(PathBuf);
+
+impl Fifo {
+    pub fn new(path: PathBuf) -> Self {
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo(3) on a NUL-terminated path we own.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        Self(path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Fifo {
+    fn drop(&mut self) {
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.0);
+        let _ = std::fs::remove_file(&self.0);
+        drop(held);
+    }
+}
+
 /// A private tmux server name, killed (socket file included) on drop.
 pub struct LocalTmux {
     pub socket: String,

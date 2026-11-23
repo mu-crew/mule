@@ -343,6 +343,82 @@ mule exec --cwd ~/repo -- git rev-parse HEAD
 mule exec -- env K=v sh -c 'echo "$K"'      # several words: quoted for you
 ```
 
+## Many small ops, fast: `serve --stdio`
+
+```sh
+mule serve --stdio [--host H]
+```
+
+For a program that needs many quick answers from a host (mu's pi tools): read
+a file, stat it, write it. Those three and nothing else: serve runs no command
+of yours; a command is a job (`run`, `exec`). One op costs one round trip
+(~0.35s p50 on the dev hosts) where `exec` costs four (~1.5s). Spawn it as a
+child, write one JSON request per line to its stdin, read one JSON reply per
+line from its stdout. It holds nothing between requests and exits when you
+close its stdin (or its stdout): it is your child, not a daemon.
+
+Requests (`id` is yours, echoed back; `*_b64` fields are base64):
+
+```json
+{"op":"read","id":1,"path":"/etc/hostname"}
+{"op":"stat","id":2,"path":"/etc/hostname"}
+{"op":"write","id":3,"path":"/tmp/x","data_b64":"aGkK"}
+{"op":"cancel","id":3}
+```
+
+Replies, one per op, in completion order:
+
+```json
+{"id":1,"rc":0,"stdout_b64":"...","stderr":"","truncated":false,"cancelled":false,"cancel_requested":false,"batch":7,"batch_size":3}
+```
+
+- **Every op has 1s on the host**, under `/bin/sh` whatever your login
+  shell, in its own session (its own process group on a host without
+  `setsid`, such as macOS). Past that the op is killed (TERM, then KILL 1s
+  later), with every process of it, and comes back `rc` 124, `kind`
+  `"timeout"`: read it with a job instead. Nothing slower rides this path,
+  by design. Nothing an op starts outlives it: when an op ends, whatever
+  the host tools it ran (`head`, `stat`, `cat`, `mv`) left behind is killed
+  then, not when its batch ends. The one exception is a host tool that is a
+  wrapper detaching a child of its own (`setsid`, a daemon), or, without
+  `setsid`, one moving it to its own group as `timeout` does, before the
+  op's end; serve cannot find that child.
+- **Output is capped on the host, on disk and on the wire**: 1MB of stdout
+  for `read`, 8KB for everything else. An op past its cap fails, `kind`
+  `"output_limit"` with `truncated` set: never parse it as whole. Each op
+  reserves its caps from an 8MB batch budget, so a batch holds 7 reads, or
+  many more stats and writes.
+- **Payloads** (`data_b64`) ride the session's stdin, up to 8MB per batch. An op too big for one batch is refused before any ssh,
+  `kind` `"too_large"`: put it in a file and run a job.
+- **`stat`** prints `size mtime mode`, mode in hex (`stat -c '%s %Y %f'` on
+  Linux, `stat -f '%z %m %Xp'` elsewhere).
+- **`write`** needs an absolute path (`bad_request` otherwise) and replaces
+  exactly that file: a destination that is a directory or a symlink fails
+  the op. It goes through a temp file in the same directory and a rename, so
+  a reader never sees half, and its stdout is the resolved path written.
+- **Requests sent together go together**: whatever queues while one round trip
+  is in flight goes out in the next, and runs in parallel on the host. Do not
+  send two ops that depend on each other's effect at once; wait for the first
+  reply.
+- **`cancel`** drops a queued op (reply `kind` `"cancelled"`), or kills one in
+  flight on the host, with its process group (its reply has `cancelled: true`,
+  rc 143). An op that completed before the cancel reached it reports its real
+  result with `cancelled: false`: `cancelled` means it did not run to the end,
+  `cancel_requested` only that you asked.
+- **Failures** have an `error` and a `kind` (and `rc` -1 if the op never
+  ran): `bad_request`, `too_large`, `timeout`, `cancelled`, `output_limit`,
+  `lost` (ended on the host without a result), `host_tool_missing` (the host
+  lacks `timeout`, `base64`, `mktemp`, `sleep`, both `setsid` and a `/bin/sh`
+  with job control, or both `pgrep -s` and `ps` with `awk`: nothing ran), `batch_failed`, `master_gone`.
+- **Exit 3** when the master goes (or is missing at start): every op still
+  queued is answered `master_gone` first, and the master command is on stderr.
+  Stop and ask a human, as for every verb. Otherwise serve exits 0 when you
+  hang up.
+- **Ops get the same shell** as `run` and `exec`: non-login, non-interactive.
+
+`serve` is a cargo feature, on by default; `cargo install --no-default-features`
+builds mule without it.
+
 ## Hosts
 
 Every job verb accepts `--host`; with one configured host you can omit it.
@@ -374,6 +450,8 @@ master reads as down rather than hanging the verb.
 | 8 | `--strict-codes` only (`exec`, `wait`, `run --wait`): the command's 3 or its own 8 (ambiguous) |
 | *n* | `wait`, `run --wait`, `run --lease` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
 | 129/130/143 | `exec` and `run --lease` after SIGHUP/SIGINT/SIGTERM: the job was stopped |
+
+`serve --stdio` exits 0 when its caller hangs up and 3 when the master goes.
 
 `mule --help` carries the same table.
 
