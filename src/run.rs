@@ -400,7 +400,11 @@ pub fn lookup(transport: &dyn Transport, host: &Host, key: &JobKey) -> Result<Op
             output.stderr.trim()
         );
     }
-    parse_hits(key, &output.text())
+    let reply = output.text();
+    if reply.lines().any(|line| !line.starts_with("existing=")) {
+        bail!("unexpected output in key lookup reply");
+    }
+    parse_hits(key, &reply)
 }
 
 /// Sets `$hit` to one `existing=<id>` line per job holding `key`, and

@@ -404,8 +404,9 @@ come before `PATH`. Remote commands are not resolved this way.
 
 `mu-plugin-mule` is a second binary in this package. It serves
 [mu](https://github.com/mu-crew/mu)'s plugin protocol (v1) over stdio, so a mu
-host can use mule as its link instead of `--shell`/`--exec` templates. It looks
-for `mule` beside itself, then on `PATH`.
+host can use mule for its link and its bound lease jobs instead of using
+shell templates for them. The plugin looks for `mule` beside itself, then on
+`PATH`.
 
 ```sh
 mule init
@@ -434,7 +435,10 @@ will not replace an existing registration with different arguments.
 `init` exits 0 on success (including when mu is absent), 1 on a local setup
 error such as invalid config, and 9 when plugin registration fails.
 
-What it declares: the **link** seam only, with `exec` served by
+When switching an existing profile, drain, collect and close its jobs before
+removing and re-adding it. Live template jobs are not converted.
+
+The **link** seam has `exec` served by
 `mule exec --no-detach --strict-codes`. `fetch` is false (mule has no fetch, so
 the host keeps its own `--fetch` template), `slots` is `self` (mule's ticket
 lock arbitrates; mu holds no channel), `quiescence` is `provable`, and
@@ -464,9 +468,31 @@ Limits and fences:
   mu's 1 MiB frame (measured after escaping: a NUL is six bytes).
 - A request whose `deadline` has passed is refused unstarted, and a live
   deadline shortens `timeoutMs`.
-- The plugin snapshots `--config` (or the default config) at `initialize`.
-  Every child uses that snapshot; edits only take effect when a new plugin
-  process initializes. The handshake `instance` hashes the snapshot and the
-  resolved hosts, so mu's fence refuses a retargeted backend.
+- The handshake `instance` is `mule-<hash>` over the config and resolved host
+  targets and sockets. RPCs use that handshake's private copy. A lease view
+  and its detached cleanup keep the selected host from the same snapshot,
+  even after the plugin exits. To pick up an edit, start a new plugin session;
+  mu's instance fence prevents recovery against a retargeted backend.
 - `$/cancel` before dispatch means nothing runs; on stdin EOF the plugin stops
-  mule and the `ssh` it started, and kills what mule leaves behind.
+  the in-flight RPC children and their `ssh` helpers. The bound lease is
+  run by its own view, not by the RPC process.
+
+### Lease jobs
+
+`job.start` returns the interactive launcher, not a job ID. The view runs
+`mule run --lease --key`, using mu's command, working directory and remote
+job environment. For a pi agent mu uses its built-in ctl channel; the view
+forwards the socket pair in the job request. Closing the view starts the usual
+lease cleanup. There is no detached view mode.
+
+The carrier writes the ID to mu's local handle file before dispatch. A file
+can be read while the SSH master is down. Exact lookup by key also finds a
+claim made before the file was published, without starting anything; a miss
+alone is not proof that no view could still dispatch. Attach runs the same
+lease carrier in attach mode and does not rerun the command.
+
+Status and stop use the handle. Status distinguishes a running job, a job
+with an exit code, a proven missing or orphaned job, and a state mule cannot
+verify. Stop acknowledges only after `mule rm` proves the job and its sessions
+are gone. A missing master is a hand-back, not proof of loss or stop. Open the
+master as directed before retrying close.

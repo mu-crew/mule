@@ -154,6 +154,190 @@ impl Drop for Plugin {
     }
 }
 
+fn job_params(key: &str, handle: Option<&str>) -> Value {
+    let mut p = json!({"target": {"host": {"name": "shim"}, "job": {"kind": "lease", "key": key}},
+                       "deadline": now_ms() + 60_000});
+    if let Some(handle) = handle {
+        p["target"]["job"]["handle"] = json!(handle);
+    }
+    p
+}
+
+fn start_lease(
+    p: &mut Plugin,
+    key: &str,
+    cwd: &std::path::Path,
+    file: &std::path::Path,
+    cmd: &str,
+) -> Value {
+    let mut params = job_params(key, None);
+    params["key"] = json!(key);
+    params["spec"] = json!({"workstream": "demo", "name": "worker", "harness": "pi",
+        "role": "read-only", "commandSource": "explicit", "cmd": cmd, "cwd": cwd,
+        "env": {"LEASE_TEST": "a'b $HOME", "MU_AGENT_NAME": "worker"}, "jobFile": file});
+    let r = p.call("job.start", params);
+    assert!(r["result"]["view"]["command"].is_string(), "{r}");
+    assert!(r["result"].get("handle").is_none(), "{r}");
+    r["result"]["view"].clone()
+}
+
+fn lookup(p: &mut Plugin, key: &str) -> Value {
+    let mut params = job_params(key, None);
+    params["key"] = json!(key);
+    params["fence"] = json!(false);
+    p.call("job.lookup", params)
+}
+
+struct Carrier(Child);
+
+impl Carrier {
+    fn start(h: &ShimHost, view: &Value) -> Self {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(view["command"].as_str().unwrap());
+        for (k, v) in view["env"].as_object().unwrap() {
+            cmd.env(k, v.as_str().unwrap());
+        }
+        let _gate = SPAWN_GATE.read().unwrap();
+        Self(
+            cmd.env("PATH", h.path_env(None))
+                .env("XDG_STATE_HOME", &h.state)
+                .stdin(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn signal(&self, signal: i32) {
+        // SAFETY: this is a fresh process group owned by the test.
+        unsafe { libc::kill(-(self.0.id() as i32), signal) };
+    }
+}
+
+impl Drop for Carrier {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            self.signal(libc::SIGKILL);
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[test]
+fn lease_view_recovers_by_file_and_key_and_uses_the_handshake_host() {
+    let Some(h) = host("pb-lease") else { return };
+    let log = log_ssh(&h);
+    let mut p = Plugin::start(&h);
+    let cfg = std::fs::read_to_string(&h.config).unwrap();
+    std::fs::write(&h.config, cfg.replace("mule.sock", "other.sock")).unwrap();
+    let cwd = h.dir.join("quoted ' cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let file = h.dir.join("quoted ' handle");
+    let key = "lease-a";
+    let view = start_lease(
+        &mut p,
+        key,
+        &cwd,
+        &file,
+        "printf '%s|%s' \"$LEASE_TEST\" \"$MU_AGENT_NAME\" > proof; sleep 90",
+    );
+    assert!(
+        !file.exists() && !log.exists(),
+        "start RPC must only return a launcher"
+    );
+    assert_eq!(lookup(&mut p, key)["result"], json!({"none": true}));
+    let mut carrier = Carrier::start(&h, &view);
+    common::local::wait_until("remote command", 20, || cwd.join("proof").exists());
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("proof")).unwrap(),
+        "a'b $HOME|worker"
+    );
+    carrier.signal(libc::SIGKILL);
+    carrier.0.wait().unwrap();
+    h.master_down(true);
+    let handle = std::fs::read_to_string(&file).unwrap();
+    let job = job_params(key, Some(handle.trim()));
+    for method in ["job.status", "job.stop"] {
+        let result = p.call(method, job.clone());
+        assert_eq!(result["error"]["data"]["kind"], "human", "{result}");
+    }
+    assert_eq!(lookup(&mut p, key)["error"]["data"]["kind"], "human");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), handle);
+    h.master_down(false);
+    assert_eq!(
+        lookup(&mut p, key)["result"],
+        json!({"found": {"handle": handle.trim()}})
+    );
+    assert_eq!(
+        lookup(&mut p, "lease")["result"],
+        json!({"none": true}),
+        "not a prefix match"
+    );
+    assert_eq!(
+        p.call("job.status", job.clone())["result"],
+        json!({"state":"running"})
+    );
+    let mut attach = job.clone();
+    attach["jobFile"] = json!(file);
+    let attached = p.call("job.attach", attach);
+    let view = &attached["result"];
+    assert!(view["command"].is_string(), "{attached}");
+    drop(p); // A returned launcher must not need the protocol process or its temp copy.
+    let attached = Carrier::start(&h, view);
+    let fence = h.state.join("mule/stopping").join(handle.trim());
+    common::local::wait_until("attach owns generation", 20, || {
+        std::fs::read_to_string(&fence).is_ok_and(|s| s.trim() == "1")
+    });
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), handle);
+    attached.signal(libc::SIGTERM);
+    common::local::wait_until("attached carrier stopped the job", 20, || {
+        !h.jobs().join(handle.trim()).exists()
+    });
+    let mut p = Plugin::start(&h);
+    assert_eq!(p.call("job.status", job.clone())["result"]["state"], "lost");
+    let stopped = p.call("job.stop", job);
+    assert_eq!(stopped.get("result"), Some(&Value::Null), "{stopped}");
+    let ssh = std::fs::read_to_string(log).unwrap();
+    // Only the final status and idempotent stop used the restarted plugin.
+    let (old, new) = ssh.split_once("other.sock").unwrap();
+    assert!(
+        old.contains("mule.sock") && !new.contains("mule.sock"),
+        "{ssh}"
+    );
+}
+
+#[test]
+fn lease_claim_before_file_publication_is_found_exactly_by_key() {
+    let Some(h) = host("pb-claim") else { return };
+    let claimed = h.dir.join("claim-landed");
+    let shim = h.dir.join("ssh");
+    let script = std::fs::read_to_string(&shim).unwrap();
+    write_exec(&shim, script.replace("exec sh -c \"$last\"", &format!(
+        "case \"$last\" in *'if [ -n \"$hit\" ]; then exit 0; fi;'*)\n  sh -c \"$last\" || exit $?; : > '{}'; exec sleep 60;;\nesac\nexec sh -c \"$last\"", claimed.display()))).unwrap();
+    let mut p = Plugin::start(&h);
+    let file = h.dir.join("handle");
+    // mu keys a job by its record token, a UUID.
+    let key = "6f1c2a9e-3b4d-4e5f-8a7b-0c1d2e3f4a5b";
+    let view = start_lease(&mut p, key, &h.dir, &file, "echo should-not-dispatch");
+    let mut carrier = Carrier::start(&h, &view);
+    common::local::wait_until("remote claim before its reply", 20, || claimed.exists());
+    carrier.signal(libc::SIGKILL);
+    carrier.0.wait().unwrap();
+    assert!(!file.exists());
+    let found = lookup(&mut p, key);
+    let handle = found["result"]["found"]["handle"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{found}"));
+    let job = job_params(key, Some(handle));
+    assert_eq!(
+        p.call("job.status", job.clone())["result"]["state"],
+        "unknown"
+    );
+    let stopped = p.call("job.stop", job);
+    assert_eq!(stopped.get("result"), Some(&Value::Null), "{stopped}");
+    assert_eq!(lookup(&mut p, key)["result"], json!({"none": true}));
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -183,9 +367,9 @@ fn host(tag: &str) -> Option<ShimHost> {
 }
 
 #[test]
-fn handshake_declares_the_link_only() {
+fn handshake_matches_mu_d15_schema() {
     let Some(h) = host("pb-hello") else { return };
-    let mut p = Plugin::start(&h);
+    let mut p = Plugin::start_raw(&h);
     let v = p.call(
         "initialize",
         json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
@@ -193,9 +377,27 @@ fn handshake_declares_the_link_only() {
     let r = &v["result"];
     assert_eq!(r["plugin"]["name"], "mule");
     assert!(r["instance"].as_str().unwrap().starts_with("mule-"));
-    assert!(r["schema"].as_str().unwrap().starts_with("sha256:"));
+    assert_eq!(r["protocol"], 1);
     let seams = r["seams"].as_object().unwrap();
-    assert_eq!(seams.keys().collect::<Vec<_>>(), ["link"]);
+    assert_eq!(
+        seams["job"],
+        json!({
+            "kind": "lease", "view": "bound", "handle": "file",
+            "start": {"lookup": true, "fenceKey": false},
+            "honours": {"command": true, "env": true, "sockets": true,
+                        "roles": ["full-access", "read-only"]}
+        })
+    );
+    // mu 69619eba: digest of the published schema that added jobFile and
+    // the attach socket pair. A sha256 prefix alone doesn't pass loadRefusals.
+    assert_eq!(
+        r["schema"],
+        "sha256:54d56d9a865c4e9302f2b63158cb595010ecbb0b59037550609a54d79392ac36"
+    );
+    assert!(
+        !seams.contains_key("channel"),
+        "mu selects its built-in channel"
+    );
     assert_eq!(seams["link"]["fetch"], false);
     assert_eq!(seams["link"]["slots"], "self");
     assert_eq!(seams["link"]["quiescence"], "provable");

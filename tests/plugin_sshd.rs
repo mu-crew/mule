@@ -10,9 +10,188 @@
 
 mod common;
 
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::sshd::Sshd;
+use serde_json::{Value, json as rpc};
+
+struct Group(Child);
+
+impl Group {
+    fn kill(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            // SAFETY: this is a new group owned by this test.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            self.0.wait().unwrap();
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+fn rpc_call(
+    plugin: &mut Group,
+    stdout: &mut BufReader<ChildStdout>,
+    method: &str,
+    params: Value,
+) -> Value {
+    let message = rpc!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+    writeln!(plugin.0.stdin.as_mut().unwrap(), "{message}").unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let reply: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(reply["id"], 1);
+    reply
+        .get("result")
+        .unwrap_or_else(|| panic!("{reply}"))
+        .clone()
+}
+
+fn run_view(sshd: &Sshd, view: &Value) -> Group {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(view["command"].as_str().unwrap());
+    for (key, value) in view["env"].as_object().unwrap() {
+        cmd.env(key, value.as_str().unwrap());
+    }
+    Group(
+        cmd.env("PATH", sshd.path_env())
+            .env("XDG_STATE_HOME", &sshd.state_root)
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+fn prove_forward(local: &std::path::Path, remote: &UnixListener) {
+    let mut client = None;
+    wait_until("local ctl listener", Duration::from_secs(20), || {
+        client = UnixStream::connect(local).ok();
+        client.is_some()
+    });
+    client.unwrap().write_all(b"ctl").unwrap();
+    // The carrier proves its listener with a bare connect (forward::listening),
+    // so the far end also sees empty connections that close with no bytes.
+    // Measured on Linux: the first accept was such a probe and read EOF.
+    // Skip those; only our own bytes prove the forward carries traffic.
+    wait_until(
+        "forward traffic at the remote socket",
+        Duration::from_secs(5),
+        || {
+            let Ok((stream, _)) = remote.accept() else {
+                return false;
+            };
+            // accept(2) on Linux does not inherit O_NONBLOCK; BSDs do.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut data = Vec::new();
+            let _ = stream.take(3).read_to_end(&mut data);
+            data == b"ctl"
+        },
+    );
+}
+
+#[test]
+fn plugin_lease_forwards_ctl_on_start_and_attach_over_the_capped_master() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "lease-wire");
+    let config = sshd.write_config(&tmux.name);
+    let file = sshd.dir.join("handle");
+    let local = sshd.dir.join("l.sock");
+    let remote = sshd.dir.join("r.sock");
+    let socket = UnixListener::bind(&remote).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let mut plugin = Group(
+        Command::new(env!("CARGO_BIN_EXE_mu-plugin-mule"))
+            .arg("--config")
+            .arg(config)
+            .env("PATH", sshd.path_env())
+            .env("XDG_STATE_HOME", &sshd.state_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = BufReader::new(plugin.0.stdout.take().unwrap());
+    let key = "capped-lease";
+    let deadline = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 90_000
+    };
+    let call =
+        |plugin: &mut Group, stdout: &mut BufReader<ChildStdout>, method: &str, mut p: Value| {
+            p["deadline"] = rpc!(deadline());
+            rpc_call(plugin, stdout, method, p)
+        };
+    rpc_call(
+        &mut plugin,
+        &mut stdout,
+        "initialize",
+        rpc!({"protocol": {"min": 1, "max": 1}}),
+    );
+    let mut target = rpc!({"host": {"name":"live"}, "job": {"kind": "lease", "key": key}});
+    let start = call(
+        &mut plugin,
+        &mut stdout,
+        "job.start",
+        rpc!({"target": target, "key": key,
+        "spec": {"cmd": "sleep 90", "env": {"MU_CTL_SOCK": remote}, "cwd": sshd.dir,
+                 "workstream": "demo", "name": "worker", "harness": "pi", "role": "full-access",
+                 "commandSource": "explicit", "jobFile": file, "sockets": {"local": local, "remote": remote}}}),
+    );
+    let mut carrier = run_view(&sshd, &start["view"]);
+    prove_forward(&local, &socket);
+    carrier.kill(); // view lost, not a clean stop
+    let handle = std::fs::read_to_string(&file).unwrap();
+    let found = call(
+        &mut plugin,
+        &mut stdout,
+        "job.lookup",
+        rpc!({"target": target, "key": key, "fence":false}),
+    );
+    assert_eq!(found["found"]["handle"], handle.trim());
+    target["job"]["handle"] = rpc!(handle.trim());
+    // The new pane must use the socket pair from *this* attach request.
+    let rebound = sshd.dir.join("new.sock");
+    let attach = call(
+        &mut plugin,
+        &mut stdout,
+        "job.attach",
+        rpc!({"target": target,
+        "jobFile": file, "sockets": {"local": rebound, "remote": remote}}),
+    );
+    let _reopened = run_view(&sshd, &attach);
+    prove_forward(&rebound, &socket);
+    assert_eq!(job_ids(&sshd), [handle.trim()]);
+    assert_eq!(
+        call(
+            &mut plugin,
+            &mut stdout,
+            "job.stop",
+            rpc!({"target": target, "key":"stop-key"})
+        ),
+        Value::Null
+    );
+    assert!(job_ids(&sshd).is_empty());
+    drop(plugin.0.stdin.take());
+    plugin.0.wait().unwrap();
+}
 
 /// A private tmux server name, torn down on drop, socket file included.
 struct Tmux<'a> {

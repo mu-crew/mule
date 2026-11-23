@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Warn past this many running jobs on one host. Backpressure, not a queue.
 const DEFAULT_MAX_RUNNING: u32 = 4;
@@ -66,7 +66,7 @@ pub struct Host {
 
 /// The raw `[hosts.<name>]` table. Everything is optional; `Host` fills in the
 /// defaults that serde cannot, because serde cannot see the section name.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawHost {
     target: Option<String>,
@@ -79,7 +79,7 @@ struct RawHost {
     max_job_secs: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     /// `BTreeMap` rather than `HashMap` so `mule host list` does not reshuffle
@@ -178,6 +178,31 @@ pub fn seed(path: &Path) -> Result<bool> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+    }
+}
+
+/// The private handoff from a plugin launcher's environment to its carrier.
+pub const LEASE_CONFIG_ENV: &str = "MULE_LEASE_CONFIG";
+
+impl Host {
+    /// A view can outlive the plugin session that issued its command. Give it
+    /// only its resolved host, not a reopen of the original config, a path to
+    /// the plugin's temporary copy, or the raw file with other hosts/comments.
+    pub fn lease_snapshot(&self) -> Result<String> {
+        let socket = std::path::absolute(&self.socket)?;
+        let host = RawHost {
+            target: Some(self.target.clone()),
+            socket: Some(socket.to_str().context("socket path is not UTF-8")?.into()),
+            tmux_socket: Some(self.tmux_socket.clone()),
+            max_running: Some(self.max_running),
+            default_cwd: self.default_cwd.clone(),
+            keep_days: Some(self.keep_days),
+            max_log_bytes: Some(self.max_log_bytes),
+            max_job_secs: Some(self.max_job_secs),
+        };
+        Ok(toml::to_string(&RawConfig {
+            hosts: [(self.name.clone(), host)].into(),
+        })?)
     }
 }
 

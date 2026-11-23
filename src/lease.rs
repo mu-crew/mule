@@ -974,7 +974,7 @@ struct RealSignalSteps {
     /// Where the stop-failure record goes, beside it.
     job_file: PathBuf,
     specs: Vec<Spec>,
-    config: Option<PathBuf>,
+    config: StopConfig,
     /// The main thread's locked calls (dispatch, probes).
     calls: Stopper,
 }
@@ -1002,12 +1002,9 @@ impl SignalSteps for RealSignalSteps {
         // The generation this carrier owns, not one read now: see `Owned`.
         let failed_file = stop_failed_path(&self.job_file, &self.owned.id);
         let retry = stop_retry(&self.owned, &failed_file, cleanup::stop_retry_for());
-        let _ = cleanup::spawn_rm(
-            self.config.as_deref(),
-            &self.host.name,
-            &self.owned.id,
-            Some(&retry),
-        );
+        let _ = self
+            .config
+            .spawn_rm(&self.host.name, &self.owned.id, Some(&retry));
     }
 
     fn unforward(&mut self) {
@@ -1020,6 +1017,33 @@ impl SignalSteps for RealSignalSteps {
             let _ = done_tx.send(());
         });
         let _ = done_rx.recv_timeout(UNFORWARD_GRACE);
+    }
+}
+
+/// A plugin carrier's stop must use the same host as dispatch even if the
+/// plugin process exited or the operator edited the config since launch.
+#[derive(Clone)]
+pub(crate) enum StopConfig {
+    Path(Option<PathBuf>),
+    Snapshot(String),
+}
+
+impl StopConfig {
+    fn spawn_rm(
+        &self,
+        host: &str,
+        id: &JobId,
+        retry: Option<&cleanup::StopRetry<'_>>,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Path(path) => cleanup::spawn_rm(path.as_deref(), host, id, retry),
+            Self::Snapshot(snapshot) => {
+                let mut cmd = cleanup::rm_command(&std::env::current_exe()?, None, host, id, retry);
+                cmd.arg("--lease-config-env")
+                    .env(crate::config::LEASE_CONFIG_ENV, snapshot);
+                cleanup::spawn_detached(cmd)
+            }
+        }
     }
 }
 
@@ -1042,13 +1066,20 @@ pub fn run_cli(
     specs: Vec<Spec>,
     request: &Request,
 ) -> Result<i32> {
-    run_cli_keyed(host, config, job_file, specs, request, None)
+    run_cli_keyed(
+        host,
+        StopConfig::Path(config),
+        job_file,
+        specs,
+        request,
+        None,
+    )
 }
 
 /// `mule run --lease --key K`: [`run_cli`] through [`start_keyed`].
-pub fn run_cli_keyed(
+pub(crate) fn run_cli_keyed(
     host: &Host,
-    config: Option<PathBuf>,
+    config: StopConfig,
     job_file: &Path,
     specs: Vec<Spec>,
     request: &Request,
@@ -1060,9 +1091,9 @@ pub fn run_cli_keyed(
 /// `mule run --lease --attach <id>`: [`attach`], then the same hold and signal
 /// path as a lease. Not a re-dispatch: nothing is started, and the exit codes
 /// are the lease's.
-pub fn attach_cli(
+pub(crate) fn attach_cli(
     host: &Host,
-    config: Option<PathBuf>,
+    config: StopConfig,
     job_file: &Path,
     specs: Vec<Spec>,
     id: &JobId,
@@ -1072,7 +1103,7 @@ pub fn attach_cli(
 
 fn carrier_cli(
     host: &Host,
-    config: Option<PathBuf>,
+    config: StopConfig,
     job_file: &Path,
     specs: Vec<Spec>,
     begin: Begin,
@@ -1185,7 +1216,7 @@ fn carrier_cli(
             // in the job file either way, and `rm` of a never-made job is a
             // no-op. (A job-file write failure never gets here with an id.)
             if let Ok(Some(owned)) = named.lock().map(|owned| owned.clone()) {
-                let _ = cleanup::spawn_rm(config.as_deref(), &host.name, &owned.id, None);
+                let _ = config.spawn_rm(&host.name, &owned.id, None);
             }
             return Err(error);
         }

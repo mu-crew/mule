@@ -10,6 +10,10 @@
   prints master commands without opening them and registers the companion
   plugin when mu is on PATH. Rerun init after an upgrade to refresh the
   registration if its version or schema changed.
+- **Lease jobs through the mule link.** `mu-plugin-mule` supplies a bound
+  lease job kind: a file handle, exact keyed recovery, status, proven stop,
+  and attach with mu's built-in ctl forwarding. The view and its cleanup use
+  the host resolved at handshake.
 - **`--strict-codes`** on `exec`, `wait` and `run --wait` reserves exit 3 for a
   hand-back (no master). A command's own 3 becomes 8; a command can also
   return 8 itself, so the remap notice is diagnostic only. Default exit

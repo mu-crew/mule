@@ -1,4 +1,4 @@
-//! mu-plugin-mule: serves mu's plugin protocol (v1) for the link seam, over
+//! mu-plugin-mule: serves mu's link and bound lease job seams (protocol v1), over
 //! the `mule` binary installed beside it. See docs/usage.md, "As a mu plugin".
 //!
 //!   mu plugin add mule -- /abs/path/mu-plugin-mule [--config PATH]
@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,8 +25,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// sha256 of `schemas/plugin-protocol-v1.json` in mu: mu refuses any other.
-const SCHEMA: &str = "sha256:6ea6e13cabf6baebe44e961e21370a66ddf523082bfd73bcf169ec627fc71a25";
+mod mule_lease;
+
+/// sha256 of mu's `schemas/plugin-protocol-v1.json` with the D15 file-handle wire.
+const SCHEMA: &str = "sha256:54d56d9a865c4e9302f2b63158cb595010ecbb0b59037550609a54d79392ac36";
 /// Per stream, read from the child. Not the reply bound: see `ENCODED_STREAM`.
 const MAX_OUTPUT: usize = 128 * 1024;
 /// Per stream, AFTER JSON escaping. mu rejects a protocol line over 1 MiB
@@ -69,6 +71,14 @@ struct Ctx {
     spawned: Arc<AtomicBool>,
 }
 
+impl Ctx {
+    fn mule_path(&self) -> std::io::Result<&Path> {
+        self.mule
+            .as_deref()
+            .map_or_else(|| mule::helper::MULE.path(), Ok)
+    }
+}
+
 /// The mule config, read and validated ONCE at the handshake. The instance mu
 /// fingerprints is derived from these bytes, and every `mule` child is handed
 /// a private copy of them (`--config <copy>`) instead of the mutable pathname:
@@ -78,6 +88,7 @@ struct Ctx {
 /// process, i.e. when mu re-handshakes.
 struct Snap {
     instance: String,
+    hosts: Option<mule::config::Config>,
     /// The private copy; `None` when the file was unreadable at the handshake,
     /// in which case nothing dispatches.
     config: Option<std::path::PathBuf>,
@@ -233,10 +244,7 @@ fn run_mule(
         std::process::id(),
         PARTIALS.fetch_add(1, Ordering::SeqCst)
     ));
-    let mule = ctx
-        .mule
-        .as_deref()
-        .map_or_else(|| mule::helper::MULE.path(), Ok);
+    let mule = ctx.mule_path();
     match remaining_at(deadline, now_ms()) {
         Err(()) => return Ok(Run::Expired),
         Ok(Some(left)) => timeout = timeout.min(left),
@@ -565,8 +573,12 @@ fn take_snapshot(ctx: &Ctx) -> Snap {
         None => (b"unreadable:nopath".to_vec(), false),
     };
     let config = ok.then(|| write_copy(&bytes)).flatten();
+    let hosts = std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|text| mule::config::Config::parse(text).ok());
     Snap {
-        instance: instance(&bytes),
+        instance: instance(&bytes, hosts.as_ref()),
+        hosts,
         config,
     }
 }
@@ -610,12 +622,16 @@ fn fnv(parts: &[&[u8]]) -> u64 {
 /// initialize cap), and the identity needs no master state. Retarget a host
 /// and the instance changes, so mu's recovery and collect fence refuses the
 /// old jobs; a hash discloses no path or secret.
-fn instance(bytes: &[u8]) -> String {
-    let hosts = mule::config::Config::parse(&String::from_utf8_lossy(bytes))
+fn instance(bytes: &[u8], config: Option<&mule::config::Config>) -> String {
+    let hosts = config
         .map(|c| {
             c.hosts()
                 .iter()
-                .map(|h| format!("{}\t{}\t{}\n", h.name, h.target, h.socket.display()))
+                .map(|h| {
+                    let socket =
+                        std::path::absolute(&h.socket).unwrap_or_else(|_| h.socket.clone());
+                    format!("{}\t{}\t{}\n", h.name, h.target, socket.display())
+                })
                 .collect::<String>()
         })
         .unwrap_or_default();
@@ -643,7 +659,7 @@ fn snapshot(ctx: &Ctx, id: &Value) -> Option<Arc<Snap>> {
                 &ctx.out,
                 id,
                 "permanent",
-                "link call before initialize; nothing ran",
+                "plugin call before initialize; nothing ran",
                 None,
             );
             None
@@ -665,6 +681,14 @@ fn handshake(instance: &str) -> Value {
             "quiescence": "provable",
             "maxScriptBytes": 128 * 1024,
             "checks": ["reach"],
+        }, "job": {
+            "kind": "lease",
+            "view": "bound",
+            "handle": "file",
+            "start": {"lookup": true, "fenceKey": false},
+            // No plugin channel: mu drives pi on its built-in ctl socket.
+            "honours": {"command": true, "env": true, "sockets": true,
+                         "roles": ["full-access", "read-only"]},
         }},
     })
 }
@@ -681,7 +705,8 @@ fn on_message(ctx: &Ctx, msg: Value) {
             }
         }
         "shutdown" => reply(&ctx.out, &id, Value::Null),
-        m @ ("link.exec" | "link.checkSteps") => {
+        m @ ("link.exec" | "link.checkSteps" | "job.start" | "job.attach" | "job.lookup"
+        | "job.status" | "job.stop") => {
             let ctx = ctx.clone();
             let m = m.to_string();
             // Registered here, on the reader, before the worker exists: a
@@ -690,10 +715,10 @@ fn on_message(ctx: &Ctx, msg: Value) {
             let live = Arc::new(Live::default());
             ctx.calls.lock().unwrap().insert(key.clone(), live.clone());
             thread::spawn(move || {
-                if m == "link.exec" {
-                    link_exec(&ctx, &live, &id, &params)
-                } else {
-                    check_steps(&ctx, &live, &id, &params)
+                match m.as_str() {
+                    "link.exec" => link_exec(&ctx, &live, &id, &params),
+                    "link.checkSteps" => check_steps(&ctx, &live, &id, &params),
+                    m => mule_lease::call(&ctx, &live, &id, m, &params),
                 }
                 ctx.calls.lock().unwrap().remove(&key);
             });
@@ -852,6 +877,7 @@ mod tests {
         };
         let snap = Snap {
             instance: String::new(),
+            hosts: None,
             config: Some(dir.join("c.toml")),
         };
         let live = Live::default();
@@ -864,9 +890,9 @@ mod tests {
     }
 
     #[test]
-    fn the_handshake_declares_the_link_only() {
+    fn the_handshake_does_not_claim_fetch_or_a_channel() {
         let h = handshake("mule-x");
-        assert_eq!(h["seams"].as_object().unwrap().len(), 1);
+        assert!(h["seams"].get("channel").is_none());
         assert_eq!(h["seams"]["link"]["fetch"], false);
         assert_eq!(h["seams"]["link"]["slots"], "self");
     }

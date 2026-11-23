@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
@@ -156,6 +156,9 @@ pub struct Cli {
     /// Config file (default: ~/.config/mule/config.toml)
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
+
+    #[arg(long, global = true, hide = true, conflicts_with = "config")]
+    lease_config_env: bool,
 
     /// Suppress next-step hints on stderr. Warnings are still printed.
     ///
@@ -380,6 +383,14 @@ pub enum Commands {
         /// searched, so "not found" there means "cannot tell".
         #[arg(long, value_name = "P")]
         key_prefix: Option<crate::key::KeyPrefix>,
+    },
+    // The plugin needs exact lookup including claims made before the handle
+    // file was published. No listing of commands (or prefix collisions).
+    #[command(hide = true)]
+    Lookup {
+        #[command(flatten)]
+        host: HostArg,
+        key: crate::key::JobKey,
     },
     /// Kill a running job
     Kill {
@@ -975,7 +986,16 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     if matches!(cli.command, Commands::Init) {
         return crate::init::run(cli.config.as_deref(), cli.quiet);
     }
-    let cfg = load_config(cli.config.as_deref())?;
+    let (cfg, stop_config) = if cli.lease_config_env {
+        let snapshot = std::env::var(crate::config::LEASE_CONFIG_ENV)
+            .context("missing plugin lease configuration snapshot")?;
+        let cfg =
+            Config::parse(&snapshot).context("invalid plugin lease configuration snapshot")?;
+        (cfg, crate::lease::StopConfig::Snapshot(snapshot))
+    } else {
+        let cfg = load_config(cli.config.as_deref())?;
+        (cfg, crate::lease::StopConfig::Path(cli.config.clone()))
+    };
     let quiet = cli.quiet;
     match cli.command {
         Commands::Init => unreachable!("init handles its own config"),
@@ -1002,13 +1022,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     .as_deref()
                     .expect("clap requires --job-file with --lease");
                 if let Some(id) = attach {
-                    return crate::lease::attach_cli(
-                        host,
-                        cli.config.clone(),
-                        job_file,
-                        specs,
-                        &id,
-                    );
+                    return crate::lease::attach_cli(host, stop_config, job_file, specs, &id);
                 }
                 let command = command_from_args(&cmd);
                 let workstream = (!human)
@@ -1022,7 +1036,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 };
                 return crate::lease::run_cli_keyed(
                     host,
-                    cli.config.clone(),
+                    stop_config,
                     job_file,
                     specs,
                     &crate::lease::Request {
@@ -1313,6 +1327,14 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             );
             Ok(0)
         }
+        Commands::Lookup { host, key } => {
+            let found = crate::run::lookup(&Ssh, cfg.host(host.host.as_deref())?, &key)?;
+            println!(
+                "{}",
+                serde_json::to_string(&found.as_ref().map(crate::wrapper::JobId::as_str))?
+            );
+            Ok(0)
+        }
         Commands::Kill { id, host, rm } => {
             let host = cfg.host(host.host.as_deref())?;
             let rc = crate::jobs::kill(&Ssh, host, &id)?;
@@ -1403,7 +1425,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     }
 }
 
-pub(crate) fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

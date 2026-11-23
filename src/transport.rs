@@ -313,7 +313,11 @@ impl Transport for Ssh {
         let mut cmd = crate::helper::SSH
             .command()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
-        cmd.arg("-E").arg(&log.0).args(run_args(host, script));
+        // This handoff is local even if the operator has a broad SendEnv rule.
+        cmd.env_remove(crate::config::LEASE_CONFIG_ENV)
+            .arg("-E")
+            .arg(&log.0)
+            .args(run_args(host, script));
         let out = cmd
             .output()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
@@ -338,7 +342,8 @@ impl Transport for Ssh {
         let mut cmd = crate::helper::SSH
             .command()
             .with_context(|| format!("spawning ssh for host {}", host.name))?;
-        cmd.args(mux_args(host, &op));
+        cmd.env_remove(crate::config::LEASE_CONFIG_ENV)
+            .args(mux_args(host, &op));
         let out = if op == MuxOp::Check {
             match output_within(&mut cmd, CHECK_TIMEOUT)
                 .with_context(|| format!("spawning ssh for host {}", host.name))?
