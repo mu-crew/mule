@@ -50,17 +50,17 @@ Without it, a job command exits 3 and prints that line.
 
 ## Use it from mu
 
-`mu-plugin-mule` is mule's link plugin for mu: mu runs `exec` through mule's
-private connection instead of holding a session itself. After `mule init`:
+`mu-plugin-mule` is mule's plugin for mu: mu runs `exec` and persistent `lease`
+workers (bound tmux views with a file handle) through mule's private connection
+instead of holding a session itself. After `mule init`:
 
 ```sh
 mu host add box --plugin mule --fetch '<your fetch command>'
 mu host check box
 ```
 
-The link serves `exec` only. The `lease` job kind (a mu worker held for a
-pane's life) is pending: `mule run --lease` exists, but its mu wire is still in
-progress. Details in [docs/usage.md](docs/usage.md#as-a-mu-plugin-mu-plugin-mule).
+Details (including setup, `lease` capabilities, and exit codes) in
+[docs/usage.md](docs/usage.md#as-a-mu-plugin-mu-plugin-mule).
 
 ## 30-second demo
 

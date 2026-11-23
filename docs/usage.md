@@ -225,11 +225,12 @@ mule run --lease [--host H] [--cwd D] [--human] [--max-secs S] \
   --job-file F [--forward-unix LOCAL:REMOTE ...] -- <cmd>
 ```
 
-For a local pane whose life must be the job's. **Status: pending as a mu job
-kind.** The verb works and is tested here, but mu's wire for it is in progress,
-and `mu-plugin-mule` does not serve it yet (it serves `exec` only). Meant for a
-mu remote worker, run by mu's lease profile. It is `run --tui` plus a foreground holder, and holds no session
-in between: a probe per tick (1s settling to 5s) over mule's own connection.
+For a local pane whose life must be the job's. `mu-plugin-mule` serves this as
+mu's bound `lease` job kind (tmux-backed views, file handle, built-in `ctl`
+channel; see [As a mu plugin](#as-a-mu-plugin-mu-plugin-mule)), and the verb
+also works directly or from a mu lease template profile. It is `run --tui` plus
+a foreground holder, and holds no session in between: a probe per tick (1s
+settling to 5s) over mule's own connection.
 
 - **The id is in `F` before the job exists** (one line, mode 0600, written
   atomically). If the write fails, nothing is dispatched (exit 1). The stop is
