@@ -16,5 +16,8 @@
   "files": [
     "bin/mule",
     "bin/mu-plugin-mule"
-  ]
+  ],
+  "scripts": {
+    "prepublishOnly": "node -e \"const fs=require('fs'); for (const p of ['bin/mule','bin/mu-plugin-mule']) { const s=fs.statSync(p); if(!s.isFile()||!s.size||!(s.mode&0o111)){console.error(p+' missing, empty, or not executable'); process.exit(1)} }\""
+  }
 }
