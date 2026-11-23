@@ -47,11 +47,13 @@
   64 KiB is a note after the output; a command's own 3 or 7 is its result.
   Reopening Pi reattaches to the jobs of `bash` calls left without a
   result (found with `mule lookup`, never restarted) and reports their
-  outcome to the model.
+  outcome to the model; a watch the master drops resumes on the next
+  workspace call that succeeds, never on a timer.
 - `poll --json` reports `drained` for a `done` job: whether its log
-  pipeline has ended, so the log and its `truncated` marker are final.
+  pipeline has finalized, so the log and its `truncated` marker are final.
   `rc` lands first when a process the command left behind still holds
-  stdout.
+  stdout. It is the pipeline's own `drained` marker, not the session's
+  end, so a `mule kill` that cuts the pipeline short stays `drained: false`.
 
 ## [0.6.0] — 2026-11-23
 

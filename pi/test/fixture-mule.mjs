@@ -83,8 +83,8 @@ head -c "$3" >"$2/log"; cat >"$2/.overflow"; if [ -s "$2/.overflow" ]; then echo
 		try { process.kill(group, 0); } catch { break; }
 		spawnSync("sleep", ["0.02"]);
 	}
+	// No `drained`: like mule's, the pipeline is cut, not finalized.
 	try { process.kill(group, "SIGKILL"); } catch { /* gone */ }
-	writeFileSync(join(job, "drained"), "");
 } else if (verb === "lookup") {
 	const key = join(dir, "keys", args[0]);
 	console.log(JSON.stringify(existsSync(key) ? readFileSync(key, "utf8") : null));

@@ -99,7 +99,10 @@ Keyed artifacts are retained by mule until explicitly removed.
   says the job is still running and must not be run again, and a second
   one carries its exit code and output when it ends. A call whose job
   never started is left alone, and a reported result is not reported
-  again on the next reopen. With
+  again on the next reopen. If the master drops while a job is watched,
+  the user is told and the job runs on; the watch resumes on the next
+  workspace call that succeeds (never on a timer), and the result is still
+  reported once. With
   `MULE_PI_JOB_PREFIX` set, it is prepended verbatim to every detached job
   key, so mu can find and stop a worker's jobs with `mule ls --key-prefix`
   across Pi sessions. A prefix that would make an invalid key (more than
@@ -125,7 +128,8 @@ Keyed artifacts are retained by mule until explicitly removed.
   are languages that can write files themselves, so only a subset passes:
   sed with print, delete, `s`, `y`, blocks and branches (no `w`, `W`, `e`,
   `r`, `-i` or `-f`), awk with `-F`/`-v` only and no `print > file`, pipe,
-  `system` or `getline`. This guards
+  `system` or `getline` (lines joined first as awk joins them, so a
+  `print` continued onto the next line is still caught). This guards
   against accidents; like mu's role it is not a security boundary. `!` is
   the user's own command and is not filtered.
 - **muzzle.** The root probe also looks for `muzzle` on the jobs' `PATH`
@@ -143,7 +147,7 @@ Keyed artifacts are retained by mule until explicitly removed.
   log drains when a process the command started still holds its output,
   so the result waits for `poll --json`'s `drained` (up to 5 s, as `exec`
   does) before reading the log and the cap marker; a log that never
-  drains gets a note saying it may be incomplete. A command's own exit 7
+  drains, or that a kill cut short, gets a note saying it may be incomplete. A command's own exit 7
   (or 3) is its result. For file ops, exec's 7 means mule cut the output;
   a file-op script's own 7 is reported as 1, so the two cannot be confused.
 

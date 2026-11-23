@@ -212,10 +212,17 @@ function refuseAwk(args: string[]): string | undefined {
 		break;
 	}
 	if (program === undefined) return "awk without a program";
-	// Strings and regex literals may hold any character; only code counts.
+	// Strings and regex literals may hold any character (a backslash-newline
+	// too); only code counts. Then join lines the way awk does before it
+	// parses: drop comments and backslash-newlines, and continue a line ending
+	// in `,`, `&&`, `||`, `do` or `else`. Otherwise `print \` and the `>` on
+	// the next line are two statements here and one to awk.
 	const code = program
-		.replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
-		.replace(/(^|[\s{(,;!~&|])\/(?:[^/\\\n]|\\.)*\//g, "$1//");
+		.replace(/"(?:[^"\\\n]|\\[\s\S])*"/g, '""')
+		.replace(/(^|[\s{(,;!~&|])\/(?:[^/\\\n]|\\[\s\S])*\//g, "$1//")
+		.replace(/#[^\n]*/g, "")
+		.replace(/\\\n/g, " ")
+		.replace(/(,|&&|\|\||\bdo|\belse)\s*\n/g, "$1 ");
 	if (/system\s*\(|getline|fflush|close\s*\(/.test(code)) return "awk running commands";
 	if (/(?<!\|)\|(?!\|)/.test(code)) return "awk piping to a command";
 	// In a print statement, > is output redirection: `print $1 > 5` writes

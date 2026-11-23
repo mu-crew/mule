@@ -388,6 +388,46 @@ const checks = {
 			assert.equal(calls().slice(after).match(/^lookup$/gm)?.length, 1, "only the call never started is looked up");
 			assert.deepEqual(again.messages, []);
 			await again.stop();
+
+			// The master drops while a reattached job is watched: the user is
+			// told, nothing retries in the background, and the next workspace
+			// call after the master is back resumes the watch. The result is
+			// reported once, and the job is never dispatched again.
+			const gate2 = join(dir, "lost-gate-2");
+			const lost2 = `while [ ! -f ${quote(gate2)} ]; do sleep 0.05; done; echo ran >> ${quote(join(dir, "lost-count-2"))}; echo second answer; exit 5`;
+			const seeded2 = spawnSync(join(dir, "mule"), ["--quiet", "run", "--host", "fixture", "--key", jobKey("fixture-session", "toolu_lost2", prefix), "--cwd", root, "--", `exec bash -c ${quote(lost2)}`], { encoding: "utf8" });
+			assert.equal(seeded2.status, 0, seeded2.stderr);
+			const job2 = seeded2.stdout.trim();
+			const flaky = register(`fixture:${root}`, {}, {}, [
+				{ type: "message", message: { role: "user", content: "go" } },
+				{ type: "message", message: { role: "assistant", content: [call("toolu_lost2", lost2)] } },
+			]);
+			await flaky.start();
+			await waitFor("the second reattach notice", () => flaky.messages.length > 0);
+			const down = join(dir, "down");
+			writeFileSync(down, "3");
+			await waitFor("the master-loss notice", () => flaky.notices.some((notice) => /SSH master/.test(notice) && notice.includes(job2)));
+			assert.match(flaky.statuses.at(-1)!, /SSH master down/);
+			assert.deepEqual(flaky.aborts, [], "a background watch does not stop a turn");
+			rmSync(down);
+			writeFileSync(gate2, "");
+			await waitFor("the job to finish", () => existsSync(join(dir, "jobs", job2, "drained")));
+			const idle = calls().length;
+			await delay(400);
+			assert.equal(calls().slice(idle), "", "no background retry");
+			assert.equal(flaky.messages.length, 1, "no result yet");
+			const runs2 = readFileSync(join(dir, "runs"), "utf8");
+			await flaky.run("ls", { path: "src" });
+			await waitFor("the resumed result", () => flaky.messages.length > 1);
+			assert.match(flaky.messages[1].content, /exited with code 5[\s\S]*second answer/);
+			assert.deepEqual(flaky.messages[1].details, { toolCallId: "toolu_lost2", job: job2, exitCode: 5 });
+			assert.equal(flaky.statuses.at(-1), `mule fixture:${root}`);
+			await flaky.run("ls", { path: "src" });
+			await delay(300);
+			assert.equal(flaky.messages.length, 2, "reported once, no second notice");
+			assert.equal(readFileSync(join(dir, "lost-count-2"), "utf8"), "ran\n");
+			assert.equal(readFileSync(join(dir, "runs"), "utf8").slice(runs2.length).trim().split("\n").length, 2, "only the two ls jobs were dispatched");
+			await flaky.stop();
 		} finally {
 			delete process.env.MULE_PI_JOB_PREFIX;
 		}

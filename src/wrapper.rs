@@ -241,7 +241,7 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
          '{{ {run}; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
                if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
-               rm -f {dir}/.overflow; }}'",
+               rm -f {dir}/.overflow; : > {dir}/drained; }}'",
         host.tmux_socket, job.id, host.max_log_bytes
     )
 }
@@ -317,7 +317,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     let consumer = format!(
         "rm -f ./pipe; head -c {max} > ./log; cat > ./.overflow; \
          if [ -s ./.overflow ]; then echo 1 > ./truncated; fi; \
-         rm -f ./.overflow; echo 1 > ./.pipe-done",
+         rm -f ./.overflow; : > ./drained; echo 1 > ./.pipe-done",
         max = host.max_log_bytes
     );
 

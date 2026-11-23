@@ -160,6 +160,9 @@ That file means the job may still be running: open the master, then
 still hold its output: the log keeps growing, and the `truncated` marker
 that `tail` reports comes only when the log pipeline ends. `drained: false`
 means exactly that; read the log as final only once `drained` is `true`.
+`drained` is the pipeline's own end-of-log marker, not the session ending: a
+`mule kill` that lands in that gap cuts the pipeline short, and the job stays
+`drained: false` for good, its log never final.
 
 `unknown` covers every probe that did not complete: a state path behind an
 unsearchable directory, a tmux that cannot be queried, a tool that failed, an

@@ -23,6 +23,12 @@ pub struct Probe {
     /// job with `rc` is `Done` while its session lives on until the whole log
     /// pipeline has drained, and `exec` waits on exactly that gap.
     pub alive: bool,
+    /// Whether the log pipeline finalized: it wrote `drained`, its last act
+    /// after the log and the `truncated` marker. The session's absence is not
+    /// this: `kill` destroys a pipeline still holding bytes past the cap, and
+    /// a session gone that way read as drained, so a capped prefix passed for
+    /// a whole result (review, 2026-11-23).
+    pub drained: bool,
     pub log_size: u64,
     pub bytes: Vec<u8>,
 }
@@ -146,6 +152,8 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
            if [ -n \"$end\" ]; then runtime=$((end - start)); [ $runtime -lt 0 ] && runtime=0; fi; \
          fi; \
          printf 'runtime=%s\\n' \"$runtime\"; \
+         drained=0; if mule_regular $d/drained drained; then drained=1; fi; \
+         printf 'drained=%s\\n' $drained; \
          mule_size $d/log log; printf 'size=%s\\n' $REPLY; \
          printf 'bytes:\\n'; {bytes}",
         prelude = crate::remote::PRELUDE,
@@ -189,6 +197,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let mut why = String::new();
     let mut runtime_secs = None;
     let mut log_size = None;
+    let mut drained = false;
     for line in output.text().lines() {
         if let Some(value) = line.strip_prefix("exists=") {
             exists = Some(Seen::parse(value));
@@ -210,6 +219,8 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
             if !value.is_empty() {
                 runtime_secs = Some(value.parse().context("invalid runtime in probe reply")?);
             }
+        } else if let Some(value) = line.strip_prefix("drained=") {
+            drained = value == "1";
         } else if let Some(value) = line.strip_prefix("size=") {
             log_size = Some(
                 value
@@ -263,6 +274,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
         state,
         runtime_secs,
         alive: alive_now,
+        drained,
         log_size: log_size.context("invalid probe reply: missing size")?,
         bytes,
     })

@@ -150,7 +150,7 @@ test("a done job's log is read once it has drained, so a cap that lands after rc
 	const stuck = { ...ops, async poll() { return { state: "done" as const, exitCode: 7, logBytes: 6, drained: false }; }, async output() { return { data: Buffer.from("early\n") }; } };
 	const text: Buffer[] = [];
 	assert.deepEqual(await watchJob(stuck, "123abc", { onData: (d) => text.push(d), drainWait: 50 }), { exitCode: 7 });
-	assert.equal(Buffer.concat(text).toString(), "early\n[mule: the command exited 7, but a process it started still holds its output; the log may be incomplete]\n");
+	assert.equal(Buffer.concat(text).toString(), "early\n[mule: the command exited 7, but its log was not finalized (a process it started still holds its output, or the job was killed); the log may be incomplete]\n");
 });
 
 test("abort kills the running job; after a handback it leaves the job running for its key", async () => {
@@ -187,7 +187,7 @@ test("read-only bash: readers pass, anything that may write is refused", () => {
 		"wc -l a; echo done", "true", "cat a >/dev/null 2>&1", "echo \"a > b\"", "fd -e ts", "sort a | uniq -c",
 		"sed -n '/err/p; 3q' a", "sed -E 's/(a|b)+/x/g' a", "sed -e '1d' -e 's|/|:|2' a", "sed ':a;N;$!ba;s/\\n/ /g' a",
 		"sed -n '/^start/,/^end/{/x/p}' a", "awk -F: '$3 > 100 {print $1}' /etc/passwd", "awk '/a|b/ {n++} END {print n}' a",
-		"awk -v x=1 'NR > x' a", "awk '{print \"a > b\", $2}' a", "uniq -c a", "xxd -l 64 a", "tree -L 2", "git grep -n x",
+		"awk -v x=1 'NR > x' a", "awk '{print \"a > b\", $2}' a", "awk '{print $1}\n$1 > 5 {n++}' a", "uniq -c a", "xxd -l 64 a", "tree -L 2", "git grep -n x",
 	]) assert.equal(readOnlyRefusal(command), undefined, command);
 	for (const [command, why] of [
 		["echo x > a", /redirection/], ["echo x >> a", /redirection/], ["cat a | tee b", /tee/], ["rm -rf src", /rm/],
@@ -201,6 +201,10 @@ test("read-only bash: readers pass, anything that may write is refused", () => {
 		["awk '{print > \"out\"}' a", /awk writing/], ["awk '{print $1 >> \"out\"}' a", /awk writing/],
 		["awk '{printf \"%s\\n\", $1 > \"out\"}' a", /awk writing/], ["awk '{print | \"sh\"}' a", /awk piping/],
 		["awk '{\"date\" | getline d}' a", /awk/], ["awk -f prog.awk a", /awk option/], ["awk -i inplace '{print}' a", /awk option/],
+		// awk joins a backslash-newline, and a newline after `,`, `&&`, `||`,
+		// `do` or `else`, before parsing: the print and its > are one statement.
+		["awk '{print \\\n> \"out\"}' a", /awk writing/], ["awk '{printf \"%s\",\n$1 > \"out\"}' a", /awk writing/],
+		["awk '{print $1, # why\n$2 > \"out\"}' a", /awk writing/], ["awk '{print \"a\\\nb\" > \"out\"}' a", /awk writing/],
 		["uniq a out", /output file/], ["xxd a out", /output file/], ["tree -o out", /tree -o/], ["rg --pre ./run x", /preprocessor/],
 		["git -c core.pager=sh log", /git -c/], ["git grep -O x", /pager/], ["diff <(ls) a", /process substitution/], ["X=1 ls", /assignment/],
 		["bash -c 'rm a'", /bash/], ["npm test", /npm/], ["make", /make/], ["ls; python3 x.py", /python3/],

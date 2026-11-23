@@ -1002,6 +1002,61 @@ fn a_job_exceeding_its_remote_cap_is_killed_with_124() {
 }
 
 #[test]
+fn poll_tells_a_killed_log_pipeline_from_one_that_drained() {
+    require_sshd!();
+    let sshd = Sshd::start();
+    let _master = sshd.open_master(&sshd.socket);
+    let tmux = Tmux::new(&sshd, "drain-kill");
+    let config = sshd.write_config(&tmux.name);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("max_log_bytes = 10\n");
+    std::fs::write(&config, text).unwrap();
+    let poll = |id: &str| -> serde_json::Value {
+        serde_json::from_str(&stdout(&sshd.mule(&config, &["poll", id, "--json"]))).unwrap()
+    };
+    let done = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let json = poll(id);
+            if json["state"] == "done" {
+                return json;
+            }
+            assert!(Instant::now() < deadline, "{id} never finished: {json}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Control: a pipeline that reaches EOF is drained, cap marker and all.
+    let clean = stdout(&sshd.mule(&config, &["run", "printf 0123456789abcdef"]));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while done(&clean)["drained"] != true {
+        assert!(Instant::now() < deadline, "clean job never drained");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // rc 0 lands while a child still holds stdout, six bytes past the cap
+    // in flight. A kill then tears the pipeline down before it writes the
+    // cap marker. The session is gone, but the log was never finalized: the
+    // session's absence alone read as `drained: true`, so a capped prefix
+    // passed for a whole, successful result (review, 2026-11-23).
+    let cut = stdout(&sshd.mule(
+        &config,
+        &["run", "printf 0123456789abcdef; (sleep 30) & exit 0"],
+    ));
+    let before = done(&cut);
+    assert_eq!(before["rc"], 0, "{before}");
+    assert_eq!(before["drained"], false, "{before}");
+    assert!(sshd.mule(&config, &["kill", &cut]).status.success());
+    let after = poll(&cut);
+    assert_eq!(after["rc"], 0, "{after}");
+    assert_eq!(
+        after["drained"], false,
+        "a killed pipeline is not a drained one: {after}"
+    );
+    clean_jobs(&sshd, &[clean, cut]);
+}
+
+#[test]
 fn a_job_finishing_inside_its_remote_cap_keeps_its_rc_and_no_watchdog() {
     require_sshd!();
     let sshd = Sshd::start();

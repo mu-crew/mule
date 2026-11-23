@@ -124,7 +124,10 @@ export async function watchJob(ops: JobOps, job: string, options: { signal?: Abo
 			const notes: string[] = [];
 			if (cappedAt !== undefined) notes.push(`[mule: the log reached max_log_bytes (${cappedAt} bytes); later output was discarded]`);
 			if (poll.logBytes > data.length) notes.push(`[mule: showing the last ${data.length} of ${poll.logBytes} log bytes]`);
-			if (!poll.drained) notes.push(`[mule: the command exited ${poll.exitCode}, but a process it started still holds its output; the log may be incomplete]`);
+			// Undrained: a process the command started still holds its output,
+			// or a kill cut the log pipeline before it finished. mule cannot
+			// tell these apart, and neither is a whole log.
+			if (!poll.drained) notes.push(`[mule: the command exited ${poll.exitCode}, but its log was not finalized (a process it started still holds its output, or the job was killed); the log may be incomplete]`);
 			if (notes.length) onData(Buffer.from(`${data.length && data[data.length - 1] !== 10 ? "\n" : ""}${notes.join("\n")}\n`));
 			return { exitCode: poll.exitCode };
 		}

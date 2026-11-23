@@ -160,6 +160,7 @@ export default function (pi: ExtensionAPI) {
 						masterDown = false;
 						(contextOf(args) ?? ctx).ui.setStatus("mule", `mule ${host}:${prompt.root}`);
 					}
+					resumeReattach();
 					return result;
 				} catch (error) {
 					if (error instanceof MasterRequired) throw handBack(error, contextOf(args) ?? ctx);
@@ -186,32 +187,64 @@ export default function (pi: ExtensionAPI) {
 		let reattaching: Promise<void> | undefined;
 		watching?.abort();
 		const watch = watching = new AbortController();
+		// Per call id, for this session: announced to the model, being
+		// watched, result reported. A resumed watch must not announce or
+		// report twice, and the branch need not show our messages yet.
+		const announced = new Set<string>();
+		const watched = new Set<string>();
+		const reported = new Set<string>();
+		// A watch the master dropped. It resumes on the next workspace call
+		// that succeeds -- the user's go-ahead that the master is back --
+		// and never on a timer: retrying exit 3 in the background only spins.
+		let reattachStalled = false;
+		const resumeReattach = () => {
+			if (!reattachStalled || !serve) return;
+			reattachStalled = false;
+			void reattach(serve);
+		};
 		const reattach = async (ops: MuleServeBackend) => {
-			const lost = interruptedBashCalls((ctx.sessionManager.getBranch?.() ?? []) as Entry[]);
+			const lost = interruptedBashCalls((ctx.sessionManager.getBranch?.() ?? []) as Entry[])
+				.filter(({ id }) => !watched.has(id) && !reported.has(id));
 			await Promise.all(lost.map(async ({ id, command }) => {
+				watched.add(id);
+				let job: string | undefined;
 				try {
 					// Look up, never `run --key`: that would start a job the
 					// lost call may never have dispatched.
-					const job = await ops.lookup(sessionKey(id));
+					job = await ops.lookup(sessionKey(id));
 					if (!job || watch.signal.aborted) return;
 					const what = `bash call ${id}${command ? ` (\`${command.length > 200 ? `${command.slice(0, 200)}...` : command}\`)` : ""}`;
-					ctx.ui.notify(`mule: reattached to job ${job} on ${host}, from ${what} before Pi restarted`, "info");
-					pi.sendMessage({
-						customType: "mule-reattach", display: true, details: { toolCallId: id, job },
-						content: `${what} was interrupted when Pi stopped, but its job ${job} kept running on ${host}. mule is watching it and will report its result here. Do not run it again.`,
-					});
+					if (!announced.has(id)) {
+						announced.add(id);
+						ctx.ui.notify(`mule: reattached to job ${job} on ${host}, from ${what} before Pi restarted`, "info");
+						pi.sendMessage({
+							customType: "mule-reattach", display: true, details: { toolCallId: id, job },
+							content: `${what} was interrupted when Pi stopped, but its job ${job} kept running on ${host}. mule is watching it and will report its result here. Do not run it again.`,
+						});
+					}
 					const parts: Buffer[] = [];
 					const { exitCode } = await watchJob(ops, job, { signal: watch.signal, onData: (data) => parts.push(data) });
 					const output = Buffer.concat(parts);
 					const tail = output.length > REATTACH_TAIL_BYTES ? `[mule: showing the last ${REATTACH_TAIL_BYTES} bytes]\n${output.subarray(-REATTACH_TAIL_BYTES).toString()}` : output.toString();
+					reported.add(id);
 					pi.sendMessage({
 						customType: "mule-reattach", display: true, details: { toolCallId: id, job, exitCode },
 						content: `${what}, reattached as job ${job}, exited with code ${exitCode}. This is its result; do not run it again.\n\n${tail.trimEnd() || "(no output)"}`,
 					}, { deliverAs: "steer" });
 				} catch (error) {
 					if (watch.signal.aborted) return;
+					if (error instanceof MasterRequired) {
+						// Not a handback: no tool call is waiting on this, so
+						// there is no turn to stop. The job runs on; say so.
+						reattachStalled = masterDown = true;
+						ctx.ui.setStatus("mule", `mule ${host}: SSH master down; open it, then continue`);
+						ctx.ui.notify(`mule lost its SSH master for ${host} while watching ${job ? `job ${job}` : `${id}'s job`}. The job keeps running; its result is reported after the master is open again and a workspace tool runs.\n${error.message}`, "error");
+						return;
+					}
 					// The job keeps its key: a later restart looks again.
 					ctx.ui.notify(`mule: could not reattach ${id}'s job: ${String(error instanceof Error ? error.message : error)}`, "error");
+				} finally {
+					watched.delete(id);
 				}
 			}));
 		};

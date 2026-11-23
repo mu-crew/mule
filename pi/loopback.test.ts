@@ -7,7 +7,7 @@ import test from "node:test";
 import { MuleExecBackend, quote } from "./exec-backend.ts";
 import { MasterRequired } from "./ops.ts";
 import { bashJob } from "./policy.ts";
-import { jobKey, loopResources, runJob, workspaceRouter } from "./routing.ts";
+import { jobKey, loopResources, runJob, watchJob, workspaceRouter } from "./routing.ts";
 import { MuleServeBackend } from "./serve-backend.ts";
 import { havePi, runPiCase } from "./test/run-pi.ts";
 
@@ -145,6 +145,16 @@ test("policy over one capped master: kill, reattach, key prefix, caps, own exit 
 		assert.deepEqual(await collect({ cwd: root, key: "pi-loopback-late-cap", command: "echo early; (sleep 1; printf 0123456789abcdef) & exit 7" }), {
 			exitCode: 7, text: "early\n0123\n[mule: the log reached max_log_bytes (10 bytes); later output was discarded]\n",
 		});
+		// rc 0 lands with six bytes past the cap still in the pipe, held open
+		// by a child; a kill then cuts the pipeline before its cap marker. A
+		// cut log is never a whole one: the answer says it may be incomplete.
+		const cut = await ops.exec({ cwd: root, key: "pi-loopback-cut", command: "printf 0123456789abcdef; (sleep 30) & exit 0" });
+		for (let i = 0; i < 200 && (await ops.poll(cut)).state !== "done"; i++) await delay(25);
+		assert.deepEqual(await ops.poll(cut), { state: "done", exitCode: 0, logBytes: 10, drained: false });
+		await ops.kill(cut);
+		const parts: Buffer[] = [];
+		assert.deepEqual(await watchJob(ops, cut, { onData: (data) => parts.push(data), drainWait: 200 }), { exitCode: 0 });
+		assert.match(Buffer.concat(parts).toString(), /^0123456789\n\[mule: [^\n]*the log may be incomplete\]\n$/);
 	} finally {
 		writeFileSync(config, readFileSync(config, "utf8").replace("max_log_bytes = 10\n", ""));
 	}
