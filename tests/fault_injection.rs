@@ -538,7 +538,11 @@ fn exercise(scenario: &Scenario) {
                             String::from_utf8_lossy(&out.stderr)
                         );
                     }
-                    let verdict = if hit.is_empty() {
+                    let verdict = if fixture_timeout(&out) {
+                        // Retried already: still no master is the fixture's
+                        // failure, and this case tested nothing.
+                        Err("harness: the fake master's check timed out".into())
+                    } else if hit.is_empty() {
                         // The scenario ran fewer commands this time: say so,
                         // rather than pass a run that injected nothing.
                         Err(format!("injection {n} was never reached"))
@@ -572,12 +576,23 @@ fn exercise(scenario: &Scenario) {
 
 // -- checks ---------------------------------------------------------------------
 
+/// `poll --json` past its master check: exit 0 and an `unknown` object with
+/// its reason, whatever failed (SPEC § Job identity, "`poll --json` answers
+/// all five states with exit 0"). A forwarded probe error -- a non-zero exit
+/// with no object -- is the regression this exists to catch.
 fn poll_is_unknown(_: &ShimHost, _: &[String], out: &Output) -> Result<(), String> {
-    match json(out) {
-        Some(v) if v["state"] == "unknown" => Ok(()),
-        Some(v) => Err(format!("answered {}", v["state"])),
-        None if !out.status.success() => Ok(()),
-        None => Err("exit 0 with no answer".into()),
+    if out.status.code() != Some(0) {
+        return Err(format!("exit {:?}, not 0", out.status.code()));
+    }
+    let Some(v) = json(out) else {
+        return Err("exit 0 with no JSON object".into());
+    };
+    if v["state"] != "unknown" {
+        return Err(format!("answered {}", v["state"]));
+    }
+    match v["reason"].as_str() {
+        Some(reason) if !reason.trim().is_empty() => Ok(()),
+        _ => Err(format!("unknown without a reason: {v}")),
     }
 }
 
