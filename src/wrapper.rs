@@ -235,14 +235,43 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
         )
     };
 
-    format!(
-        "printf %s {command} | base64 -d > {dir}/cmd.tmp && mv -f {dir}/cmd.tmp {dir}/cmd && \
-         tmux -L {} -f /dev/null new-session -d -s mule-{} \
+    let start = format!(
+        "tmux -L {} -f /dev/null new-session -d -s mule-{} \
          '{{ {run}; }} \
           | {{ head -c {} > {dir}/log; cat > {dir}/.overflow; \
                if [ -s {dir}/.overflow ]; then echo 1 > {dir}/truncated; fi; \
                rm -f {dir}/.overflow; : > {dir}/drained; }}'",
         host.tmux_socket, job.id, host.max_log_bytes
+    );
+    format!(
+        "printf %s {command} | base64 -d > {dir}/cmd.tmp && mv -f {dir}/cmd.tmp {dir}/cmd && \
+         {{ {}; }}",
+        new_session(&start)
+    )
+}
+
+/// `start` (a job's `tmux new-session`), retried while it meets a server on
+/// its way out.
+///
+/// A tmux server exits with its last session, and a client that connects in
+/// the moment between that session's end and the server's exit is never
+/// accepted: the server closes it unanswered and tmux prints `server exited
+/// unexpectedly`. That is one job ending while another dispatches -- measured
+/// with stock tmux, a `sleep 0.02` session and a `new-session` 19ms later,
+/// 30 of 300 rounds; Pi's parallel tools over one master hit it in CI. The
+/// retry cannot start a job twice: an unaccepted client's command never ran,
+/// and by its EOF the server is gone, so the next attempt starts a fresh
+/// one. Any other failure is passed on as tmux printed it. Four attempts
+/// (the `[0-2]` on the count), because each needs a session to end in a
+/// window of well under a millisecond.
+fn new_session(start: &str) -> String {
+    format!(
+        "mule_n=0; until mule_e=$({start} 2>&1); do \
+           case $mule_n$mule_e in \
+             [0-2]*\"server exited unexpectedly\"*) mule_n=$((mule_n + 1));; \
+             *) printf '%s\\n' \"$mule_e\" >&2; mule_n=x; break;; \
+           esac; \
+         done; [ $mule_n != x ]"
     )
 }
 
@@ -325,8 +354,7 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
         "printf %s {command} | base64 -d > {dir}/cmd.tmp && mv -f {dir}/cmd.tmp {dir}/cmd && \
          printf %s {wrapper} | base64 -d > {dir}/wrapper && \
          printf %s {consumer} | base64 -d > {dir}/pipe && echo tui > {dir}/mode && \
-         tmux -L {socket} -f /dev/null new-session -d -s mule-{id} -c {dir} \
-           \"sh ./wrapper\" && \
+         {{ {start}; }} && \
          {{ tmux -L {socket} set-option -g extended-keys on 2>/dev/null && \
             tmux -L {socket} set-option -g extended-keys-format csi-u 2>/dev/null || \
             {{ tmux -L {socket} kill-session -t mule-{id} 2>/dev/null; \
@@ -337,6 +365,11 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
         id = job.id,
         wrapper = encode_command(wrapper.as_bytes()),
         consumer = encode_command(consumer.as_bytes()),
+        start = new_session(&format!(
+            "tmux -L {socket} -f /dev/null new-session -d -s mule-{id} -c {dir} \"sh ./wrapper\"",
+            socket = host.tmux_socket,
+            id = job.id,
+        )),
     )
 }
 
