@@ -750,7 +750,7 @@ pub fn remove_with_retry(
             }
             None => None,
         };
-        crate::lease::write_line_file(path, &line)
+        crate::jobfile::write_line_file(path, &line)
             .with_context(|| format!("cannot write stop record {}: {line}", path.display()))?;
     }
     Ok(StopOutcome::GaveUp { line, code })

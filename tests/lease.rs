@@ -18,7 +18,8 @@ use std::time::Duration;
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_ORPHAN, MuleError};
 use mule::forward::{Spec, read_record};
-use mule::lease::{Hold, Request, SignalSteps, hold, on_signal, start, write_job_file};
+use mule::jobfile::write_job_file;
+use mule::lease::{Hold, Request, SignalSteps, hold, on_signal, start};
 use mule::transport::{Fake, MuxOp, Output, Transport};
 use mule::wrapper::{JobId, JobMetadata};
 

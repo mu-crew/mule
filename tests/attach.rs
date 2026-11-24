@@ -15,10 +15,8 @@ use std::time::Duration;
 
 use mule::config::{Config, Host};
 use mule::errors::{MuleError, exit_code};
-use mule::lease::{
-    Hold, Owned, Published, attach, hold, publish_job_file, publish_job_file_with,
-    stop_failed_path, stop_retry,
-};
+use mule::jobfile::{Published, publish_job_file, publish_job_file_with, stop_failed_path};
+use mule::lease::{Hold, Owned, attach, hold, stop_retry};
 use mule::stopfence::StopFence;
 use mule::transport::{Fake, Output};
 use mule::wrapper::JobId;

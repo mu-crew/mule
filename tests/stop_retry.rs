@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mule::config::{Config, Host};
+use mule::jobfile::{stop_failed_path, write_line_file};
 use mule::jobs::{
     Clock, MASTER_POLL, RECORD_MAX_BYTES, RetryPolicy, StopOutcome, record_line, remove_with_retry,
 };
-use mule::lease::{stop_failed_path, write_line_file};
 use mule::stopfence::StopFence;
 use mule::transport::{Fake, MuxOp, Output, Transport};
 use mule::wrapper::JobId;

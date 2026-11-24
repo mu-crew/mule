@@ -15,6 +15,7 @@ pub mod forward;
 #[doc(hidden)]
 pub mod helper;
 mod init;
+pub mod jobfile;
 pub mod jobs;
 pub mod key;
 pub mod lease;
