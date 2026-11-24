@@ -58,6 +58,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - name: TEMP loop Pi loopback (drop before merge)
+        if: runner.os == 'Linux'
+        env:
+          MULE_REQUIRE_LAYERS: "1"
+        run: |
+          fails=0
+          for i in $(seq 1 30); do
+            cargo test --locked --test local_sshd pi_ops_over_a_capped_master -q >"/tmp/loop-$i.txt" 2>&1 || { fails=$((fails+1)); echo "round $i FAILED"; grep -E "server exited|Error:" "/tmp/loop-$i.txt" | head -5; }
+          done
+          echo "loop: $fails of 30 failed"
+          [ "$fails" = 0 ]
       # Fail, rather than skip, if the installs above did not take.
       - run: cargo test --locked
         env:
