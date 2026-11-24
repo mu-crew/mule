@@ -431,7 +431,7 @@ pub fn forward(t: &dyn Transport, host: &Host, specs: &[Spec]) -> Result<()> {
 fn forward_one(t: &dyn Transport, host: &Host, spec: &Spec, pid: Option<u32>) -> Result<()> {
     // Held from the record read to the record write: the whole sequence is one
     // transaction on this LOCAL. Dropped on every return path.
-    let _lock = lock_local(host, &spec.local)?;
+    // MUTANT: no per-LOCAL lock
     // 1. Same LOCAL, different REMOTE, same master: the recorded forward is
     //    still in that master's table. Cancel it first or the new one wedges it.
     if let Some(old) = read_record(host, &spec.local)

@@ -422,7 +422,7 @@ fn watcher() -> String {
         "d=$1; X=$2; T=$3; n=$4\n{KILL_FNS}\
          c() {{ [ -s \"$d/rc.$1\" ] && return; : > \"$d/cx.$1\"; L $1 || return; K TERM $p $1 t; \
          ( sleep {KILL_GRACE_SECS}; [ -s \"$d/rc.$1\" ] || K KILL $p $1 t ) & }}\n\
-         while IFS= read -r l; do case $l in ''|*[!0-9]*) continue;; esac; [ $l -lt $n ] && c $l; done\n\
+         while IFS= read -r l; do case $l in ''|*[!0-9]*) continue;; esac; [ $l -lt 0 ] && c $l; done\n\
          k=0; while [ $k -lt $n ]; do c $k; k=$((k+1)); done; wait"
     )
 }
