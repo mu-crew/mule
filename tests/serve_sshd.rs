@@ -144,15 +144,24 @@ fn reader_gone_within(w: &mut std::fs::File, limit: Duration) {
     }
 }
 
-/// Holds the master's only session for `secs`, from a bare ssh, and
-/// returns once the holder's command runs.
-fn hold_the_session(sshd: &Sshd, secs: u32) -> Child {
+/// Holds the master's only session from a bare ssh until `release` exists
+/// (or 60s pass, so a failed test cannot leave it holding), and returns once
+/// the holder's command runs.
+///
+/// Gated, not a `sleep 3`: the probe then cannot race the holder's own end,
+/// and the release is an event the test makes rather than one it guesses.
+fn hold_the_session(sshd: &Sshd) -> (Child, PathBuf) {
     let flag = sshd.dir.join("held");
+    let release = sshd.dir.join("release");
     let holder = Command::new(sshd.dir.join("ssh"))
         .arg("-S")
         .arg(&sshd.socket)
         .args(["-o", "BatchMode=yes", "127.0.0.1"])
-        .arg(format!("touch '{}'; sleep {secs}", flag.display()))
+        .arg(format!(
+            "touch '{}'; i=0; while [ ! -e '{}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done",
+            flag.display(),
+            release.display()
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -166,20 +175,36 @@ fn hold_the_session(sshd: &Sshd, secs: u32) -> Child {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    holder
+    (holder, release)
 }
+
+/// Only a hang guard: what the cases below wait for is an event (a reply, a
+/// closed channel, a gone reader), and a correct build meets it in well under
+/// a second.
+const WATCHDOG: Duration = Duration::from_secs(30);
 
 /// The oracle every case here rests on: it must see a held session.
 #[test]
 fn the_session_probe_sees_a_held_session() {
     require_sshd!();
     let (sshd, _master, _config) = setup();
-    let mut holder = hold_the_session(&sshd, 3);
+    let (mut holder, release) = hold_the_session(&sshd);
     let held = session_free(&sshd);
-    let _ = holder.kill();
-    let _ = holder.wait();
+    // Let the holder's command end, and wait for its ssh to exit: that is the
+    // channel closed. Killing the local ssh instead left the remote command
+    // holding the session until its own `sleep 3` ended, and the free check
+    // then raced macOS channel teardown (CI, macos-latest: still held at 3s).
+    std::fs::write(&release, "").unwrap();
+    let t = Instant::now();
+    while holder.try_wait().unwrap().is_none() {
+        if t.elapsed() > WATCHDOG {
+            let _ = holder.kill();
+            panic!("the holder did not end after its release");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!held, "the probe reported a held session free");
-    session_frees_within(&sshd, Duration::from_secs(3));
+    session_frees_within(&sshd, WATCHDOG);
 }
 
 #[test]
