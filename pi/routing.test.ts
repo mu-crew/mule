@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -224,4 +225,38 @@ test("bash jobs: plain without a muzzle; with one, heavy commands queue and the 
 	const untimed = bashJob("x", { muzzle: "/m" });
 	assert.equal(untimed.timeout, undefined);
 	assert.doesNotMatch(untimed.command, /run-timeout|command -v timeout/);
+});
+
+// The generated script, run by a real bash on a PATH without timeout(1) (stock
+// macOS has none). Muzzle widens mule's deadline by 930 s, so without a
+// fallback a light command's own timeout silently becomes ~16 minutes.
+test("a light command keeps Pi's timeout on a host without timeout(1)", async () => {
+	const dir = realpathSync(mkdtempSync(join(tmpdir(), "mule-no-timeout-")));
+	try {
+		const bin = join(dir, "bin");
+		mkdirSync(bin);
+		for (const tool of ["bash", "sleep", "touch"]) {
+			const found = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
+			symlinkSync(found, join(bin, tool));
+		}
+		const run = (command: string, timeout: number) => spawnSync("/bin/bash", ["-c", bashJob(command, { muzzle: join(dir, "absent"), timeout }).command], {
+			env: { PATH: bin }, encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL",
+		});
+		assert.ok(!existsSync(join(bin, "timeout")));
+
+		const fast = run("echo out; echo err >&2; exit 7", 5);
+		assert.deepEqual([fast.status, fast.stdout, fast.stderr], [7, "out\n", "err\n"]);
+
+		// A command that ignores the signals timeout(1) would send must still
+		// be gone, and nothing of it may run on after the exit.
+		const late = join(dir, "late");
+		const started = Date.now();
+		const slow = run(`trap '' HUP TERM INT; sleep 3; touch ${late}`, 1);
+		assert.equal(slow.status, 124, slow.stderr);
+		assert.ok(Date.now() - started < 2_500, "the timeout, not the command, ended it");
+		await new Promise((resolve) => setTimeout(resolve, 3_500));
+		assert.ok(!existsSync(late), "the timed-out command ran on");
+	} finally {
+		rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+	}
 });
