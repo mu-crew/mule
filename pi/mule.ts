@@ -375,7 +375,9 @@ export default function (pi: ExtensionAPI) {
 			const target = (await ready()).router.remotePath(path);
 			// Like pi's local find: --no-require-git only when no ancestor has .git.
 			// Inside a repo it would make fd obey a .gitignore above the repo root.
-			const walk = `nrg=--no-require-git; d=${quote(target)}; while :; do if [ -e "$d/.git" ]; then nrg=; break; fi; case "$d" in /|.) break;; esac; d=$(dirname -- "$d"); done; `;
+			// target is normalized and absolute. Slice off the last component in
+			// shell: command substitution would strip newlines from the parent.
+			const walk = `nrg=--no-require-git; d=${quote(target)}; while :; do if [ -e "$d/.git" ]; then nrg=; break; fi; [ "$d" = / ] && break; d=\${d%/*}; d=\${d:-/}; done; `;
 			return remoteSearch(id, `${walk}fd --glob --hidden $nrg --exclude .git --max-results ${number(params.limit, 1000)} ${fdPattern(params.pattern, target)} ${quote(target)}`, signal);
 		} }));
 		pi.registerTool(tool({ ...local.ls, async execute(id, params, signal, update, context) {
