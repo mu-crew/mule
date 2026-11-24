@@ -85,10 +85,9 @@ Keyed artifacts are retained by mule until explicitly removed.
   `!` waits for the dispatch answer, then stops exactly that job with
   `mule kill`. An abort before dispatch starts nothing. A cancelled file op
   is cancelled alone in serve (queued: dropped; in flight: killed), and the
-  serve child keeps serving. Under muzzle, a light command with a timeout
-  runs `timeout(1)` in a process group of its own, which `mule kill`'s
-  hangup does not reach; the job's shell takes the hangup and kills that
-  group, so nothing of an aborted command runs on.
+  serve child keeps serving. A timed light command under muzzle gets its
+  own process group. The job's shell catches `mule kill`'s hangup and kills
+  that group.
 - **Reattach.** A job's key is a hash of the Pi session id and the tool
   call id, so a replayed call gets the job already running, or its result,
   instead of running it again. Pi itself does not replay an interrupted
@@ -137,9 +136,10 @@ Keyed artifacts are retained by mule until explicitly removed.
   host's `muzzle wrap` whether the command is heavy and, if so, runs it
   under `muzzle run --rule R --slots N --timeout 900`, with Pi's timeout as
   `--run-timeout` (counted from admission) and mule's deadline widened to
-  timeout + 930 s as a backstop; a light command keeps Pi's timeout via
-  `timeout(1)`. A muzzle that is gone or answers nothing usable runs the
-  command unwrapped. `MULE_PI_MUZZLE=off` skips it; an absolute path pins it.
+  timeout + 930 s as a backstop. Light commands, including when muzzle
+  is gone or returns no usable answer, skip admission. Their Pi timeout
+  (exit 124) uses `timeout(1)` when present, or a Bash watchdog.
+  `MULE_PI_MUZZLE=off` skips it; an absolute path pins it.
 - **Output caps.** A `bash` result is the last 64 KiB of the job's log.
   When the job outran `max_log_bytes` (`mule tail` says so on stderr), or
   the log is longer than that tail, a `[mule: ...]` note follows the

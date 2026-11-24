@@ -14,30 +14,47 @@ const MUZZLE_SLACK_SECS = 30;
  * host's own muzzle whether the command is heavy (its config is the only
  * judge) and, if so, queues it there. A Pi timeout must then count from
  * admission, not from the queue (`--run-timeout`), so mule's deadline is
- * only a backstop: timeout + queue + slack. A light command keeps the Pi
- * timeout through `timeout(1)` where the host has it. A muzzle that has
- * disappeared since startup, or answers nothing usable, runs the command
- * unwrapped: admission is advice, never a reason not to run.
+ * only a backstop: timeout + queue + slack. Light commands (including a
+ * missing muzzle or unusable wrap answer) get a separate Pi deadline.
  */
 export function bashJob(command: string, options: { muzzle?: string; timeout?: number }) {
 	const timeout = options.timeout && options.timeout > 0 ? Math.ceil(options.timeout) : undefined;
 	if (!options.muzzle) return { command, timeout };
 	const limit = timeout ? ` --run-timeout ${timeout}` : "";
-	// timeout(1) leads a process group of its own, so the hangup `mule kill`
-	// sends the pane's group never reached it: an aborted command ran on and
-	// wrote to the workspace (review, 2026-11-23). This shell stays in the
-	// pane's group, takes the hangup, and kills timeout's whole group. muzzle
-	// needs none of this: measured under tmux kill-session, its command dies
-	// with the pane's group.
-	const light = timeout
-		? `if command -v timeout >/dev/null 2>&1; then
+	// Without timeout(1), Bash 3.2 job control gives the command and timer
+	// their own groups. In both branches this shell stays in the pane's
+	// group to relay mule's hangup to the command group.
+	const light = timeout ? `if ! command -v timeout >/dev/null 2>&1; then
+  stop_group() {
+    [ -n "$1" ] || return 0
+    # Stop before killing: a child woken by another member's death can fork.
+    kill -STOP -- -"$1" || :
+    kill -KILL -- -"$1" || :
+  } 2>/dev/null
+  finish() {
+    trap '' HUP TERM INT USR1
+    stop_group "$p"; stop_group "$timer"; exit "$1"
+  }
+  # A trap between an async launch and $! must not lose that child's group.
+  interrupted() { if [ -n "$timer" ]; then finish "$1"; else pending=$1; fi; }
+  p= timer= pending=
+  trap 'interrupted 129' HUP TERM INT
+  trap 'interrupted 124' USR1
+  set -m
+  bash -c "$c" </dev/null & p=$!
+  ( sleep ${timeout} || :; kill -USR1 "$$" ) </dev/null >/dev/null 2>&1 & timer=$!
+  set +m
+  [ -z "$pending" ] || finish "$pending"
+  rc=0
+  wait "$p" || rc=$?
+  finish "$rc"
+else
   p=
   trap '[ -n "$p" ] && kill -KILL -- -"$p" "$p" 2>/dev/null; exit 129' HUP TERM INT
   timeout ${timeout} bash -c "$c" & p=$!
   wait "$p"; exit
 fi
-`
-		: "";
+` : "";
 	const script = `c=${quote(command)}
 m=${quote(options.muzzle)}
 if [ -x "$m" ] && w=$("$m" wrap --json --cwd "$PWD" -- "$c" 2>/dev/null) \\
