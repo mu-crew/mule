@@ -1,7 +1,8 @@
 //! Fair, per-host serialization for access to mule's private ssh channel.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -201,14 +202,7 @@ impl Drop for HeldLock {
     }
 }
 
-#[cfg(unix)]
 fn with_counter_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    use std::os::fd::AsRawFd;
-
-    unsafe extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
-
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -218,33 +212,32 @@ fn with_counter_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T>
         .context("cannot open counter lock")?;
     // The OS releases flock when a process dies. This avoids a stale sentinel,
     // while keeping the ticket read-modify-write atomic.
-    if unsafe { flock(file.as_raw_fd(), 2) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("cannot acquire counter lock");
-    }
+    flock_exclusive(&file, true).context("cannot acquire counter lock")?;
     let result = f();
     drop(file);
     result
 }
 
-#[cfg(not(unix))]
-fn with_counter_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let sentinel = path.join("counter.lock");
+/// Take an exclusive `flock(2)` on `file`, retrying on EINTR. `Ok(false)` only
+/// when `wait` is false and another open file description holds it. The lock
+/// is per open file description, so two threads of one process exclude each
+/// other too.
+pub(crate) fn flock_exclusive(file: &File, wait: bool) -> std::io::Result<bool> {
+    let operation = if wait {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
     loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&sentinel)
-        {
-            Ok(file) => {
-                let result = f();
-                drop(file);
-                fs::remove_file(&sentinel).ok();
-                return result;
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error).context("cannot acquire counter lock"),
+        // SAFETY: `file` owns a valid fd for the duration of the call.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            ErrorKind::Interrupted => {}
+            ErrorKind::WouldBlock if !wait => return Ok(false),
+            _ => return Err(error),
         }
     }
 }
@@ -409,23 +402,13 @@ fn read_counters(path: &Path) -> Result<Counters> {
     Ok(Counters { next, serving })
 }
 
-#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-
-    let Ok(pid) = i32::try_from(pid) else {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
     // Signal 0 performs the existence/permission check without sending a signal.
-    if unsafe { kill(pid, 0) } == 0 {
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
-    std::io::Error::last_os_error().raw_os_error() != Some(3)
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }

@@ -290,10 +290,7 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
 }

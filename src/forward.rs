@@ -287,15 +287,6 @@ pub fn try_lock_local(host: &Host, local: &Path) -> Result<Option<LocalLock>> {
 }
 
 fn flock_local(host: &Host, local: &Path, wait: bool) -> Result<Option<LocalLock>> {
-    use std::os::fd::AsRawFd;
-
-    unsafe extern "C" {
-        fn flock(fd: i32, operation: i32) -> i32;
-    }
-    // LOCK_EX and LOCK_NB; the same values on Linux and macOS, as in `lock.rs`.
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-
     let path = record_path(host, local).with_extension("lock");
     let dir = path.parent().expect("lock paths have a parent");
     std::fs::create_dir_all(dir)
@@ -311,32 +302,22 @@ fn flock_local(host: &Host, local: &Path, wait: bool) -> Result<Option<LocalLock
     // fact the kernel reported, which [`on_lock_contended`] hands to a test:
     // "the second caller found it held" is what exclusion means, and no sleep
     // can observe it.
-    let mut operation = LOCK_EX | LOCK_NB;
-    // The lock is per open file description, so two threads of one process
-    // exclude each other too, which the layer-1 tests rely on.
-    loop {
-        // SAFETY: `file` owns a valid fd for the duration of the call.
-        if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
-            return Ok(Some(LocalLock { _file: file }));
+    let lock = |wait| {
+        crate::lock::flock_exclusive(&file, wait)
+            .with_context(|| format!("cannot lock forward state {}", path.display()))
+    };
+    if !lock(false)? {
+        if !wait {
+            return Ok(None);
         }
-        let error = std::io::Error::last_os_error();
-        match error.kind() {
-            ErrorKind::Interrupted => {}
-            ErrorKind::WouldBlock if !wait => return Ok(None),
-            ErrorKind::WouldBlock if operation != LOCK_EX => {
-                CONTENDED_HOOK.with(|hook| {
-                    if let Some(hook) = hook.borrow().as_ref() {
-                        hook(host, local);
-                    }
-                });
-                operation = LOCK_EX;
+        CONTENDED_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(host, local);
             }
-            _ => {
-                return Err(error)
-                    .with_context(|| format!("cannot lock forward state {}", path.display()));
-            }
-        }
+        });
+        lock(true)?;
     }
+    Ok(Some(LocalLock { _file: file }))
 }
 
 /// The master pid from `-O check`'s `Master running (pid=N)`. ssh prints it on

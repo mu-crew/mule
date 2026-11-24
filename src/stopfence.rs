@@ -31,7 +31,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -104,14 +103,6 @@ impl StopFence {
     }
 
     fn flock(&self, wait: bool) -> Result<Option<FenceLock>> {
-        unsafe extern "C" {
-            fn flock(fd: i32, operation: i32) -> i32;
-        }
-        // LOCK_EX and LOCK_NB; the same values on Linux and macOS, as in
-        // `lock.rs` and `forward.rs`.
-        const LOCK_EX: i32 = 2;
-        const LOCK_NB: i32 = 4;
-
         let dir = self.path.parent().expect("fence paths have a parent");
         std::fs::create_dir_all(dir)
             .with_context(|| format!("cannot create stop fence directory {}", dir.display()))?;
@@ -122,26 +113,12 @@ impl StopFence {
             .truncate(false)
             .open(&self.path)
             .with_context(|| format!("cannot open stop fence {}", self.path.display()))?;
-        let operation = if wait { LOCK_EX } else { LOCK_EX | LOCK_NB };
-        loop {
-            // SAFETY: `file` owns a valid fd for the duration of the call.
-            if unsafe { flock(file.as_raw_fd(), operation) } == 0 {
-                return Ok(Some(FenceLock {
-                    file,
-                    path: self.path.clone(),
-                }));
-            }
-            let error = std::io::Error::last_os_error();
-            match error.kind() {
-                ErrorKind::Interrupted => {}
-                ErrorKind::WouldBlock if !wait => return Ok(None),
-                _ => {
-                    return Err(error).with_context(|| {
-                        format!("cannot lock stop fence {}", self.path.display())
-                    });
-                }
-            }
-        }
+        let taken = crate::lock::flock_exclusive(&file, wait)
+            .with_context(|| format!("cannot lock stop fence {}", self.path.display()))?;
+        Ok(taken.then(|| FenceLock {
+            file,
+            path: self.path.clone(),
+        }))
     }
 }
 
