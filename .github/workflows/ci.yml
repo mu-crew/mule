@@ -38,6 +38,14 @@ jobs:
       - name: Install tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install tmux
+      - name: DIAG timeout(1)
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers || true
+          ls -l /usr/bin/timeout || true
+          command -v timeout || echo "no timeout on runner PATH"
+          brew list --versions coreutils || true
+          env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin sh -c 'command -v timeout || echo "no timeout on the default PATH"'
       - name: Rust toolchain
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@v2
