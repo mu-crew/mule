@@ -313,12 +313,23 @@ const checks = {
 		await assert.rejects(s.run("bash", { command: "touch never" }, { signal: AbortSignal.abort() }), /abort/i);
 		assert.equal(readFileSync(join(dir, "runs"), "utf8"), runs);
 		assert.ok(!existsSync(join(root, "never")));
-		// A cancelled serve read is cancelled alone: the session's child serves the next one.
+		// A serve read cancelled in flight is cancelled alone. The fixture holds
+		// `held.txt` until it is cancelled, and the abort waits for serve to have
+		// it, so this is the in-flight cancel, not an op never sent.
+		put(root, "held.txt", "held text");
 		const read = new AbortController();
-		const pending = s.run("read", { path: "shared.txt" }, { signal: read.signal });
+		const from = calls().length;
+		const pending = s.run("read", { path: "held.txt" }, { signal: read.signal });
+		pending.catch(() => { /* asserted below */ });
+		await waitFor("serve to receive the held read", () => /^serve:held \d+$/m.test(calls().slice(from)));
+		const held = /^serve:held (\d+)$/m.exec(calls().slice(from))![1];
+		const serves = calls().match(/^serve$/gm)?.length;
+		// A sibling on the same child finishes while the held read is in flight.
+		assert.match(await s.run("read", { path: "shared.txt" }), /remote text/);
 		read.abort();
 		await assert.rejects(pending);
-		const serves = calls().match(/^serve$/gm)?.length;
+		await waitFor(`serve to get the cancel for op ${held}`, () => new RegExp(`^serve:cancel ${held}$`, "m").test(calls().slice(from)));
+		assert.deepEqual(calls().slice(from).match(/^serve:cancel \d+$/gm), [`serve:cancel ${held}`], "only the aborted op is cancelled");
 		assert.match(await s.run("read", { path: "shared.txt" }), /remote text/);
 		assert.equal(calls().match(/^serve$/gm)?.length, serves, "same serve child");
 		await s.stop();

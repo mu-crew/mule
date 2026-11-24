@@ -95,9 +95,27 @@ head -c "$3" >"$2/log"; cat >"$2/.overflow"; if [ -s "$2/.overflow" ]; then echo
 		id, rc, stdout_b64: stdout.toString("base64"), stderr, truncated: false, cancelled: false, cancel_requested: false, batch: 1, batch_size: 1,
 	})}\n`);
 	const absent = (error) => error.code === "ENOENT" || error.code === "ENOTDIR" ? "No such file or directory" : String(error);
-	createInterface({ input: process.stdin }).on("line", (line) => {
+	// A read of `held.txt` is in flight until cancelled: it is recorded as
+	// received (`serve:held <id>`) and never answered otherwise, so a test can
+	// abort it while serve is running it. A cancel names its id, and ends the
+	// held op as serve would: a `cancelled` reply nobody waits for any more.
+	const held = new Set();
+	const input = createInterface({ input: process.stdin });
+	input.on("line", (line) => {
 		const { op, id, path, data_b64 } = JSON.parse(line);
 		appendFileSync(join(dir, "calls"), `serve:${op}\n`);
+		if (op === "cancel") {
+			appendFileSync(join(dir, "calls"), `serve:cancel ${id}\n`);
+			if (held.delete(id)) process.stdout.write(`${JSON.stringify({
+				id, rc: 143, stdout_b64: "", stderr: "", truncated: false, cancelled: true, cancel_requested: true, kind: "cancelled", batch: 1, batch_size: 1,
+			})}\n`);
+			return;
+		}
+		if (op === "read" && basename(path) === "held.txt") {
+			held.add(id);
+			appendFileSync(join(dir, "calls"), `serve:held ${id}\n`);
+			return;
+		}
 		try {
 			if (op === "read") answer(id, 0, readFileSync(path));
 			else if (op === "stat") {
