@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## [0.7.1] — 2026-11-24
+
+0.7.0 was tagged but never published (its release stopped at the macOS
+gate); its notes below ship with 0.7.1.
+
 ### Fixed
 
 - `mule serve` no longer needs `timeout(1)` on the host. Stock macOS before
