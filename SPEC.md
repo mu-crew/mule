@@ -91,7 +91,7 @@ mule run --lease [--host H] [--cwd D] [--human] [--max-secs S]
 The process mu runs as a remote worker's pane: it lives exactly as long as its job. `--lease` implies `--tui`, requires `--job-file`, and conflicts with `--wait`/`--no-tail`. It lives in `lease.rs`.
 
 1. **Name the job first.** Generate the id, read its stop fence generation (the one this carrier owns; an unreadable fence exits 1 with nothing written or dispatched), and write the id to `F` -- a temp file in the same directory, mode 0600, one line, fsynced, renamed over `F`, then the directory fsynced -- *before* the dispatch ssh starts. A write failure exits 1 with nothing dispatched. A lease that dies after the write leaves a name whose `mule rm` is a no-op if the dispatch never ran, so no window remains in which a job exists that nobody can name.
-2. **Dispatch** the job exactly as `run --tui` does (`run::dispatch_with_id`). No master is exit 3, the lease's only exit 3.
+2. **Dispatch** the job exactly as `run --tui` does (`run::dispatch`). No master is exit 3, the lease's only exit 3.
 3. **Forward** each spec through `forward`, without waiting for REMOTE: it is resolved per connection, and mu's ctl handshake retries `refused` itself.
 4. **Hold.** One `-O check` (lock-free), a local drift check, and one locked probe per tick, at 1s settling to 5s and resetting on change.
    - `rc` present: print the final screen, unforward, exit with the job's code. Orphan: unforward, exit 5. Missing: unforward, exit 1.

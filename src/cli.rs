@@ -1063,7 +1063,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 if let Some(id) = attach {
                     return crate::lease::attach_cli(host, stop_config, job_file, specs, &id);
                 }
-                return crate::lease::run_cli_keyed(
+                return crate::lease::run_cli(
                     host,
                     stop_config,
                     job_file,
@@ -1083,32 +1083,22 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             } else {
                 crate::wrapper::JobMode::Pipe
             };
-            let dispatched = match &key {
-                None => crate::run::dispatch(
-                    &Ssh,
-                    host,
-                    &command,
-                    cwd.as_deref(),
-                    max_secs,
-                    metadata,
-                    mode,
-                )
-                .map(crate::run::Dispatched::New),
-                Some(key) => crate::run::dispatch_keyed(
-                    &Ssh,
-                    host,
-                    crate::wrapper::new_id()
+            let dispatched = crate::run::dispatch(
+                &Ssh,
+                host,
+                crate::wrapper::Job {
+                    id: crate::wrapper::new_id()
                         .parse()
                         .expect("generated ids are valid"),
-                    Some(key),
-                    &command,
-                    cwd.as_deref(),
-                    max_secs,
+                    cmd: command.clone(),
+                    cwd,
+                    max_secs: max_secs.unwrap_or(host.max_job_secs),
                     metadata,
                     mode,
-                    &mut std::io::stderr(),
-                ),
-            };
+                },
+                key.as_ref(),
+                &mut std::io::stderr(),
+            );
             match dispatched {
                 Ok(dispatched) => {
                     let existing = matches!(dispatched, crate::run::Dispatched::Existing(_));
@@ -1187,7 +1177,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         } => {
             let host = cfg.host(host.host.as_deref())?;
             let command = command_from_args(&cmd);
-            crate::exec::run_cli_with(
+            crate::exec::run_cli(
                 host,
                 cli.config.clone(),
                 &crate::exec::Request {

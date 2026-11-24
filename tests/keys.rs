@@ -17,10 +17,10 @@ use mule::config::{Config, Host};
 use mule::errors::{MuleError, exit_code};
 use mule::key::{JobKey, KeyPrefix};
 use mule::remote::CANNOT_TELL;
-use mule::run::{Dispatched, dispatch_keyed, lookup};
+use mule::run::{Dispatched, lookup};
 use mule::stopfence::StopFence;
 use mule::transport::{Fake, Output};
-use mule::wrapper::{JobId, JobMetadata, JobMode};
+use mule::wrapper::{Job, JobId, JobMetadata, JobMode};
 
 fn host() -> Host {
     common::local::isolate_state();
@@ -46,18 +46,18 @@ fn dispatch(
     k: &JobKey,
     cmd: &str,
 ) -> anyhow::Result<Dispatched> {
-    dispatch_keyed(
-        t,
-        host,
-        id(fresh),
-        Some(k),
-        cmd,
-        None,
-        None,
-        JobMetadata::Human,
-        JobMode::Pipe,
-        &mut std::io::sink(),
-    )
+    mule::run::dispatch(t, host, job(fresh, cmd), Some(k), &mut std::io::sink())
+}
+
+fn job(fresh: &str, cmd: &str) -> Job {
+    Job {
+        id: id(fresh),
+        cmd: cmd.into(),
+        cwd: None,
+        max_secs: 0,
+        metadata: JobMetadata::Human,
+        mode: JobMode::Pipe,
+    }
 }
 
 fn request() -> mule::lease::Request<'static> {
@@ -509,15 +509,11 @@ fn the_real_listing_carries_the_key_and_none_for_an_unkeyed_job() {
     ))
     .unwrap();
     dispatch(&local, &host, "d00001", &key("mu.a.1"), "sleep 30").unwrap();
-    mule::run::dispatch_with_id(
+    mule::run::dispatch(
         &local,
         &host,
-        id("d00002"),
-        "sleep 30",
+        job("d00002", "sleep 30"),
         None,
-        None,
-        JobMetadata::Human,
-        JobMode::Pipe,
         &mut std::io::sink(),
     )
     .unwrap();

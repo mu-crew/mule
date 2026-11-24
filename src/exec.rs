@@ -123,7 +123,7 @@ fn exec_job(host: &Host, id: JobId, request: &Request) -> Job {
 pub fn start(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<()> {
     let job = exec_job(host, id, request);
     check_size(host, &job)?;
-    crate::run::dispatch_job(transport, host, job, None, &mut std::io::sink()).map(drop)
+    crate::run::dispatch(transport, host, job, None, &mut std::io::sink()).map(drop)
 }
 
 /// Wait for the job, print its output, remove it, and return the exit code.
@@ -138,26 +138,23 @@ pub fn finish(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
-    finish_within(transport, host, id, SESSION_END_WAIT, pause, out, err)
+    finish_coded(
+        transport,
+        host,
+        id,
+        SESSION_END_WAIT,
+        pause,
+        out,
+        err,
+        false,
+    )
 }
 
 /// [`finish`] with the settle bound as a parameter, so a test can pin the
-/// wall-clock behaviour without spending 5s.
-pub fn finish_within(
-    transport: &dyn Transport,
-    host: &Host,
-    id: &JobId,
-    settle: Duration,
-    pause: &dyn Fn(Duration),
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> Result<i32> {
-    finish_coded(transport, host, id, settle, pause, out, err, false)
-}
-
-/// [`finish_within`] with `--strict-codes` as a parameter: the command's exit 3
-/// comes back as `EXIT_COMMAND_3`, with the note as the first line of `err`.
-#[allow(clippy::too_many_arguments)] // finish_within's seven plus one flag; a struct would only rename them
+/// wall-clock behaviour without spending 5s, and `--strict-codes`: the
+/// command's exit 3 comes back as `EXIT_COMMAND_3`, with the note as the first
+/// line of `err`.
+#[allow(clippy::too_many_arguments)] // finish's six plus two knobs; a struct would only rename them
 pub fn finish_coded(
     transport: &dyn Transport,
     host: &Host,
@@ -428,13 +425,8 @@ fn stop(cancel: Cancel, config: Option<&std::path::Path>, host: &Host, id: &JobI
 /// `mule exec` as the binary runs it: real ssh, real signals.
 ///
 /// `config` is the effective `--config`, handed to the detached cleanup child so
-/// it reads the same file.
-pub fn run_cli(host: &Host, config: Option<PathBuf>, request: &Request) -> Result<i32> {
-    run_cli_with(host, config, request, Cancel::Detach, false)
-}
-
-/// [`run_cli`] with the cancel mode chosen (`exec --no-detach`).
-pub fn run_cli_with(
+/// it reads the same file. `cancel` is `exec --no-detach`'s choice.
+pub fn run_cli(
     host: &Host,
     config: Option<PathBuf>,
     request: &Request,

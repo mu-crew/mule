@@ -5,72 +5,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Host;
 use crate::key::JobKey;
 use crate::transport::Transport;
-use crate::wrapper::{JOBS_ROOT, Job, JobId, JobMetadata, JobMode, dispatch_script_with, new_id};
-
-pub fn dispatch(
-    transport: &dyn Transport,
-    host: &Host,
-    cmd: &str,
-    cwd: Option<&str>,
-    max_secs: Option<u64>,
-    metadata: JobMetadata,
-    mode: JobMode,
-) -> Result<JobId> {
-    dispatch_with_warnings(
-        transport,
-        host,
-        cmd,
-        cwd,
-        max_secs,
-        metadata,
-        mode,
-        &mut std::io::stderr(),
-    )
-}
-
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)] // The test seam mirrors run's independent CLI fields plus its warning sink.
-pub fn dispatch_with_warnings(
-    transport: &dyn Transport,
-    host: &Host,
-    cmd: &str,
-    cwd: Option<&str>,
-    max_secs: Option<u64>,
-    metadata: JobMetadata,
-    mode: JobMode,
-    warnings: &mut dyn Write,
-) -> Result<JobId> {
-    // Generated, so it parses by construction; the parse is what keeps a
-    // CLI-supplied id from reaching the remote shell unvalidated.
-    let id = new_id().parse::<JobId>().expect("generated ids are valid");
-    dispatch_with_id(
-        transport, host, id, cmd, cwd, max_secs, metadata, mode, warnings,
-    )
-}
-
-/// Dispatch under an id the caller already holds.
-///
-/// `mule exec` needs the id before the ssh call returns: a signal that lands
-/// mid-dispatch must still be able to name the job it may have started, and
-/// `rm` of an id that never dispatched is a no-op.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)] // Same seam as `dispatch_with_warnings`, plus the id.
-pub fn dispatch_with_id(
-    transport: &dyn Transport,
-    host: &Host,
-    id: JobId,
-    cmd: &str,
-    cwd: Option<&str>,
-    max_secs: Option<u64>,
-    metadata: JobMetadata,
-    mode: JobMode,
-    warnings: &mut dyn Write,
-) -> Result<JobId> {
-    dispatch_keyed(
-        transport, host, id, None, cmd, cwd, max_secs, metadata, mode, warnings,
-    )
-    .map(Dispatched::into_id)
-}
+use crate::wrapper::{JOBS_ROOT, Job, JobId, dispatch_script_with};
 
 /// What a keyed dispatch did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,41 +29,6 @@ impl Dispatched {
             Self::New(id) | Self::Existing(id) => id,
         }
     }
-}
-
-/// [`dispatch_with_id`], with an optional caller key (`run --key`).
-///
-/// With a key, one round trip checks for a job already holding it and, only
-/// if there is none, writes `$d/key` and starts the job: a dispatch whose key
-/// exists returns that job and starts nothing. The id stays generated.
-///
-/// The check and the start share one remote script, so they are atomic with
-/// respect to every other mule call on this client: each holds the host's
-/// ticket lock for its whole round trip. That is the same guarantee every
-/// other read-then-act script here rests on (`rm`'s proof, `rm --all`).
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)] // `dispatch_with_id`'s seam, plus the key.
-pub fn dispatch_keyed(
-    transport: &dyn Transport,
-    host: &Host,
-    id: JobId,
-    key: Option<&JobKey>,
-    cmd: &str,
-    cwd: Option<&str>,
-    max_secs: Option<u64>,
-    metadata: JobMetadata,
-    mode: JobMode,
-    warnings: &mut dyn Write,
-) -> Result<Dispatched> {
-    let job = Job {
-        id,
-        cmd: cmd.to_owned(),
-        cwd: cwd.map(str::to_owned),
-        max_secs: max_secs.unwrap_or(host.max_job_secs),
-        metadata,
-        mode,
-    };
-    dispatch_job(transport, host, job, key, warnings)
 }
 
 /// Build the exact script handed to ssh, including prune and the advisory
@@ -172,7 +72,17 @@ pub(crate) fn dispatch_script(host: &Host, job: &Job, key: Option<&JobKey>) -> S
     )
 }
 
-pub(crate) fn dispatch_job(
+/// Dispatch `job`, with an optional caller key (`run --key`).
+///
+/// With a key, one round trip checks for a job already holding it and, only
+/// if there is none, writes `$d/key` and starts the job: a dispatch whose key
+/// exists returns that job and starts nothing. The id stays generated.
+///
+/// The check and the start share one remote script, so they are atomic with
+/// respect to every other mule call on this client: each holds the host's
+/// ticket lock for its whole round trip. That is the same guarantee every
+/// other read-then-act script here rests on (`rm`'s proof, `rm --all`).
+pub fn dispatch(
     transport: &dyn Transport,
     host: &Host,
     job: Job,

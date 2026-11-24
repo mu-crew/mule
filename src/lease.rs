@@ -42,7 +42,7 @@ use crate::probe::{From as ProbeFrom, State, probe};
 use crate::run::Dispatched;
 use crate::stopfence::StopFence;
 use crate::transport::{InFlight, Ssh, Stopper, Transport};
-use crate::wrapper::{JobId, JobMetadata, JobMode, new_id};
+use crate::wrapper::{Job, JobId, JobMetadata, JobMode, new_id};
 
 /// How long the remote screen is mirrored into the pane after the first
 /// successful forward. Long enough for mu's startup health scan and `mu agent
@@ -265,18 +265,15 @@ pub fn start_keyed(
     }
     let owned = Owned { id, fence_gen };
     on_dispatch(Some(&owned));
-    let dispatched = crate::run::dispatch_keyed(
-        t,
-        host,
-        owned.id.clone(),
-        key,
-        request.cmd,
-        request.cwd,
-        request.max_secs,
-        request.metadata.clone(),
-        JobMode::Tui,
-        warnings,
-    );
+    let job = Job {
+        id: owned.id.clone(),
+        cmd: request.cmd.to_owned(),
+        cwd: request.cwd.map(str::to_owned),
+        max_secs: request.max_secs.unwrap_or(host.max_job_secs),
+        metadata: request.metadata.clone(),
+        mode: JobMode::Tui,
+    };
+    let dispatched = crate::run::dispatch(t, host, job, key, warnings);
     on_dispatch(None);
     match dispatched? {
         Dispatched::New(_) => Ok(owned),
@@ -845,28 +842,11 @@ enum Begin<'a> {
     Attach(&'a JobId),
 }
 
-/// `mule run --lease` as the binary runs it: real ssh, real signals.
+/// `mule run --lease [--key K]` as the binary runs it: real ssh, real
+/// signals, through [`start_keyed`].
 ///
 /// `config` is the effective `--config`, handed to the detached cleanup child.
-pub fn run_cli(
-    host: &Host,
-    config: Option<PathBuf>,
-    job_file: &Path,
-    specs: Vec<Spec>,
-    request: &Request,
-) -> Result<i32> {
-    run_cli_keyed(
-        host,
-        StopConfig::Path(config),
-        job_file,
-        specs,
-        request,
-        None,
-    )
-}
-
-/// `mule run --lease --key K`: [`run_cli`] through [`start_keyed`].
-pub(crate) fn run_cli_keyed(
+pub(crate) fn run_cli(
     host: &Host,
     config: StopConfig,
     job_file: &Path,

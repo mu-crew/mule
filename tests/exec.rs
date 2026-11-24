@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_TRUNCATED, MuleError};
-use mule::exec::{Request, finish, finish_within, next_interval, start};
+use mule::exec::{Request, finish, finish_coded, next_interval, start};
 use mule::transport::{Fake, Output};
 use mule::wrapper::JobId;
 
@@ -359,7 +359,7 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let started = Instant::now();
 
-    let code = finish_within(
+    let code = finish_coded(
         &fake,
         &host(),
         &id(),
@@ -367,6 +367,7 @@ fn a_session_still_alive_at_collect_is_exit_seven_not_the_job_code_beside_a_part
         &std::thread::sleep,
         &mut out,
         &mut err,
+        false,
     )
     .unwrap();
 
@@ -415,7 +416,7 @@ fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
 
     // Pauses are no-ops; each probe costs 300ms. 500ms of bound is two probes
     // by the clock, five by a count of requested 100ms pauses.
-    let _ = finish_within(
+    let _ = finish_coded(
         &slow,
         &host(),
         &id(),
@@ -423,6 +424,7 @@ fn the_settle_bound_counts_probe_time_not_just_requested_pauses() {
         &no_pause(),
         &mut Vec::new(),
         &mut Vec::new(),
+        false,
     );
 
     // The probe count is the deterministic discriminator (2 by the clock, 5 by
