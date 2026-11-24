@@ -4,10 +4,9 @@
 //!   mu plugin add mule -- /abs/path/mu-plugin-mule [--config PATH]
 //!   mu host add box --plugin mule --fetch '<fetch cmd>'
 //!
-//! The mu host's name is the mule host's name. Declared: `exec` only
-//! (`fetch: false`, so the host profile keeps its own `--fetch`), `slots:
-//! "self"` (mule's ticket lock arbitrates; mu holds no channel), and
-//! `quiescence: "provable"`.
+//! The mu host's name is the mule host's name. Declares `exec` and the
+//! `lease` job kind, not `fetch` (the host profile keeps its own `--fetch`).
+//! `slots: "self"` lets mule's ticket lock arbitrate; `quiescence: "provable"`.
 //!
 //! Every call is a `mule` child in THIS process group, never detached
 //! (protocol, "Process"): `exec --no-detach` stops the remote job from inside

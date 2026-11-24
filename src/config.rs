@@ -128,7 +128,6 @@ fn expand_tilde(raw: &str) -> Result<PathBuf> {
     Ok(home.join(rest.trim_start_matches('/')))
 }
 
-/// Where the config lives: `~/.config/mule/config.toml`.
 /// Written to the config path the first time mule runs without one.
 ///
 /// Every host is commented out, so the file is a prompt rather than a guess:

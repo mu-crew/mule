@@ -1,7 +1,4 @@
 //! The command surface.
-//!
-//! The command shapes are settled by the spec and declared up front so
-//! `--help` stays honest while each implementation lands.
 
 use std::collections::VecDeque;
 use std::io::Write;

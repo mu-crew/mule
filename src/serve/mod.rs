@@ -22,8 +22,8 @@
 //!   the batch's, on disk and on the wire. So a batch frees the session even
 //!   if this process is SIGKILLed or the link wedges. Work longer than
 //!   [`MAX_OP_SECS`] comes back rc 124 and belongs in a detached job. A host
-//!   without `base64`, `mktemp`, `sleep`, a way to make process
-//!   groups or a way to find an op's processes fails every op closed.
+//!   without the required tools, process group support,
+//!   or a way to find an op's processes fails every op closed.
 //! - **Payloads on stdin**, never argv: a 200KB write is one round trip.
 //! - **Coalescing.** Requests queued while a batch is in flight go together
 //!   in the next one and run in parallel on the host.
@@ -78,10 +78,11 @@ pub const MAX_BATCH_OUTPUT: u64 = 8 << 20;
 /// Payload cap per batch (and so per op), so a batch is a bounded transfer.
 pub const MAX_PAYLOAD: usize = 8 << 20;
 /// Script cap per batch, before [`batch_script`] base64s it for `/bin/sh`:
-/// with that 4/3 and the fixed part (~5KB) it stays under the 112 KiB
-/// dispatch cap (SPEC § The dispatch size cap). Payloads do not count: they
-/// ride stdin.
+/// leaves room for 4/3 expansion and the fixed batch code within the
+/// 112 KiB dispatch cap. Payloads ride stdin.
 pub const MAX_SCRIPT: usize = 64 << 10;
+/// Required on every host, in addition to the process-control alternatives.
+const REQUIRED_TOOLS: &str = "base64 mktemp head tail wc cat sleep";
 /// Ops per batch.
 pub const MAX_BATCH: usize = 64;
 /// How long the worker lets a burst gather before sending. Windows of 1-20ms
@@ -537,7 +538,7 @@ pub fn batch_body(ops: &[Op]) -> String {
     // only looked for, not run: `-o pid,ppid,pgid` is POSIX, and one `ps`
     // costs 0.1-0.3s on a loaded macOS, on every batch.
     s.push_str(&format!(
-        "for t in base64 mktemp head tail wc cat sleep; do \
+        "for t in {REQUIRED_TOOLS}; do \
          command -v \"$t\" >/dev/null 2>&1 || \
          {{ echo \"mule-serve: host lacks $t\" >&2; exit {RC_MISSING_TOOL}; }}; done\n\
          X=; if command -v setsid >/dev/null 2>&1; then S=setsid; \
@@ -712,7 +713,7 @@ pub enum Ended {
     Cancelled,
     /// The deadline killed it before it completed.
     TimedOut,
-    /// It ended without a result and neither did.
+    /// It ended with no result, without cancellation or a deadline.
     Lost,
     /// It completed, but the host could not spool its output whole (a
     /// collector failed: a full disk, a quota): its bytes are not its own.
@@ -1106,7 +1107,7 @@ fn worker<T: Transport + ?Sized>(
                     (
                         "host_tool_missing",
                         format!(
-                            "{why}; serve needs base64, mktemp, sleep and \
+                            "{why}; serve needs {REQUIRED_TOOLS}, plus \
                              setsid (or a /bin/sh with job control) and pgrep -s (or ps and \
                              awk) on the host"
                         ),

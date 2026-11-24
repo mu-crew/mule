@@ -20,11 +20,9 @@ pub const MAX_KEY_LEN: usize = 128;
 /// A validated key: 1 to [`MAX_KEY_LEN`] bytes of `[A-Za-z0-9._-]`.
 ///
 /// Validated at the boundary for the same reason [`crate::wrapper::JobId`]
-/// is: a key is written into a remote shell script and matched by `grep`.
-/// With no quote, space, `$`, glob or newline in the alphabet, the value is
-/// inert in every layer it crosses and fits on one line of `$d/key`, so
-/// `grep -Fx` matches it exactly. A leading `-` is refused too, so a key can
-/// never be read as an option.
+/// is: the alphabet keeps it inert in a remote shell script and on one line
+/// of `$d/key`, where awk compares it literally. A leading `-` is refused
+/// so it cannot be read as an option.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobKey(String);
 
