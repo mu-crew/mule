@@ -253,12 +253,11 @@ settling to 5s) over mule's own connection.
 - **A lost master does not end it.** It prints once `master for H is gone; a
   human must run: ssh -MNf …`, keeps checking every 5s, and re-forwards when the
   master is back. Exit 3 happens only at startup, before anything is dispatched.
-- **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143) through a detached
-  `mule rm`, and cancel the forwards. Closing the pane is a SIGHUP. `kill -9`
-  cannot be handled: the job keeps running and `F` names it. The detached stop
-  retries for up to 10 minutes (a down master included). If it still fails it
-  writes `F.<id>.stop-failed`, one line starting with the id, so a job that
-  could not be stopped is never silent.
+- **SIGHUP/SIGINT/SIGTERM** (including a pane hangup) attempt to cancel the
+  forwards, hand cleanup to a detached `mule rm`, and exit 129/130/143.
+  The stop retries for up to 10 minutes and records failure in
+  `F.<id>.stop-failed`. `kill -9` bypasses cleanup. For proof, use the id in
+  `F` and require `mule rm <id> --host H` to succeed on the intended host.
 - **The pane shows** a status line (job, host, state, forwards, the
   `tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-<id>` attach command and the stop command)
   and mirrors the remote screen for 30s after the first forward, then only on
@@ -333,19 +332,19 @@ is the command's own.
   comes back in one locked read, so use `run` and `tail` for anything big.
 - **Exit 1** also covers a job mule could not remove (a session or state left
   on the host): the command's own code is never returned beside a leftover job.
-- **SIGHUP/SIGINT/SIGTERM stop the job** (exit 129/130/143), through a detached `mule rm`
-  that queues like any caller and retries for up to 10 minutes. Give it a moment before you tear the machine
-  down. `run --wait` is the opposite: its job continues.
+- **SIGHUP/SIGINT/SIGTERM** exit 129/130/143 after handing cleanup to a
+  detached `mule rm` that retries for up to 10 minutes. `run --wait` leaves
+  the job alone. If teardown requires
+  proof, use `run` or `run --lease` to keep the id, then require a successful
+  `mule rm <id> --host H` on the intended host.
 - **Exit 3** is still "no master: stop and ask a human".
 - **A command whose dispatch script passes 112 KiB** (the dispatch size cap, set
   below Linux's 128 KiB per-argument limit; roughly 80KB of command)
   exits 1 with `command too large for one dispatch (<n> bytes of remote script,
   limit <m>)`, before any ssh call. Put big payloads in a file and run that.
-- **`--no-detach`** stops the job from exec itself on a signal: one `mule rm`
-  attempt, then the exit, with every process left in exec's process group.
-  For a caller that kills the group after a grace (a plugin host), where a
-  detached child would be a leak. The stop is not retried and can outlast
-  that grace, so a killed exec means the job may still run.
+- **`--no-detach`** attempts one `mule rm` in exec's process group. This
+  avoids a child leaking when a plugin host kills the group after a grace.
+  The attempt may fail or outlast the grace; the exit is not proof.
 
 ```sh
 mule exec --cwd ~/repo -- git rev-parse HEAD
@@ -458,7 +457,7 @@ master reads as down rather than hanging the verb.
 | 7 | `exec` only: output incomplete (truncated at `max_log_bytes`, or a leftover process still holds the job's stdout) |
 | 8 | `--strict-codes` only (`exec`, `wait`, `run --wait`): the command's 3 or its own 8 (ambiguous) |
 | *n* | `wait`, `run --wait`, `run --lease` and `exec` return the job's own exit code, including 124 (hit `--max-secs`) and 137 (`mule kill`) |
-| 129/130/143 | `exec` and `run --lease` after SIGHUP/SIGINT/SIGTERM: the job was stopped |
+| 129/130/143 | `exec` and `run --lease` after SIGHUP/SIGINT/SIGTERM: cleanup attempted or handed off, not proof |
 
 `serve --stdio` exits 0 when its caller hangs up and 3 when the master goes.
 
