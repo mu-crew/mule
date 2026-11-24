@@ -370,7 +370,12 @@ fn a_background_child_holding_stdout_is_exit_seven_without_sleeping_in_the_lock(
     // pipeline -- and so the session -- open. This used to hold the ticket for
     // ~14s in the collect and then return rc 0 with an empty stdout.
     // Let the job sleep without recording it as a locked script's sleep.
-    let cmd = format!("'{}' 30 & echo hi", server.transport.real_sleep.display());
+    const CHILD: Duration = Duration::from_secs(30);
+    let cmd = format!(
+        "'{}' {} & echo hi",
+        server.transport.real_sleep.display(),
+        CHILD.as_secs()
+    );
     let started = Instant::now();
     let (code, out, err) = server.exec("e20008", &cmd, None);
 
@@ -384,6 +389,14 @@ fn a_background_child_holding_stdout_is_exit_seven_without_sleeping_in_the_lock(
     // nothing sleeps under the ticket, not whether this machine forks quickly.
     let sleeps = server.transport.sleeps();
     assert!(sleeps.is_empty(), "a locked script slept: {sleeps:?}");
+    // A wait with no `sleep` -- a blocking read of the pipeline, a spin on
+    // the session -- holds the ticket for most of the child's life; a
+    // waitless call, even on a loaded Mac, took 2.2s at most.
+    let longest = *server.transport.longest.lock().unwrap();
+    assert!(
+        longest < CHILD / 2,
+        "a locked call ran {longest:?}; the ticket is held for all of it"
+    );
     // The settle bound is 5s of wall clock, probes included; the rest is one
     // collect. What this shows is that exec stops waiting well short of the
     // 30s child. Whether the bound is wall-clock rather than a pause count is
