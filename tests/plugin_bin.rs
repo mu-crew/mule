@@ -689,7 +689,8 @@ fn the_instance_names_the_backend_not_the_plugin() {
 #[test]
 fn wedged_peers_do_not_delay_the_handshake() {
     let Some(h) = host("pb-wedged") else { return };
-    // Six more configured hosts, and an ssh that never answers a `-O check`.
+    // Six more configured hosts, and an ssh that records its argv and then
+    // never answers, `-O check` included.
     let mut config = std::fs::read_to_string(&h.config).unwrap();
     for i in 0..6 {
         config.push_str(&format!(
@@ -698,20 +699,40 @@ fn wedged_peers_do_not_delay_the_handshake() {
         ));
     }
     std::fs::write(&h.config, config).unwrap();
-    write_exec(h.dir.join("ssh"), "#!/bin/sh\nexec sleep 300\n").unwrap();
+    let log = h.dir.join("ssh.argv");
+    write_exec(
+        h.dir.join("ssh"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec sleep 300\n",
+            log.display()
+        ),
+    )
+    .unwrap();
     let mut p = Plugin::start_raw(&h);
-    let t = std::time::Instant::now();
+    // A probe would block on the wedged ssh: the reply then never comes, and
+    // the plugin's watchdog fails this. That is the hang guard; what proves
+    // no probe is the shim's log, not the clock. A 2s bound here measured
+    // scheduling and the snapshot too, and missed a probe that returned in
+    // time (before, six wedged peers took 15s, past mu's 10s initialize cap).
     let v = p.call(
         "initialize",
         json!({"protocol": {"min": 1, "max": 1}, "mu": "5"}),
     );
     assert!(v["result"]["instance"].is_string(), "{v}");
-    // mu caps the initialize read at 10 s; before, six wedged peers took 15 s.
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(2),
-        "initialize took {:?}",
-        t.elapsed()
-    );
+    // Then EOF and the plugin's exit. A probe may still be starting -- its
+    // shim's first line not yet run -- but it is in the plugin's group (mu's
+    // group, which nothing at the handshake leaves), and the shim never
+    // exits: so a probe is either in the log or alive in that group.
+    let group = p.child.id() as i32;
+    drop(p);
+    // SAFETY: signal 0 only probes for existence.
+    let alive = unsafe { libc::kill(-group, 0) } == 0;
+    if alive {
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(calls.is_empty(), "the handshake ran ssh: {calls}");
+    assert!(!alive, "the handshake left a process in the plugin's group");
 }
 
 /// Make the shim ssh record the argv of every non-`-O` call.
