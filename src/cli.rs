@@ -71,7 +71,7 @@ struct JobJson<'a> {
 /// that must never mistake "cannot tell" for "gone" -- mu reconciling a job
 /// after a crash -- gets each as an answer to switch on, instead of exit 1,
 /// which also meant a refused session or a dropped probe.
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct PollJson {
     state: &'static str,
     rc: Option<i32>,
@@ -949,44 +949,38 @@ fn poll_json_verdict(
 }
 
 fn poll_json(state: &State, runtime_secs: Option<u64>, log_size: u64, drained: bool) -> String {
-    let (state, rc) = match state {
+    let (label, rc) = match state {
         State::Running => ("running", None),
         State::Done(code) => ("done", Some(*code)),
         State::Orphan => ("orphan", None),
         // Nothing to measure: no log, no runtime.
         State::Missing => {
-            return serde_json::to_string(&PollJson {
+            return to_json(&PollJson {
                 state: "missing",
-                rc: None,
-                runtime_secs: None,
-                log_size: None,
-                drained: None,
-                reason: None,
-            })
-            .expect("poll json is numbers and static strings");
+                ..PollJson::default()
+            });
         }
     };
-    serde_json::to_string(&PollJson {
-        state,
+    to_json(&PollJson {
         rc,
         runtime_secs,
         log_size: Some(log_size),
-        drained: (state == "done").then_some(drained),
-        reason: None,
+        drained: rc.is_some().then_some(drained),
+        state: label,
+        ..PollJson::default()
     })
-    .expect("poll json is numbers and static strings")
 }
 
 fn poll_json_unknown(reason: &str) -> String {
-    serde_json::to_string(&PollJson {
-        state: "unknown",
-        rc: None,
-        runtime_secs: None,
-        log_size: None,
-        drained: None,
+    to_json(&PollJson {
         reason: Some(reason.to_string()),
+        state: "unknown",
+        ..PollJson::default()
     })
-    .expect("poll json is numbers and strings")
+}
+
+fn to_json(json: &PollJson) -> String {
+    serde_json::to_string(json).expect("poll json is numbers and strings")
 }
 
 pub fn wait(
@@ -1049,6 +1043,18 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             if !std::env::args().any(|a| a == "--") {
                 warn_about_swallowed_flags(&cmd);
             }
+            let command = command_from_args(&cmd);
+            let workstream = (!human)
+                .then(|| std::env::var("MU_WORKSTREAM").ok())
+                .flatten()
+                .filter(|value| !value.is_empty());
+            let metadata = if human {
+                crate::wrapper::JobMetadata::Human
+            } else {
+                crate::wrapper::JobMetadata::Managed {
+                    workstream: workstream.clone(),
+                }
+            };
             if lease {
                 let specs = crate::forward::Spec::parse_all(&forward_unix)?;
                 let job_file = job_file
@@ -1057,16 +1063,6 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                 if let Some(id) = attach {
                     return crate::lease::attach_cli(host, stop_config, job_file, specs, &id);
                 }
-                let command = command_from_args(&cmd);
-                let workstream = (!human)
-                    .then(|| std::env::var("MU_WORKSTREAM").ok())
-                    .flatten()
-                    .filter(|value| !value.is_empty());
-                let metadata = if human {
-                    crate::wrapper::JobMetadata::Human
-                } else {
-                    crate::wrapper::JobMetadata::Managed { workstream }
-                };
                 return crate::lease::run_cli_keyed(
                     host,
                     stop_config,
@@ -1081,19 +1077,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     key.as_ref(),
                 );
             }
-            let command = command_from_args(&cmd);
             let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
-            let workstream = (!human)
-                .then(|| std::env::var("MU_WORKSTREAM").ok())
-                .flatten()
-                .filter(|value| !value.is_empty());
-            let metadata = if human {
-                crate::wrapper::JobMetadata::Human
-            } else {
-                crate::wrapper::JobMetadata::Managed {
-                    workstream: workstream.clone(),
-                }
-            };
             let mode = if tui {
                 crate::wrapper::JobMode::Tui
             } else {
@@ -1287,7 +1271,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                         "cannot follow a TUI job; streaming redraw bytes is not useful".to_string();
                     if !quiet {
                         message.push_str(&format!(
-                            "\n  view current screen: mule tail {id}\n  jump/interact:       tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select mule-{id}"
+                            "\n  view current screen: mule tail {id}\n  jump/interact:       {}",
+                            crate::lease::attach_hint(&id)
                         ));
                     }
                     anyhow::bail!(message);
@@ -1469,10 +1454,11 @@ fn tui_hints(id: &crate::wrapper::JobId, target: &str, workstream: Option<&str>)
     format!(
         "TUI job {id} is interactive\n\
            view current screen: mule tail {id}\n\
-           jump/interact:       tsesh pick-and-connect --mode agents  # (tmux: prefix a) ctrl-g shows crew, select {agent}\n\
+           jump/interact:       {attach}\n\
            control through mu:  mu agent spawn {agent}{workstream} --command \\\n\
              \"$(murmur jump-command --host {target} --agent {agent})\"\n\
-           stop and remove:     mule kill --rm {id}\n"
+           stop and remove:     mule kill --rm {id}\n",
+        attach = crate::lease::attach_hint(id),
     )
 }
 
@@ -1663,7 +1649,7 @@ pub fn command_from_args(args: &[String]) -> String {
         [command] => command.clone(),
         _ => args
             .iter()
-            .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+            .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" "),
     }

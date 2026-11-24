@@ -44,6 +44,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 
+use crate::cli::shell_quote;
 use crate::config::Host;
 use crate::transport::{Control, Feed, Transport};
 
@@ -280,10 +281,6 @@ fn write_body(len: usize) -> String {
 /// 0. The padding macOS's `wc` prints is trimmed.
 const COUNT_FN: &str = "N() { c=$(wc -c < \"$1\") || return 1; c=${c#\"${c%%[![:space:]]*}\"}; \
      c=${c%\"${c##*[![:space:]]}\"}; case $c in ''|*[!0-9]*) return 1;; esac; [ \"$c\" -eq \"$2\" ]; }\n";
-
-fn quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
 
 /// Runs one op: `$1` body, `$2` out, `$3` err, `$4` rc, `$5` stdin, `$6`
 /// and `$7` the stdout and stderr caps, each one byte past the op's cap so
@@ -646,9 +643,9 @@ pub fn batch_body(ops: &[Op]) -> String {
         }
         off += n;
     }
-    s.push_str(&format!("R={}\n", quote(&runner())));
-    s.push_str(&format!("DL={}\n", quote(&deadline())));
-    s.push_str(&format!("W={}\n", quote(&watcher())));
+    s.push_str(&format!("R={}\n", shell_quote(&runner())));
+    s.push_str(&format!("DL={}\n", shell_quote(&deadline())));
+    s.push_str(&format!("W={}\n", shell_quote(&watcher())));
     s.push_str(KILL_FNS);
     for (k, op) in ops.iter().enumerate() {
         // A supervisor per op, a subshell in the batch's group: it forks
@@ -718,7 +715,7 @@ pub fn batch_body(ops: &[Op]) -> String {
     // Every op has ended and been cleaned up by its supervisor; the helpers
     // and their timers go now.
     s.push_str("for p in $dl $w; do kill -KILL -$p; done 2>/dev/null\nexec 3<&-\n");
-    s.push_str(&format!("F={}\n", quote(&deliverer())));
+    s.push_str(&format!("F={}\n", shell_quote(&deliverer())));
     s.push_str(&format!(
         "TO {DELIVER_SECS} sh -c \"$F\" mule-deliver \"$d\" {}{} 3< /dev/null\n",
         ops.len(),
