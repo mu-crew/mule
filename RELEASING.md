@@ -11,8 +11,9 @@ through OIDC (trusted publishing).
    node scripts/npm-version.js
    ```
 
-3. Run the commit gate from `AGENTS.md` and commit the release.
-4. Tag the same version and push the commit and tag:
+3. Add the matching version section to `CHANGELOG.md`. CI extracts it before publishing.
+4. Run the commit gate from `AGENTS.md` and commit the release.
+5. Tag the same version and push the commit and tag:
 
    ```sh
    git tag -a v0.2.2 -m "mule 0.2.2"
@@ -54,7 +55,6 @@ its first version by hand (`npm login`, then `npm publish --access public`),
 add the trusted publisher, and let CI publish from then on.
 
 The workflow also creates the GitHub release for the tag, with the matching
-CHANGELOG section as its notes. It fails if that section is missing, so add
-the CHANGELOG entry before tagging. The release carries a `mule-<version>-<target>.tar.gz`
+CHANGELOG section as its notes and a `mule-<version>-<target>.tar.gz`
 per platform (Linux x64/arm64 musl, macOS arm64), each containing both
 executables, and a `SHA256SUMS` covering those archives.
