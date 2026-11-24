@@ -417,7 +417,7 @@ Replies, one per op, in completion order:
 - **Failures** have an `error` and a `kind` (and `rc` -1 if the op never
   ran): `bad_request`, `too_large`, `timeout`, `cancelled`, `output_limit`,
   `lost` (ended on the host without a result), `host_tool_missing` (the host
-  lacks `timeout`, `base64`, `mktemp`, `sleep`, both `setsid` and a `/bin/sh`
+  lacks `base64`, `mktemp`, `sleep`, both `setsid` and a `/bin/sh`
   with job control, or both `pgrep -s` and `ps` with `awk`: nothing ran), `batch_failed`, `master_gone`.
 - **Exit 3** when the master goes (or is missing at start): every op still
   queued is answered `master_gone` first, and the master command is on stderr.

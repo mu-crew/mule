@@ -17,12 +17,12 @@
 //!   other verb. No session is held between batches.
 //! - **Bounded by the host, not by this process.** The remote script bounds
 //!   every phase -- payload read [`PAYLOAD_SECS`] and delivery
-//!   [`DELIVER_SECS`] under `timeout(1)`, each op [`MAX_OP_SECS`] in its own
+//!   [`DELIVER_SECS`] under a timer of the script's own ([`BOUND_FN`]), each op [`MAX_OP_SECS`] in its own
 //!   session (or process group), KILLed whole 1s later -- and caps every op's output, and
 //!   the batch's, on disk and on the wire. So a batch frees the session even
 //!   if this process is SIGKILLed or the link wedges. Work longer than
 //!   [`MAX_OP_SECS`] comes back rc 124 and belongs in a detached job. A host
-//!   without `timeout`, `base64`, `mktemp`, `sleep`, a way to make process
+//!   without `base64`, `mktemp`, `sleep`, a way to make process
 //!   groups or a way to find an op's processes fails every op closed.
 //! - **Payloads on stdin**, never argv: a 200KB write is one round trip.
 //! - **Coalescing.** Requests queued while a batch is in flight go together
@@ -449,6 +449,41 @@ fn deliverer() -> String {
         .into()
 }
 
+/// `TO <secs> <cmd>...` runs `cmd` bounded, as `timeout -k 1 <secs>` did:
+/// TERM to its group (or session) at `secs`, KILL 1s later. `cmd` gets fd 3
+/// as its stdin, since `sh` gives an async command `/dev/null` and dash does
+/// so even under an explicit `<&0`; a caller with nothing to feed passes
+/// `3</dev/null`. Like the ops, `cmd` and the timer each run in a group of
+/// their own (`$S`, or `set -m`), so the TERM reaches `cmd`'s children and
+/// the timer goes whole, its `sleep` included, once `cmd` ends.
+///
+/// Once `cmd` ends, what is left of its group is KILLed too, and that goes
+/// past `timeout -k`, which stops at its child's exit: a TERM-proof `head`
+/// under a delivery that the TERM killed kept the session's stdout open after
+/// the batch exited (local repro, a `head` shim ignoring TERM). STOPped
+/// first, then KILLed, until the group is empty (20 times 50ms at most): a
+/// bare group KILL is not atomic on a loaded macOS, and a shim whose `sleep`
+/// it killed first ran on and forked a `touch` the KILL never reached (about
+/// 1 local run in 2). A stopped member runs nothing, and its parent is not
+/// woken by the stop. A clean `cmd` leaves no group, so all this costs one
+/// failed `kill`. The timer's `sh` is KILLed by pid before its group for the
+/// same reason: with its `sleep` dead first, it would run on to its TERM.
+///
+/// Not `timeout(1)`: stock macOS before 27 has none, and with it required
+/// every op on such a host failed `host_tool_missing` (CI, macOS 26 runner:
+/// sshd's `PATH` has no `timeout`; the runner's shell had Homebrew's).
+///
+/// The timer's KILL can hit a reused pid in the instant between `wait`
+/// reaping `cmd` and the timer's own KILL.
+pub const BOUND_FN: &str = "TO() { tl=$1; shift; [ -z \"$S\" ] && set -m\n\
+     exec $S \"$@\" <&3 & tp=$!\n\
+     exec $S sh -c 'sleep $1; kill -TERM -$2 $2; sleep 1; kill -KILL -$2 $2' mule-timer $tl $tp \
+     < /dev/null > /dev/null 2>&1 3<&- & tw=$!\n\
+     [ -z \"$S\" ] && set +m\n\
+     wait $tp; tr=$?; { kill -KILL $tw; kill -KILL -$tw; tn=0\n\
+     while kill -STOP -$tp && [ $tn -lt 20 ]; do kill -KILL -$tp; sleep 0.05; tn=$((tn+1)); done; } 2>/dev/null\n\
+     return $tr; }\n";
+
 /// The command ssh sends for one batch: [`batch_body`] run by `/bin/sh`,
 /// whatever the account's login shell is.
 ///
@@ -471,7 +506,7 @@ pub fn batch_script(ops: &[Op]) -> String {
 /// The POSIX `sh` script for one batch.
 ///
 /// Nothing in it waits unbounded on anything but local files: the payload
-/// read and the delivery run under `timeout`, every op under the deadline
+/// read and the delivery run under [`BOUND_FN`], every op under the deadline
 /// process, and the helpers are killed once the ops end.
 ///
 /// Every op runs in its own session (`setsid`), or where the host has none
@@ -493,7 +528,7 @@ pub fn batch_script(ops: &[Op]) -> String {
 pub fn batch_body(ops: &[Op]) -> String {
     let total: usize = ops.iter().map(|op| op.payload().len()).sum();
     let mut s = String::new();
-    // Fail closed: without timeout(1), process groups or a way to find an
+    // Fail closed: without `sleep`, process groups or a way to find an
     // op's processes nothing here is bounded, and without base64 or mktemp
     // nothing runs as written. Checked before anything runs. Sessions count
     // only if `pgrep -s 0` lists this shell: the tool that is probed is the
@@ -502,7 +537,7 @@ pub fn batch_body(ops: &[Op]) -> String {
     // only looked for, not run: `-o pid,ppid,pgid` is POSIX, and one `ps`
     // costs 0.1-0.3s on a loaded macOS, on every batch.
     s.push_str(&format!(
-        "for t in timeout base64 mktemp head tail wc cat sleep; do \
+        "for t in base64 mktemp head tail wc cat sleep; do \
          command -v \"$t\" >/dev/null 2>&1 || \
          {{ echo \"mule-serve: host lacks $t\" >&2; exit {RC_MISSING_TOOL}; }}; done\n\
          X=; if command -v setsid >/dev/null 2>&1; then S=setsid; \
@@ -513,6 +548,7 @@ pub fn batch_body(ops: &[Op]) -> String {
          [ -n \"$X$T\" ] || {{ echo 'mule-serve: host lacks pgrep -s, and ps -o or awk' >&2; \
          exit {RC_MISSING_TOOL}; }}\n"
     ));
+    s.push_str(BOUND_FN);
     // Every body decoded here, before any op runs: decoded inside the async
     // op, the decode stretched the window in which a cancel hits a shell
     // that has not yet exec'd (bash 3.2, three ops cancelled at once: three
@@ -546,7 +582,7 @@ pub fn batch_body(ops: &[Op]) -> String {
         s.push_str(": > \"$d/in\" || B 'spool write failed'\n");
     } else {
         s.push_str(&format!(
-            "timeout {PAYLOAD_SECS} head -c {total} > \"$d/in\" || B 'payload read failed'\n"
+            "TO {PAYLOAD_SECS} head -c {total} > \"$d/in\" || B 'payload read failed'\n"
         ));
     }
     s.push_str(&format!("N \"$d/in\" {total} || B 'short payload'\n"));
@@ -658,7 +694,7 @@ pub fn batch_body(ops: &[Op]) -> String {
     s.push_str("for p in $dl $w; do kill -KILL -$p; done 2>/dev/null\nexec 3<&-\n");
     s.push_str(&format!("F={}\n", quote(&deliverer())));
     s.push_str(&format!(
-        "timeout -k 1 {DELIVER_SECS} sh -c \"$F\" mule-deliver \"$d\" {}{}\n",
+        "TO {DELIVER_SECS} sh -c \"$F\" mule-deliver \"$d\" {}{} 3< /dev/null\n",
         ops.len(),
         (0..ops.len())
             .map(|k| format!(" \"$d/out.{k}\" \"$d/err.{k}\""))
@@ -1070,7 +1106,7 @@ fn worker<T: Transport + ?Sized>(
                     (
                         "host_tool_missing",
                         format!(
-                            "{why}; serve needs timeout, base64, mktemp, sleep and \
+                            "{why}; serve needs base64, mktemp, sleep and \
                              setsid (or a /bin/sh with job control) and pgrep -s (or ps and \
                              awk) on the host"
                         ),

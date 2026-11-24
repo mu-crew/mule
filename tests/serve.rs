@@ -279,11 +279,11 @@ fn every_op_runs_in_its_own_group_under_the_deadline_and_payloads_stay_out_of_ar
         s.contains(&format!("mule-watch \"$d\" \"$X\" \"$T\" {n} ")),
         "{s}"
     );
-    assert!(s.contains(&format!("timeout {} head -c", mule::serve::PAYLOAD_SECS)));
-    assert!(s.contains(&format!(
-        "timeout -k 1 {} sh -c \"$F\"",
-        mule::serve::DELIVER_SECS
-    )));
+    // The payload read and the delivery are bounded by the script itself:
+    // the host need not have `timeout(1)`.
+    assert!(s.contains(&format!("TO {} head -c", mule::serve::PAYLOAD_SECS)));
+    assert!(s.contains(&format!("TO {} sh -c \"$F\"", mule::serve::DELIVER_SECS)));
+    assert!(!s.contains("timeout"), "{s}");
     assert!(
         // The write body is the largest op body (~2KB); a 200KB payload
         // in the script would be far past this.
@@ -388,6 +388,7 @@ fn have_tools() -> bool {
         .output()
         .is_ok_and(|o| o.status.success() && o.stdout.ends_with(b"x"));
     if !ok {
+        // The script needs no timeout(1); the tests' tool shims do.
         eprintln!("skipping: no timeout(1) or base64 -d on this machine");
     }
     ok
@@ -592,12 +593,13 @@ fn output_is_capped_on_the_host_and_flagged() {
 }
 
 /// A `PATH` of symlinks to every tool the script and the test ops need,
-/// minus `missing`.
+/// minus `missing`. `timeout` is not the script's but the shims': tests
+/// wrap a host tool in GNU `timeout` to make a child leave the op's group.
 fn path_without(missing: &str) -> String {
     let dir = scratch(&format!("nopath-{missing}"));
     for tool in [
-        "sh", "timeout", "base64", "mktemp", "head", "tail", "wc", "cat", "rm", "mv", "touch",
-        "sleep", "uname", "stat", "ps", "awk", "pgrep", "pkill",
+        "sh", "timeout", "base64", "mktemp", "head", "tail", "wc", "cat", "rm", "rmdir", "mv",
+        "chmod", "touch", "sleep", "uname", "stat", "ps", "awk", "pgrep", "pkill",
     ] {
         if tool == missing {
             continue;
@@ -617,11 +619,11 @@ fn path_without(missing: &str) -> String {
 }
 
 #[test]
-fn a_host_without_timeout_base64_or_mktemp_fails_every_op_closed() {
+fn a_host_without_base64_or_mktemp_fails_every_op_closed() {
     if !have_tools() {
         return;
     }
-    for missing in ["timeout", "base64", "mktemp"] {
+    for missing in ["base64", "mktemp"] {
         let marker = scratch("tool").join("ran");
         let t = Arc::new(LocalSh {
             path: Some(path_without(missing)),
@@ -647,6 +649,177 @@ fn a_host_without_timeout_base64_or_mktemp_fails_every_op_closed() {
         assert!(!marker.exists(), "{missing}: an op ran without its bounds");
         drop(w);
         assert_eq!(done.join().unwrap(), 0);
+    }
+}
+
+/// A `PATH` of one directory: a symlink to the first of each command `path`
+/// finds, `timeout` excepted. Stock macOS before 27 has no `timeout(1)`, and
+/// on the CI runner only the runner's shell `PATH` (Homebrew) had one, not
+/// sshd's `/usr/bin:/bin:/usr/sbin:/sbin`: every op of every batch failed
+/// `host_tool_missing` there, while these local-sh tests passed.
+fn without_timeout(path: &str) -> String {
+    let dir = scratch("no-timeout");
+    for d in path.split(':').filter(|d| !d.is_empty()) {
+        let Ok(entries) = std::fs::read_dir(d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if name == "timeout" || dir.join(&name).symlink_metadata().is_ok() {
+                continue;
+            }
+            let _ = std::os::unix::fs::symlink(e.path(), dir.join(&name));
+        }
+    }
+    assert!(!dir.join("timeout").exists());
+    dir.display().to_string()
+}
+
+/// Every local "host" flavour, none with a `timeout(1)` on its `PATH`.
+fn hosts_without_timeout() -> Vec<(&'static str, LocalSh)> {
+    local_hosts()
+        .into_iter()
+        .map(|(flavour, t)| {
+            let path = t
+                .path
+                .clone()
+                .unwrap_or_else(|| std::env::var("PATH").unwrap());
+            let t = LocalSh {
+                path: Some(without_timeout(&path)),
+                ..t
+            };
+            (flavour, t)
+        })
+        .collect()
+}
+
+#[test]
+fn a_host_without_timeout_serves_every_op() {
+    if !have_tools() {
+        return;
+    }
+    for (flavour, t) in hosts_without_timeout() {
+        let p = scratch("no-timeout-rt").join("w");
+        let out = round_trip(&t, &[Op::Write(p.display().to_string(), b"hi".to_vec())]);
+        let f = parse_frames(&out.stdout, 1)
+            .unwrap_or_else(|| panic!("{flavour}: rc {}: {}", out.code, out.stderr));
+        assert_eq!(
+            f[0].rc,
+            0,
+            "{flavour}: {}",
+            String::from_utf8_lossy(&f[0].stderr)
+        );
+        let p = p.display().to_string();
+        let out = round_trip(&t, &[Op::Read(p.clone()), Op::Stat(p)]);
+        let f = parse_frames(&out.stdout, 2)
+            .unwrap_or_else(|| panic!("{flavour}: rc {}: {}", out.code, out.stderr));
+        assert_eq!(
+            (f[0].rc, f[0].stdout.as_slice()),
+            (0, &b"hi"[..]),
+            "{flavour}"
+        );
+        assert_eq!(f[1].rc, 0, "{flavour}");
+    }
+}
+
+/// A payload that never arrives whole: the host's own bound on reading it
+/// fails the batch, before any op, with no `timeout(1)` to lean on.
+#[test]
+fn the_payload_read_is_bounded_on_a_host_without_timeout() {
+    if !have_tools() {
+        return;
+    }
+    let secs = u64::from(mule::serve::PAYLOAD_SECS);
+    let runs: Vec<_> = hosts_without_timeout()
+        .into_iter()
+        .map(|(flavour, t)| {
+            std::thread::spawn(move || {
+                let marker = scratch("no-timeout-pay").join("w");
+                let op = Op::Write(marker.display().to_string(), vec![b'x'; 10]);
+                let ctl = Control::default();
+                let start = Instant::now();
+                // Half the payload, and the stream left open.
+                let out = t
+                    .run_with_stdin(
+                        &host(&uniq("pay")),
+                        &batch_script(&[op]),
+                        &feed(b"xxxxx", &ctl),
+                    )
+                    .unwrap_or_else(|e| panic!("{flavour}: {e:#}"));
+                (flavour, start.elapsed(), out, marker.exists())
+            })
+        })
+        .collect();
+    for run in runs {
+        let (flavour, took, out, wrote) = run.join().unwrap();
+        assert!(
+            out.stderr.contains("payload read failed"),
+            "{flavour}: rc {}: {}",
+            out.code,
+            out.stderr
+        );
+        assert!(!wrote, "{flavour}: the op ran");
+        assert!(
+            took >= Duration::from_secs(secs) && took < Duration::from_secs(secs + 3),
+            "{flavour}: {took:?}"
+        );
+    }
+}
+
+/// A delivery that stalls, TERM-proof: KILLed whole one second after its
+/// bound, as `timeout -k 1` did, with no `timeout(1)` on the host.
+#[test]
+fn the_delivery_is_bounded_on_a_host_without_timeout() {
+    if !have_tools() {
+        return;
+    }
+    let secs = u64::from(mule::serve::DELIVER_SECS);
+    let real_head = real("head");
+    let runs: Vec<_> = hosts_without_timeout()
+        .into_iter()
+        .map(|(flavour, t)| {
+            let late = scratch("no-timeout-deliver").join("late");
+            // Only the delivery names a spool file `out.<k>` as an argument.
+            let dir = tool_dir(
+                "no-timeout-head",
+                "head",
+                &format!(
+                    "case \"$*\" in *mule-serve.*/out.*) trap '' TERM; sleep {}; touch '{}';; esac\n\
+                     exec {real_head} \"$@\"",
+                    secs + 3,
+                    late.display()
+                ),
+            );
+            let t = with_tools(t, &dir);
+            std::thread::spawn(move || {
+                let file = scratch("no-timeout-deliver-src").join("f");
+                std::fs::write(&file, "data").unwrap();
+                let start = Instant::now();
+                let out = round_trip(&t, &[Op::Read(file.display().to_string())]);
+                (flavour, start.elapsed(), out, late)
+            })
+        })
+        .collect();
+    let mut lates = Vec::new();
+    for run in runs {
+        let (flavour, took, out, late) = run.join().unwrap();
+        assert!(
+            parse_frames(&out.stdout, 1).is_none(),
+            "{flavour}: a cut delivery passed"
+        );
+        assert!(
+            took >= Duration::from_secs(secs) && took < Duration::from_secs(secs + 3),
+            "{flavour}: {took:?}: {}",
+            out.stderr
+        );
+        lates.push((flavour, late));
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    for (flavour, late) in lates {
+        assert!(
+            !late.exists(),
+            "{flavour}: the stalled delivery outlived its KILL"
+        );
     }
 }
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- `mule serve` no longer needs `timeout(1)` on the host. Stock macOS before
+  27 has none, so every op against such a host failed `host_tool_missing`
+  (CI's macOS 26 runner: sshd's `PATH` has no `timeout`). The payload read
+  and the delivery are bounded by the batch script itself, as before (TERM
+  at 5s, KILL 1s later), and a delivery's leftovers die with it.
+
 ## [0.7.0] — 2026-11-24
 
 ### Added
