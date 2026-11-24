@@ -43,7 +43,6 @@ export class MuleServeBackend implements WorkspaceOps {
 		this.#config = options.config;
 	}
 
-	resolveRoot(cwd?: string) { return this.jobs.resolveRoot(cwd); }
 	probe(cwd?: string, muzzle?: string) { return this.jobs.probe(cwd, muzzle); }
 
 	// The child is per caller and lives only as long as it is needed: a

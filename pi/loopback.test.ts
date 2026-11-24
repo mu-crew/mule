@@ -22,7 +22,7 @@ const mark = () => readFileSync(process.env.MULE_PI_TEST_CALLS!, "utf8").length;
 test("workspace ops work over one capped SSH master", { skip: noFixture, timeout: 45_000 }, async () => {
 	const root = fixture!;
 	const ops = backend();
-	assert.equal(await ops.resolveRoot(root), root);
+	assert.equal((await ops.probe(root, "off")).root, root);
 	const router = workspaceRouter("/loop/workspace", root, loopResources("/loop/workspace", "/loop/home", []), ops);
 	const path = "a ' $dollar; $(false) ü.txt";
 	const file = join(root, path);

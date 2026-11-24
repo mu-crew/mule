@@ -10,6 +10,7 @@ const WRITE_CHUNK = 40 * 1024;
 const BATCH_OUTPUT_BYTES = 512 * 1024;
 const FILE_OP_SECONDS = 10;
 const MISSING = 44;
+const JOB_ID = /^[0-9a-f]{6}$/;
 
 type Reply = { code: number; data: Buffer };
 type Member = {
@@ -92,10 +93,6 @@ export class MuleExecBackend implements WorkspaceOps {
 
 	/** A short fixed script on the host, its output discarded. */
 	async command(script: string) { await this.#fixed(script); }
-
-	async resolveRoot(cwd?: string) {
-		return (await this.probe(cwd, "off")).root;
-	}
 
 	/**
 	 * The workspace root and, in the same round trip, the host's muzzle: an
@@ -237,7 +234,7 @@ else printf missing; fi`, 9, signal);
 		// mule's worker wrapper runs POSIX sh. Bash tools expect bash syntax.
 		const id = (await this.#call("run", ["--human", "--cwd", cwd, "--key", key,
 			...(timeout && timeout > 0 ? ["--max-secs", String(Math.ceil(timeout))] : []), "--", `exec bash -c ${quote(command)}`])).toString().trim();
-		if (!/^[0-9a-f]{6}$/.test(id)) throw new Error("Mule did not return a job id");
+		if (!JOB_ID.test(id)) throw new Error("Mule did not return a job id");
 		return id;
 	}
 
@@ -264,7 +261,7 @@ else printf missing; fi`, 9, signal);
 		// 24-hour window, so an old finished job is still found.
 		const id: unknown = JSON.parse((await this.#call("lookup", [key])).toString());
 		if (id === null) return undefined;
-		if (typeof id !== "string" || !/^[0-9a-f]{6}$/.test(id)) throw new Error("Mule did not return a job id");
+		if (typeof id !== "string" || !JOB_ID.test(id)) throw new Error("Mule did not return a job id");
 		return id;
 	}
 }
