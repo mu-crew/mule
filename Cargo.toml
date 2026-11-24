@@ -22,9 +22,7 @@ rust-version = "1.88"
 # published tarball -- the repository is where they belong.
 include = ["src/**/*.rs", "README.md", "SPEC.md", "LICENSE", "CHANGELOG.md"]
 
-# The library keeps the short name too, so `mule::cli` and the 91 `mule::`
-# paths across src/ and tests/ are unaffected by the crate rename. Without
-# this, renaming the package renames the lib target and nothing compiles.
+# Keep `mule::` imports independent of the published package name.
 [lib]
 name = "mule"
 path = "src/lib.rs"

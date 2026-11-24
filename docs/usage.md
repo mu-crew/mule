@@ -44,7 +44,8 @@ usually lives — does not run.
 In practice that is enough: put your version manager's shims directory on
 `PATH` in `.bashrc` and jobs resolve the same tool versions a login shell
 would. If you need activation itself, ask for it in the command:
-`mule run 'source ~/.zshrc && npm test'`. There is deliberately no flag for it —
+`mule run '. ~/activate.sh && npm test'` for a POSIX activation file. Use
+the file's own shell if it needs one. There is no flag for it —
 a login shell measured 83ms against a 125ms dispatch and changed nothing but
 `PATH` length.
 
@@ -118,7 +119,7 @@ gone. So a script can treat exit 0 as proof before deleting its own handle.
 `mule rm --all` removes every **finished** job, ignoring `keep_days`, and leaves
 running jobs and orphans alone. Prefer `mule kill` when you want the exit code
 recorded as **137** without dropping state; use `kill --rm` to end and discard
-in one trip.
+in one invocation.
 
 `mule rm <id> --retry-for SECS` is the signal-path stop a lease or `exec`
 spawns. You rarely type it. It waits for a missing master (a `-O check` every
@@ -265,7 +266,7 @@ settling to 5s) over mule's own connection.
   the tsesh agents view to interact.
 
 ```sh
-mule run --host box --lease --human --cwd ~/w --job-file /tmp/w1.job \
+mule run --host box --lease --human --cwd '~/w' --job-file /tmp/w1.job \
   --forward-unix /tmp/w1.sock:/home/me/.mu/w1.sock -- env K=v sh -c 'pi'
 ```
 
@@ -347,7 +348,7 @@ is the command's own.
   The attempt may fail or outlast the grace; the exit is not proof.
 
 ```sh
-mule exec --cwd ~/repo -- git rev-parse HEAD
+mule exec --cwd '~/repo' -- git rev-parse HEAD
 mule exec -- env K=v sh -c 'echo "$K"'      # several words: quoted for you
 ```
 
