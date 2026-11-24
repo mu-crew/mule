@@ -153,7 +153,7 @@ pub const TEMPLATE: &str = "\
 # Then open the control master, once per ControlPersist window. This may ask
 # you to touch a hardware key; mule cannot do it for you:
 #
-#   ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
+#   ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h -o StreamLocalBindUnlink=yes build
 ";
 
 /// Write [`TEMPLATE`] to `path` unless something is already there.

@@ -275,7 +275,7 @@ Mule requires an existing control master and never opens one:
 
 ```text
 mule: no control master for build
-  run: ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
+  run: ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h -o StreamLocalBindUnlink=yes build
 ```
 
 Opening a master may need a prompt (a hardware token, a second factor) that only a terminal can answer, so a missing master exits **3**. A master lasts until `ControlPersist` runs out or the connection under it drops, whichever comes first. A resumable transport can hold the connection across drops: for example Eternal Terminal with a port forward to the host's sshd, and the host's ssh config pointing at that port. mule resolves its target through ssh, so it needs no change.

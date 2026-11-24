@@ -89,9 +89,15 @@ fn no_mu_seeds_once_without_needing_the_plugin() {
         out.lines().filter(|l| l.contains("mu not on PATH")).count(),
         1
     );
-    assert_eq!(
-        fs::read_to_string(h.config()).unwrap(),
-        mule::config::TEMPLATE
+    let seeded = fs::read_to_string(h.config()).unwrap();
+    assert_eq!(seeded, mule::config::TEMPLATE);
+    let master = seeded
+        .lines()
+        .find(|line| line.starts_with("#   ssh -MNf "))
+        .expect("the template has a master setup example");
+    assert!(
+        master.contains("-o StreamLocalBindUnlink=yes"),
+        "template master must replace stale forward sockets: {master}"
     );
     let edited = "# keep this\n";
     fs::write(h.config(), edited).unwrap();
