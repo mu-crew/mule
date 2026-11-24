@@ -87,8 +87,7 @@ pub fn next_interval(current: Duration) -> Duration {
 /// the ~267KB `mux_client_request_session: write packet: Broken pipe` that
 /// spike_exec saw). The Linux limit is the smaller, so it governs; 16 KiB of
 /// headroom below it covers the NUL, mux framing and anything the transport
-/// adds. Not a measured end-to-end boundary (no sshd in the sandbox): policy
-/// derived from those two sources. SPEC § The dispatch size cap.
+/// adds. A policy ceiling, not a measured boundary (SPEC § The dispatch size cap).
 pub const MAX_DISPATCH_BYTES: usize = 112 * 1024;
 
 /// Refuse a dispatch too big for one ssh argument, before any transport call

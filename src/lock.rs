@@ -217,7 +217,7 @@ fn with_counter_lock<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T>
         .open(path.join("counter.lock"))
         .context("cannot open counter lock")?;
     // The OS releases flock when a process dies. This avoids a stale sentinel,
-    // while keeping the ticket read-modify-write atomic without a dependency.
+    // while keeping the ticket read-modify-write atomic.
     if unsafe { flock(file.as_raw_fd(), 2) } != 0 {
         return Err(std::io::Error::last_os_error()).context("cannot acquire counter lock");
     }
