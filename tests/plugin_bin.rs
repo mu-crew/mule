@@ -188,7 +188,8 @@ fn lookup(p: &mut Plugin, key: &str) -> Value {
     p.call("job.lookup", params)
 }
 
-struct Carrier(Child);
+/// A launched carrier, and everything it has printed so far.
+struct Carrier(Child, Arc<std::sync::Mutex<String>>);
 
 impl Carrier {
     fn start(h: &ShimHost, view: &Value) -> Self {
@@ -198,14 +199,33 @@ impl Carrier {
             cmd.env(k, v.as_str().unwrap());
         }
         let _gate = SPAWN_GATE.read().unwrap();
-        Self(
-            cmd.env("PATH", h.path_env(None))
-                .env("XDG_STATE_HOME", &h.state)
-                .stdin(Stdio::null())
-                .process_group(0)
-                .spawn()
-                .unwrap(),
-        )
+        let mut child = cmd
+            .env("PATH", h.path_env(None))
+            .env("XDG_STATE_HOME", &h.state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let out = Arc::<std::sync::Mutex<String>>::default();
+        let (stdout, sink) = (child.stdout.take().unwrap(), Arc::clone(&out));
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let mut sink = sink.lock().unwrap();
+                sink.push_str(&line);
+                sink.push('\n');
+            }
+        });
+        Self(child, out)
+    }
+
+    /// Wait until the carrier holds: `hold` prints its first status line only
+    /// once the start or attach has returned, so its signal path knows the
+    /// job by then.
+    fn wait_holding(&self) {
+        common::local::wait_until("carrier holding", 20, || {
+            self.1.lock().unwrap().contains(": starting; forwards:")
+        });
     }
 
     fn signal(&self, signal: i32) {
@@ -283,13 +303,28 @@ fn lease_view_recovers_by_file_and_key_and_uses_the_handshake_host() {
     let view = &attached["result"];
     assert!(view["command"].is_string(), "{attached}");
     drop(p); // A returned launcher must not need the protocol process or its temp copy.
-    let attached = Carrier::start(&h, view);
+    let mut attached = Carrier::start(&h, view);
     let fence = h.state.join("mule/stopping").join(handle.trim());
     common::local::wait_until("attach owns generation", 20, || {
         std::fs::read_to_string(&fence).is_ok_and(|s| s.trim() == "1")
     });
     assert_eq!(std::fs::read_to_string(&file).unwrap(), handle);
+    // The fence is bumped just before the signal path is handed the job, and
+    // a TERM between the two stops nothing (by design: the job runs on).
+    attached.wait_holding();
     attached.signal(libc::SIGTERM);
+    // Reap it, as the pane's shell would. A carrier TERMed while its probe
+    // is queued exits leaving `waiter.<n>` with its pid, and the lock steps
+    // over that ticket only once `kill(pid, 0)` fails, which it never does
+    // for an unreaped zombie: the detached `rm` then queued behind it
+    // forever. Caught under load as `waiter.8` = the carrier's pid in `ps`
+    // state Z, the `rm` on ticket 9 (CI runs 45195619097, 45359523640).
+    let mut code = None;
+    common::local::wait_until("attached carrier exited", 20, || {
+        code = attached.0.try_wait().unwrap().map(|s| s.code());
+        code.is_some()
+    });
+    assert_eq!(code, Some(Some(143)), "a TERMed carrier exits 128+15");
     common::local::wait_until("attached carrier stopped the job", 20, || {
         !h.jobs().join(handle.trim()).exists()
     });
@@ -693,6 +728,11 @@ fn log_ssh(h: &ShimHost) -> std::path::PathBuf {
         ),
     )
     .unwrap();
+    // Warm the rewritten script as `ShimHost::new` warms the first: a fresh
+    // script's first exec on macOS can outlast mule's 2s `-O check`, and a
+    // loaded local run lost this test's first carrier to "no control master".
+    let _gate = SPAWN_GATE.read().unwrap();
+    let _ = Command::new(&shim).arg("-O").output();
     log
 }
 
