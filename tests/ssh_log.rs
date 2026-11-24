@@ -65,11 +65,13 @@ fn a_group_writable_ancestor_is_refused() {
     let mid = root.join("mid");
     std::fs::create_dir(&mid).unwrap();
     std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let ancestor = std::fs::canonicalize(&mid).unwrap();
     let dir = mid.join("ssh");
     let err = SshLog::create_in(&dir).err().expect("must fail closed");
-    assert!(err.to_string().contains(&*mid.to_string_lossy()), "{err}");
     std::fs::set_permissions(&mid, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
+    let expected = format!(": ancestor {} is unsafe (", ancestor.display());
+    assert!(err.to_string().contains(&expected), "{err}");
 }
 
 #[test]
