@@ -38,7 +38,7 @@ use crate::errors::{EXIT_NO_MASTER, EXIT_ORPHAN, MuleError};
 use crate::forward::{self, Spec};
 use crate::jobfile::{publish_job_file, stop_failed_path, write_job_file};
 use crate::key::JobKey;
-use crate::probe::{From as ProbeFrom, State, probe};
+use crate::probe::{Fetch, State, probe};
 use crate::run::Dispatched;
 use crate::stopfence::StopFence;
 use crate::transport::{InFlight, Ssh, Stopper, Transport};
@@ -78,12 +78,12 @@ pub struct Request<'a> {
 
 /// The job a carrier owns, and the stop fence generation it owns it at.
 ///
-/// Fixed before the carrier can own the job, and the only generation its
-/// stop is ever fenced with: a lease reads it before its dispatch; an attach
-/// owns the number it bumped to. Never re-read at signal time -- a signal
-/// thread descheduled after its pane went could read an attach's new
-/// generation and kill the reattached job, and a read error there left the
-/// stop unfenced (review of mule_stop, both reproduced).
+/// Fixed before the carrier can own the job, and the only generation its stop
+/// is ever fenced with: a lease reads it before its dispatch; an attach owns
+/// the number it bumped to. Never re-read at signal time -- a signal thread
+/// descheduled after its pane went could read an attach's new generation and
+/// kill the reattached job, and a read error there left the stop unfenced (both
+/// reproduced).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Owned {
     pub id: JobId,
@@ -158,13 +158,13 @@ pub fn start(
 /// - **claimed:** exactly [`start`]: the job file names the fresh id, then
 ///   the dispatch, whose key check finds this job's own claim and starts it.
 ///
-/// The fresh id is named (`on_dispatch(Some)`) before each claim, so a
-/// signal while the claim is in flight removes a claim that landed. Once a
-/// claim is known to have made nothing -- it found the key held, or it
-/// stopped in its lookup, before `mkdir` -- `on_unnamed` takes the name back:
-/// nothing of that id exists, and a later failure must not spawn an `rm`
-/// for it (review of P7a, round 4: every injected failure past such a claim
-/// spawned a detached `mule rm` of an id that never existed).
+/// The fresh id is named (`on_dispatch(Some)`) before each claim, so a signal
+/// while the claim is in flight removes a claim that landed. Once a claim is
+/// known to have made nothing -- it found the key held, or it stopped in its
+/// lookup, before `mkdir` -- `on_unnamed` takes the name back: nothing of that
+/// id exists, and a later failure must not spawn an `rm` for it (every injected
+/// failure past such a claim spawned a detached `mule rm` of an id that never
+/// existed).
 #[allow(clippy::too_many_arguments)] // `start`'s seam, plus the key.
 pub fn start_keyed(
     t: &dyn Transport,
@@ -298,8 +298,8 @@ enum Require {
     AnyState,
 }
 
-/// Own a job that is already running: `run --lease --attach`, steps 1-5 of
-/// spec 2026-11-04-lease-adopt § mule_attach. [`hold`] is the rest, unchanged.
+/// Own a job that is already running: `run --lease --attach`, steps 1-5
+/// below. [`hold`] is the rest, unchanged.
 ///
 /// 1. No master: [`MuleError::NoMaster`] (exit 3), with nothing written.
 /// 2. Take `fence`'s lock, waiting out a stop attempt in flight: an old
@@ -342,7 +342,7 @@ fn own_existing(
     let mut lock = fence.lock()?;
     // Flattened to text: a probe that fails is exit 1 for an attach whatever
     // the cause (spec step 3), not the code its error would map to elsewhere.
-    let state = match probe(t, host, id, ProbeFrom::StateOnly) {
+    let state = match probe(t, host, id, Fetch::StateOnly) {
         Ok(probed) => probed.state,
         // A keyed lease holds whatever its key names, an unproven state
         // included: a claim whose dispatch is still to come reads `unknown`,
@@ -550,7 +550,7 @@ impl Holder<'_, '_> {
     /// that fails, or finds the state already removed, costs only the screen.
     /// No drift repair: the job is over, and its forwards are about to go.
     fn finish(&mut self, code: i32) -> i32 {
-        match probe(self.t, self.h.host, self.h.id, ProbeFrom::Screen) {
+        match probe(self.t, self.h.host, self.h.id, Fetch::Screen) {
             Ok(result) if matches!(result.state, State::Done(_)) => self.show(&result.bytes),
             _ => {
                 let line = self.status_line();
@@ -598,9 +598,9 @@ impl Holder<'_, '_> {
         }
 
         let from = if self.mirroring() || self.link != Link::Ok || self.want_screen {
-            ProbeFrom::Screen
+            Fetch::Screen
         } else {
-            ProbeFrom::StateOnly
+            Fetch::StateOnly
         };
         let result = match probe(self.t, self.h.host, self.h.id, from) {
             Ok(result) => result,
@@ -621,14 +621,14 @@ impl Holder<'_, '_> {
         };
         let link_changed = self.link != Link::Ok;
         self.link = Link::Ok;
-        if from == ProbeFrom::Screen {
+        if from == Fetch::Screen {
             self.want_screen = false;
         }
         let state_changed = self.state.as_ref() != Some(&result.state);
         self.state = Some(result.state.clone());
 
         match result.state {
-            State::Done(code) if from == ProbeFrom::Screen => {
+            State::Done(code) if from == Fetch::Screen => {
                 self.show(&result.bytes);
                 self.unforward();
                 (Some(code), true)
@@ -659,9 +659,9 @@ impl Holder<'_, '_> {
                 (Some(1), true)
             }
             State::Running => {
-                let screen_changed = from == ProbeFrom::Screen
+                let screen_changed = from == Fetch::Screen
                     && self.last_screen.as_deref() != Some(result.bytes.as_slice());
-                if from == ProbeFrom::Screen && (screen_changed || state_changed || link_changed) {
+                if from == Fetch::Screen && (screen_changed || state_changed || link_changed) {
                     self.show(&result.bytes);
                 } else if state_changed || link_changed {
                     // Out of the mirror window: a change of state earns one
@@ -745,13 +745,6 @@ pub fn on_signal(steps: &mut dyn SignalSteps, signal: i32) -> i32 {
     steps.spawn_stop();
     steps.unforward();
     cleanup::exit_status_for(signal)
-}
-
-/// Block this thread until the signal thread ends the process.
-fn park() -> ! {
-    loop {
-        std::thread::park();
-    }
 }
 
 struct RealSignalSteps {
@@ -969,7 +962,7 @@ fn carrier_cli(
         Ok(owned) => owned.id,
         Err(error) => {
             if signals.pending().is_some() {
-                park();
+                cleanup::park();
             }
             if matches!(
                 error.downcast_ref::<MuleError>(),
@@ -1003,13 +996,13 @@ fn carrier_cli(
             if signals.wait(Some(interval)).is_some() {
                 // The signal thread is stopping the job and about to exit the
                 // process; another probe would be a locked call for nothing.
-                park();
+                cleanup::park();
             }
         },
         &mut std::io::stdout(),
     );
     if signals.pending().is_some() {
-        park();
+        cleanup::park();
     }
     Ok(code)
 }

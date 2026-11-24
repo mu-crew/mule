@@ -16,7 +16,7 @@ mod common;
 use common::local::{ShimHost, scratch, stderr, stdout, tmux_available, wait_until};
 use mule::config::{Config, Host};
 use mule::errors::{MuleError, exit_code};
-use mule::probe::{From, State, probe};
+use mule::probe::{Fetch, State, probe};
 use mule::remote::CANNOT_TELL;
 use mule::transport::{Fake, Output};
 use mule::wrapper::JobId;
@@ -37,7 +37,7 @@ fn id() -> JobId {
 fn probed(reply: &str) -> anyhow::Result<State> {
     let fake = Fake::new();
     fake.push(Output::ok(reply));
-    probe(&fake, &host(), &id(), From::StateOnly).map(|p| p.state)
+    probe(&fake, &host(), &id(), Fetch::StateOnly).map(|p| p.state)
 }
 
 fn json(out: &std::process::Output) -> serde_json::Value {
@@ -56,7 +56,7 @@ fn a_check_that_could_not_tell_is_unverifiable_never_missing_or_orphan() {
         stdout: b"exists=1\n".to_vec(),
         ..Output::fail(CANNOT_TELL, format!("mule: cannot tell: {why}\n"))
     });
-    let error = probe(&fake, &host(), &id(), From::StateOnly).unwrap_err();
+    let error = probe(&fake, &host(), &id(), Fetch::StateOnly).unwrap_err();
     assert!(
         matches!(error.downcast_ref::<MuleError>(), Some(MuleError::Unverifiable { why: reason, .. }) if reason == why),
         "{error:#}"

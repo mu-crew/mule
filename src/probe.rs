@@ -25,9 +25,9 @@ pub struct Probe {
     pub alive: bool,
     /// Whether the log pipeline finalized: it wrote `drained`, its last act
     /// after the log and the `truncated` marker. The session's absence is not
-    /// this: `kill` destroys a pipeline still holding bytes past the cap, and
-    /// a session gone that way read as drained, so a capped prefix passed for
-    /// a whole result (review, 2026-11-23).
+    /// this: `kill` destroys a pipeline still holding bytes past the cap, and a
+    /// session gone that way read as drained, so a capped prefix passed for a
+    /// whole result.
     pub drained: bool,
     pub log_size: u64,
     pub bytes: Vec<u8>,
@@ -41,7 +41,7 @@ pub struct Probe {
 /// needs and produced `tail: Invalid argument`, which surfaced as a spurious
 /// "lost contact while waiting" on every `--wait --no-tail`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum From {
+pub enum Fetch {
     Offset(u64),
     StateOnly,
     /// State plus the pane's current screen in `bytes` (`capture-pane`), or
@@ -51,15 +51,15 @@ pub enum From {
     Screen,
 }
 
-impl From {
+impl Fetch {
     /// The `tail -c +N` argument, or `None` when no bytes are wanted.
     fn tail_arg(self) -> Option<u64> {
         match self {
             // `tail -c +N` is 1-based, so byte offset 0 is `+1`. Saturating at
             // the top keeps a nonsensical offset from wrapping into a valid
             // one; it reads the last byte instead of the whole file.
-            From::Offset(n) => Some(n.saturating_add(1)),
-            From::StateOnly | From::Screen => None,
+            Fetch::Offset(n) => Some(n.saturating_add(1)),
+            Fetch::StateOnly | Fetch::Screen => None,
         }
     }
 
@@ -71,7 +71,7 @@ impl From {
             // pane is captured; a pane that went between the session read
             // and the capture leaves its saved screen, which is read only as
             // a regular file. Anything else cannot tell.
-            From::Screen => format!(
+            Fetch::Screen => format!(
                 "if [ \"$alive\" = 1 ]; then \
                    tmux -L {socket} capture-pane -p -J -t mule-{id} 2>/dev/null \
                    || {{ mule_regular $d/screen screen && {{ cat $d/screen || mule_u \"cannot read $d/screen\"; }}; }} \
@@ -91,7 +91,7 @@ impl From {
     }
 }
 
-pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) -> Result<Probe> {
+pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<Fetch>) -> Result<Probe> {
     let dir = state_dir(id);
     let from = from.into();
     // `alive` is read BEFORE `rc`, never after. Every path that ends a job
@@ -259,8 +259,8 @@ pub fn next_interval(current: Duration, new_bytes: bool) -> Duration {
     }
 }
 
-impl core::convert::From<u64> for From {
+impl From<u64> for Fetch {
     fn from(offset: u64) -> Self {
-        From::Offset(offset)
+        Fetch::Offset(offset)
     }
 }

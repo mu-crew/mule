@@ -1,11 +1,10 @@
 //! `mule serve --stdio`: bounded synchronous ops for one caller.
 //!
 //! The third class of ssh use (SPEC § Bounded synchronous ops). `exec` costs
-//! about four round trips per command (dispatch, probe, collect, removal
-//! proof: 1.3-1.7s measured on two real hosts); serve answers a read, stat
-//! or write in one, at 0.32-0.38s p50 on the same hosts. Those three only:
-//! no arbitrary command runs here (human decision, 2026-11-20); a command
-//! is a detached job (`run`, `exec`).
+//! about four round trips per command (dispatch, probe, collect, removal proof:
+//! 1.3-1.7s measured on two real hosts); serve answers a read, stat or write in
+//! one, at 0.32-0.38s p50 on the same hosts. Those three only: no arbitrary
+//! command runs here; a command is a detached job (`run`, `exec`).
 //!
 //! - **A child of its caller, not a daemon.** JSON lines on stdin, JSON lines
 //!   on stdout. stdin EOF, or a stdout the caller closed, means the caller is
@@ -51,8 +50,8 @@ mod script;
 use script::write_body;
 pub use script::{BOUND_FN, batch_body, batch_script};
 
-/// Hard per-op limit on the host. 1s: rung 2 wants a single op at <=0.5s, so
-/// a bounded op needing twice that is a job (human decision, 2026-11-20).
+/// Hard per-op limit on the host. 1s: rung 2 wants a single op at <=0.5s, so a
+/// bounded op needing twice that is a job.
 pub const MAX_OP_SECS: u32 = 1;
 /// Test seam: a longer op deadline, for a test whose subject is not the
 /// deadline (a cancel) and which must not race it. A delayed test thread lost
@@ -98,10 +97,10 @@ pub const MAX_OUT: u64 = 1 << 20;
 pub const MAX_SMALL: u64 = 8 << 10;
 /// All ops' output in one batch, on the host's disk and on the wire. Each op
 /// reserves its caps out of it when it joins a batch, so the spool can never
-/// pass it however the ops behave: 7 reads a batch, or dozens of
-/// stats and writes. A shared cap the ops drew on as they wrote would let
-/// a batch hold more, but `sh` has no atomic counter, and the per-op caps
-/// alone let 64 ops spool 68MB for an 8MB reply (review, 2026-11-20).
+/// pass it however the ops behave: 7 reads a batch, or dozens of stats and
+/// writes. A shared cap the ops drew on as they wrote would let a batch hold
+/// more, but `sh` has no atomic counter, and the per-op caps alone let 64 ops
+/// spool 68MB for an 8MB reply.
 pub const MAX_BATCH_OUTPUT: u64 = 8 << 20;
 /// Payload cap per batch (and so per op), so a batch is a bounded transfer.
 pub const MAX_PAYLOAD: usize = 8 << 20;
@@ -194,8 +193,7 @@ impl Op {
     ///
     /// A path `-` becomes `./-`, the same file: `--` ends option parsing but
     /// leaves `-` meaning stdin to GNU `head` and `stat`, and a read of the
-    /// file named `-` replied empty, a stat size 0, both rc 0 (review,
-    /// 2026-11-22, Linux host).
+    /// file named `-` replied empty, a stat size 0, both rc 0 (on Linux).
     fn body(&self) -> String {
         const DASH: &str = "case $1 in -) set -- ./-;; esac; ";
         match self {
@@ -298,13 +296,18 @@ fn max_batch_stdout(ops: usize) -> usize {
 }
 
 /// One reply line. `error` and `kind` are set on failure; `kind` is stable for
-/// programs: `bad_request`, `too_large`, `timeout`, `cancelled`,
-/// `output_limit`, `lost`, `spool_failed`, `cleanup_failed`,
-/// `host_tool_missing`, `batch_failed`, `master_gone`. `spool_failed` has rc -1 whatever the op's own rc (in
-/// `error`): the op ran, so a write's effect may have happened, but its
-/// output is not whole, and a caller reading rc 0 would trust it.
-/// `cleanup_failed` is rc -1 likewise: the op ended, but something it
-/// started may still be running.
+/// programs:
+///
+/// - `bad_request`, `too_large` (over a batch cap, refused before any ssh),
+///   `timeout`, `cancelled`, `output_limit`;
+/// - `lost`: the op ended on the host with no result, and neither a cancel nor
+///   the deadline killed it;
+/// - `spool_failed`: rc -1 whatever the op's own rc (in `error`). The op ran,
+///   so a write's effect may have happened, but its output is not whole, and a
+///   caller reading rc 0 would trust it;
+/// - `cleanup_failed`: rc -1 likewise. The op ended, but the host could not
+///   prove every process of it gone, so something it started may still run;
+/// - `host_tool_missing`, `batch_failed`, `master_gone`.
 ///
 /// `cancelled` is a fact: the op was dropped before dispatch, or the host
 /// killed it before it completed. `cancel_requested` only says a cancel was

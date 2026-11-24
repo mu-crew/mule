@@ -365,7 +365,7 @@ fn ls_rows_carry_the_key_and_old_six_field_rows_still_parse() {
          fed987\t56\t\t\t0\tdHJ1ZQ==\t\n",
     ));
 
-    let (rows, _) = mule::jobs::list(&cfg, &fake, None, true).unwrap();
+    let (rows, _, _) = mule::jobs::list(&cfg, &fake, None, true).unwrap();
 
     let keys: Vec<_> = rows
         .iter()
@@ -522,7 +522,7 @@ fn the_real_listing_carries_the_key_and_none_for_an_unkeyed_job() {
     dispatch(&local, &host, "d00003", &key("mu.b.1"), "sleep 30").unwrap();
     std::fs::write(local.jobs().join("d00003/key"), "mu.b\t1\n").unwrap();
 
-    let (mut rows, unreachable) = mule::jobs::list(&cfg, &local, None, true).unwrap();
+    let (mut rows, unreachable, _) = mule::jobs::list(&cfg, &local, None, true).unwrap();
     rows.sort_by(|a, b| a.id.cmp(&b.id));
 
     assert!(unreachable.is_empty());

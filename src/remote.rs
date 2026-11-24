@@ -9,13 +9,12 @@
 //! unexpected output yields "cannot tell", and only an explicit positive
 //! proof yields an absence** (`missing`, "no such key", "not live", "gone").
 //!
-//! Two review rounds of P7a found the rule broken one site at a time: a
-//! `grep` exit 2 read as "not listed", a `cat` exit 2 whose partial `1` was
-//! taken as the rc, a failing `find -exec test` that made prune delete a
-//! keyed job, a symlinked key that `find -type f` silently skipped. So the
-//! checks live here, once, as shell functions every snippet starts with, and
-//! `tests/fault_injection.rs` fails every external command of every snippet
-//! in turn to hold them to it.
+//! The rule broke one site at a time: a `grep` exit 2 read as "not listed", a
+//! `cat` exit 2 whose partial `1` was taken as the rc, a failing `find -exec
+//! test` that made prune delete a keyed job, a symlinked key that `find -type
+//! f` silently skipped. So the checks live here, once, as shell functions every
+//! snippet starts with, and `tests/fault_injection.rs` fails every external
+//! command of every snippet in turn to hold them to it.
 //!
 //! The helpers stop the snippet with [`CANNOT_TELL`] (or the snippet's own
 //! `mule_u_code`) and a reason on stderr. Shell builtins (`[`, `printf`,
@@ -41,16 +40,15 @@ pub const CANNOT_TELL: i32 = 86;
 /// - `mule_u REASON`: stop, cannot tell.
 /// - `mule_absent PATH [WHAT]`: 0 if PATH is proven not to exist (`ls -d`
 ///   says `No such file or directory`), 1 if it exists; anything else stops.
-/// - `mule_regular PATH [WHAT]`: 0 for a regular file that is not a
-///   symlink, 1 if proven absent; a symlink, a directory or anything that
-///   cannot be looked at stops. Keys and `rc` are read only this way: a
-///   symlink is refused, not followed. One `ls -ld` decides, from the type
-///   its mode string names or from its "No such file" error: one
-///   observation, so a file that appears mid-check (a job writing `rc` as
-///   it ends) is seen either absent or regular, never "not a regular file".
-///   The first version tested `[ -f ]` and then proved absence with a second
-///   look, and `rc` landing between the two stopped `exec` and `wait`
-///   (review of P7a, round 3).
+/// - `mule_regular PATH [WHAT]`: 0 for a regular file that is not a symlink, 1
+///   if proven absent; a symlink, a directory or anything that cannot be looked
+///   at stops. Keys and `rc` are read only this way: a symlink is refused, not
+///   followed. One `ls -ld` decides, from the type its mode string names or
+///   from its "No such file" error: one observation, so a file that appears
+///   mid-check (a job writing `rc` as it ends) is seen either absent or
+///   regular, never "not a regular file". The first version tested `[ -f ]` and
+///   then proved absence with a second look, and `rc` landing between the two
+///   stopped `exec` and `wait`.
 /// - `mule_read PATH [WHAT]`: `REPLY` = its content, which must be
 ///   non-empty and read with `cat` exiting 0; a missing file stops too.
 /// - `mule_sessions`: `SESSIONS` = the server's session names, one per

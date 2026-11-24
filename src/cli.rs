@@ -77,15 +77,15 @@ struct PollJson {
     rc: Option<i32>,
     runtime_secs: Option<u64>,
     log_size: Option<u64>,
-    /// `done` only: whether the log pipeline finalized. `rc` is written by
-    /// the left end of the log pipeline, so it can land while a process the
-    /// command left behind still writes the log and before the `truncated`
-    /// marker exists. Only `drained: true` says the log and that marker are
-    /// final -- exec waits on the same gap, and Pi's bash showed a capped job
-    /// as uncapped with an empty log without it. It is the pipeline's own
+    /// `done` only: whether the log pipeline finalized. `rc` is written by the
+    /// left end of the log pipeline, so it can land while a process the command
+    /// left behind still writes the log and before the `truncated` marker
+    /// exists. Only `drained: true` says the log and that marker are final --
+    /// exec waits on the same gap, and Pi's bash showed a capped job as
+    /// uncapped with an empty log without it. It is the pipeline's own
     /// `drained` marker, not the session's absence: a `kill` in that gap ends
     /// the session with the pipeline cut, and Pi showed the capped prefix as a
-    /// whole rc-0 result (both review, 2026-11-23).
+    /// whole rc-0 result.
     #[serde(skip_serializing_if = "Option::is_none")]
     drained: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -593,9 +593,8 @@ pub fn host_list(cfg: &Config, t: &dyn Transport, json: bool) -> Result<()> {
         cfg.hosts().iter().map(|h| (h, t.master_alive(h))).collect();
 
     if json {
-        // JSON is an agent-facing contract, and this is now one of three
-        // emitters. Typed serialization makes escaping mandatory instead of a
-        // convention each new field can forget.
+        // JSON is an agent-facing contract. Typed serialization makes escaping
+        // mandatory instead of a convention each new field can forget.
         let items = rows
             .iter()
             .map(|(host, master)| HostListJson {
@@ -758,12 +757,9 @@ fn host_info(cfg: &Config, t: &dyn Transport, host_filter: Option<&str>, json: b
 
 /// One aligned table with a header, for every human-readable listing.
 ///
-/// There were three renderers and two of them were wrong: `host list` printed
-/// bare rows with no header, so the reader had to know that field two was the
-/// master state, and `host info` printed a FIXED-WIDTH header over unpadded
-/// rows -- so the header and the data disagreed about where a column began as
-/// soon as a value was wider than its title, which is every real hostname.
-/// `ls` was the only correct one, and this is its logic, shared.
+/// Every column is padded to its widest cell, header included: a fixed-width
+/// header over unpadded rows disagrees about where a column begins as soon as
+/// a value is wider than its title, which is every real hostname.
 ///
 /// The last column is never padded, so it can run long without trailing
 /// whitespace on every line. Widths count CHARACTERS, not bytes: a command or
@@ -877,7 +873,7 @@ fn poll_with_hint(
     // session channel and the ticket lock. That is invariant 3 violated by the
     // cheapest verb in the tool.
     crate::errors::require_master(t, host)?;
-    let probed = probe(t, host, id, crate::probe::From::StateOnly);
+    let probed = probe(t, host, id, crate::probe::Fetch::StateOnly);
     if json {
         return poll_json_verdict(id, probed, quiet);
     }
@@ -1292,7 +1288,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
         } => {
             // A key lookup ignores the 24-hour window: missing an old
             // finished job would make its caller start the effect again.
-            let (mut rows, unreachable, mut hidden) = crate::jobs::list_with_hidden(
+            let (mut rows, unreachable, mut hidden) = crate::jobs::list(
                 &cfg,
                 &Ssh,
                 host.host.as_deref(),
@@ -1317,8 +1313,7 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             }
             // Filters narrow an answer; they run after the guards that decide
             // whether there is one. `--running` first dropped the job whose key
-            // would not read, and the guard above then saw nothing to refuse
-            // (review of P7a, round 2).
+            // would not read, and the guard above then saw nothing to refuse.
             if running {
                 rows.retain(|row| row.unknown.is_none() && matches!(row.state, State::Running));
             }

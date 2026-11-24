@@ -79,12 +79,12 @@ impl Ctx {
 }
 
 /// The mule config, read and validated ONCE at the handshake. The instance mu
-/// fingerprints is derived from these bytes, and every `mule` child is handed
-/// a private copy of them (`--config <copy>`) instead of the mutable pathname:
-/// an atomic replace of the real file between the check and the use can then
-/// never retarget a dispatch (reviewed: exec ran against `two/two.sock` while
-/// mu held `one`'s fingerprint). A changed file is seen only by a new plugin
-/// process, i.e. when mu re-handshakes.
+/// fingerprints is derived from these bytes, and every `mule` child is handed a
+/// private copy of them (`--config <copy>`) instead of the mutable pathname: an
+/// atomic replace of the real file between the check and the use can then never
+/// retarget a dispatch (exec ran against `two/two.sock` while mu held `one`'s
+/// fingerprint). A changed file is seen only by a new plugin process, i.e. when
+/// mu re-handshakes.
 struct Snap {
     instance: String,
     hosts: Option<mule::config::Config>,
@@ -601,18 +601,6 @@ fn write_copy(bytes: &[u8]) -> Option<std::path::PathBuf> {
     Some(p)
 }
 
-/// FNV-1a: stable across Rust versions, unlike `DefaultHasher`, and the
-/// instance must compare equal across plugin restarts.
-fn fnv(parts: &[&[u8]]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for p in parts {
-        for b in p.iter().chain(&[0u8]) {
-            h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
-        }
-    }
-    h
-}
-
 /// The backend's identity, opaque: a hash over what decides where a job goes
 /// -- the config bytes (or why they were unreadable) and every host's name,
 /// target and master socket as mule resolves them (`~` expanded). Computed
@@ -634,7 +622,10 @@ fn instance(bytes: &[u8], config: Option<&mule::config::Config>) -> String {
                 .collect::<String>()
         })
         .unwrap_or_default();
-    format!("mule-{:016x}", fnv(&[bytes, hosts.as_bytes()]))
+    // Stable across toolchains: the instance must compare equal across plugin
+    // restarts. Each part ends in a NUL, so no two splits hash alike.
+    let hash = mule::forward::fnv1a(&[bytes, b"\0", hosts.as_bytes(), b"\0"].concat());
+    format!("mule-{hash:016x}")
 }
 
 /// The snapshot a dispatch must use; replies with a refusal (nothing ran) and

@@ -34,6 +34,13 @@ pub fn exit_status_for(signal: i32) -> i32 {
     128 + signal
 }
 
+/// Block this thread until the signal thread ends the process.
+pub(crate) fn park() -> ! {
+    loop {
+        std::thread::park();
+    }
+}
+
 /// Signals seen so far, and a pipe that wakes a sleeper when one arrives.
 ///
 /// The handler does two async-signal-safe things: store the signal number and
@@ -170,8 +177,8 @@ pub struct StopRetry<'a> {
 ///   child would fall back to -- and, on a bare home, seed -- the default
 ///   config, which is not the file the parent used.
 /// - `--quiet`: nothing here is read by anyone, and stdio is `/dev/null`. That
-///   is why a signal-path stop retries and records (`retry`): on 2026-11-04 a
-///   single attempt failed on a down master into `/dev/null`, and six jobs ran
+///   is why a signal-path stop retries and records (`retry`): a single
+///   attempt once failed on a down master into `/dev/null`, and six jobs ran
 ///   on unseen.
 pub fn rm_command(
     exe: &Path,

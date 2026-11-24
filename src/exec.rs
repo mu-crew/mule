@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail};
 use crate::cleanup::{self, Signals};
 use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_TRUNCATED, MuleError, strict_code, strict_note};
-use crate::probe::{From as ProbeFrom, State, probe};
+use crate::probe::{Fetch, State, probe};
 use crate::transport::{InFlight, Ssh, Transport};
 use crate::wrapper::{Job, JobId, JobMetadata, JobMode, new_id, state_dir};
 
@@ -42,9 +42,10 @@ const SETTLE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a job with an `rc` may keep its session before exec gives up on the
 /// rest of its output. Wall-clock, probe round trips included: counting only
-/// the requested pauses let a slow probe stretch the bound well past 5s. A drain takes milliseconds; a session that outlives this
-/// is held open by a process the command left behind holding its stdout (`sleep
-/// 30 &`), and waiting longer would only be waiting for that process.
+/// the requested pauses let a slow probe stretch the bound well past 5s. A
+/// drain takes milliseconds; a session that outlives this is held open by a
+/// process the command left behind holding its stdout (`sleep 30 &`), and
+/// waiting longer would only be waiting for that process.
 const SESSION_END_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a signal waits for the locked call in flight (a dispatch already
@@ -83,11 +84,12 @@ pub fn next_interval(current: Duration) -> Duration {
 /// host as the `sh -c` string sshd spawns. Two documented ceilings bound it:
 /// Linux's per-argument limit `MAX_ARG_STRLEN` (32 pages = 131072 bytes
 /// including the NUL, execve(2)), and OpenSSH's mux reader, which drops a
-/// client message over 256 KiB (`channel_post_mux_client_read`, channels.c;
-/// the ~267KB `mux_client_request_session: write packet: Broken pipe` that
-/// spike_exec saw). The Linux limit is the smaller, so it governs; 16 KiB of
-/// headroom below it covers the NUL, mux framing and anything the transport
-/// adds. A policy ceiling, not a measured boundary (SPEC § The dispatch size cap).
+/// client message over 256 KiB (`channel_post_mux_client_read`, channels.c; a
+/// ~267KB script was measured failing with `mux_client_request_session: write
+/// packet: Broken pipe`). The Linux limit is the smaller, so it governs; 16 KiB
+/// of headroom below it covers the NUL, mux framing and anything the transport
+/// adds. A policy ceiling, not a measured boundary (SPEC § The dispatch size
+/// cap).
 pub const MAX_DISPATCH_BYTES: usize = 112 * 1024;
 
 /// Refuse a dispatch too big for one ssh argument, before any transport call
@@ -174,7 +176,7 @@ pub fn finish_coded(
         let probed = Instant::now();
         // State only: the output comes back once, in the final read, so a
         // probe never ships bytes it would have to resend.
-        let result = probe(transport, host, id, ProbeFrom::StateOnly).with_context(|| {
+        let result = probe(transport, host, id, Fetch::StateOnly).with_context(|| {
             format!(
                 "lost contact with {} while waiting for the command",
                 host.name
@@ -208,12 +210,11 @@ pub fn finish_coded(
 
 /// The final read and the removal, in one round trip.
 ///
-/// Fail closed ([`crate::remote`]): the session list, the `truncated`
-/// marker, both sizes and both reads are checked, and any failure stops
-/// the script before the removal, so a job is never deleted with its output
-/// unread. A `wc` that failed used to read as size 0: exec exited 0 with
-/// the command's output silently dropped, and removed the job (review of
-/// P7a, round 3).
+/// Fail closed ([`crate::remote`]): the session list, the `truncated` marker,
+/// both sizes and both reads are checked, and any failure stops the script
+/// before the removal, so a job is never deleted with its output unread. A `wc`
+/// that failed used to read as size 0: exec exited 0 with the command's output
+/// silently dropped, and removed the job.
 ///
 /// No waiting in here: this runs under the ticket lock, so a sleep is a channel
 /// outage for every other caller (a 5s wait was measured holding it ~14s with a
@@ -355,13 +356,6 @@ fn note_partial() {
     }
 }
 
-/// Block this thread until the signal thread ends the process.
-fn park() -> ! {
-    loop {
-        std::thread::park();
-    }
-}
-
 /// Called when a step failed: if a stop signal is (or is about to be) pending,
 /// the failure is its fallout and the signal thread owns the exit.
 ///
@@ -372,7 +366,7 @@ fn park() -> ! {
 /// mule's own handler having run; it is paid only on an already-failed path.
 fn park_if_signalled(signals: &Signals) {
     if signals.wait(Some(SIGNAL_GRACE)).is_some() {
-        park();
+        cleanup::park();
     }
 }
 
@@ -494,7 +488,7 @@ pub fn run_cli(
                 // The signal thread is cleaning up and about to exit the
                 // process. Returning would spin probes -- locked ssh calls --
                 // for nothing in the meantime.
-                park();
+                cleanup::park();
             }
         },
         &mut std::io::stdout().lock(),

@@ -99,7 +99,7 @@ type JobOps = Pick<WorkspaceOps, "poll" | "output">;
  * Poll one job to its end and hand its tail to `onData`. A job is over when
  * `rc` exists and its log has drained: `rc` lands first, and a tail read
  * then can miss the last bytes and mule's cap marker, so a capped log would
- * pass for whole and a command's own 7 for mule's cap (review, 2026-11-23).
+ * pass for whole and a command's own 7 for mule's cap.
  * A log still undrained after DRAIN_WAIT_MS is reported as unfinished.
  */
 export async function watchJob(ops: JobOps, job: string, options: { signal?: AbortSignal; onData: (data: Buffer) => void; drainWait?: number }) {

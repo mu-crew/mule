@@ -7,42 +7,41 @@ use crate::cli::shell_quote;
 
 /// `write`: replace exactly the file named, or fail.
 ///
-/// `mv -f tmp dst` treats a `dst` that is a directory, or a symlink to one,
-/// as a container: a write to a directory returned rc 0 and left the payload
-/// in an oddly named child (review, 2026-11-20). BSD `mv` has no `-T`, so the
-/// destination is checked before (not a symlink, not a directory, its parent
-/// resolved with `pwd -P`) and after: a regular file of exactly the payload's
-/// size at the resolved path, and the temp name gone. The temp file sits
-/// in a `mktemp -d` directory of its own inside the destination's
-/// directory, so the rename stays on one filesystem, and nothing in the
-/// shared directory is ever opened or removed but what `mktemp` created
-/// exclusively (`mkdir`, mode 0700). A fixed name created with `set -C`
-/// and `rm -f`'d on failure deleted the caller's sibling on a collision,
-/// and checking the name (`-e`, `-L`) before the `set -C` create did not
-/// close the gap: `set -C` opens an existing FIFO, and one planted between
-/// the two got the payload and was then removed (review, 2026-11-23,
-/// Linux host). Only what this op created is cleaned up, the TERM trap's
-/// included. The resolved path is the op's stdout, so the caller sees where it
-/// went. The path is absolute: [`accept`] refuses a relative one, which the
-/// host would resolve against whatever its login directory is.
+/// `mv -f tmp dst` treats a `dst` that is a directory, or a symlink to one, as
+/// a container: a write to a directory returned rc 0 and left the payload in an
+/// oddly named child. BSD `mv` has no `-T`, so the destination is checked
+/// before (not a symlink, not a directory, its parent resolved with `pwd -P`)
+/// and after: a regular file of exactly the payload's size at the resolved
+/// path, and the temp name gone. The temp file sits in a `mktemp -d` directory
+/// of its own inside the destination's directory, so the rename stays on one
+/// filesystem, and nothing in the shared directory is ever opened or removed
+/// but what `mktemp` created exclusively (`mkdir`, mode 0700). A fixed name
+/// created with `set -C` and `rm -f`'d on failure deleted the caller's sibling
+/// on a collision, and checking the name (`-e`, `-L`) before the `set -C`
+/// create did not close the gap: `set -C` opens an existing FIFO, and one
+/// planted between the two got the payload and was then removed (on Linux).
+/// Only what this op created is cleaned up, the TERM trap's included. The
+/// resolved path is the op's stdout, so the caller sees where it went. The path
+/// is absolute: [`accept`] refuses a relative one, which the host would resolve
+/// against whatever its login directory is.
 ///
 /// The parent is resolved byte-for-byte: `$(pwd -P)` strips every trailing
 /// newline, so `parent\n/file` resolved to `parent/file`, and a write there
-/// replaced an unrelated file, rc 0 (review, 2026-11-20). A sentinel after
-/// `pwd`'s output keeps them; only `pwd`'s own newline is cut. The temp
-/// file's size is checked before the rename too: checked only after it, a
-/// short temp file had already replaced the old one.
+/// replaced an unrelated file, rc 0. A sentinel after `pwd`'s output keeps
+/// them; only `pwd`'s own newline is cut. The temp file's size is checked
+/// before the rename too: checked only after it, a short temp file had already
+/// replaced the old one.
 ///
-/// A replaced file keeps its mode, set on the temp file before the rename:
-/// the rename publishes the temp file's inode, so a chmod after it left a
-/// 0600 file's new bytes at 0644 until it ran, and for good when it failed
-/// or the caller aborted (review, 2026-11-23, Linux host). The temp file is
-/// unreadable to others meanwhile: its directory is `mktemp -d`'s 0700. No
-/// `--` for `chmod`: BSD's takes it as a file; `$t` is absolute.
+/// A replaced file keeps its mode, set on the temp file before the rename: the
+/// rename publishes the temp file's inode, so a chmod after it left a 0600
+/// file's new bytes at 0644 until it ran, and for good when it failed or the
+/// caller aborted (on Linux). The temp file is unreadable to others meanwhile:
+/// its directory is `mktemp -d`'s 0700. No `--` for `chmod`: BSD's takes it as
+/// a file; `$t` is absolute.
 ///
 /// Both size checks are [`COUNT_FN`]'s: `$(($(wc -c < f)))` dropped `wc`'s
-/// status and read its empty output as 0, so with `wc` failing an empty
-/// write replaced the file, rc 0 (review, 2026-11-22, Linux host).
+/// status and read its empty output as 0, so with `wc` failing an empty write
+/// replaced the file, rc 0 (on Linux).
 pub(super) fn write_body(len: usize) -> String {
     format!(
         "{COUNT_FN}p=$1; b=${{p##*/}}; case $b in ''|.|..) echo \"mule-serve: no file name in $p\" >&2; exit 2;; esac\n\
@@ -90,9 +89,9 @@ const COUNT_FN: &str = "N() { c=$(wc -c < \"$1\") || return 1; c=${c#\"${c%%[![:
 /// pipe open and kept the runner alive until the deadline.
 ///
 /// Each collector marks `<file>.ok` only if its `head` succeeded: the drain
-/// after it hid a failed one, and a read whose stdout could not be spooled
-/// (a full disk) replied rc 0, empty and whole (review, 2026-11-20). A
-/// missing mark is a failure, so a mark that cannot be made fails closed.
+/// after it hid a failed one, and a read whose stdout could not be spooled (a
+/// full disk) replied rc 0, empty and whole. A missing mark is a failure, so a
+/// mark that cannot be made fails closed.
 fn runner() -> String {
     "{ { trap : TERM; sh -c \"$1\" mule-body \"$8\" < \"$5\" 3>&-; echo $? > \"$4\"; } 2>&1 1>&3 | \
      { head -c \"$7\" > \"$3\" && : > \"$3.ok\"; cat > /dev/null; }; } 3>&1 | \
@@ -106,58 +105,55 @@ fn runner() -> String {
 /// work).
 ///
 /// `K <sig> <leader> <k> [t]` signals op `k`'s leader itself, unless its
-/// supervisor has reaped it (`end.<k>`), its process group, its session
-/// with `$X`, and every pid recorded in `kids.<k>`. The leader by its pid
-/// because `$!` is published before it has made its session: until the op's
-/// `setsid` runs, the leader is in the batch's group and leads nothing, so
-/// a group or session signal misses it. One stopped there outlived its
-/// deadline, its cancel and its caller's exit, and ran its op on resume,
-/// rc 0 (review, 2026-11-22, a `setsid` wrapper that stopped first). With `t` (a deadline or
-/// a cancel: the leader is still alive) it first walks the leader's process
-/// tree and records every descendant, whatever its group -- first, because
-/// the signal kills the leader and orphans them out of the tree. The op
-/// bodies are serve's own and start no group, but the host tools they run
-/// (`head`, `stat`, `cat`, `mv`, `wc`) are whatever the host's `PATH` finds,
-/// and a wrapper there (a shim, a version manager's) may run the real tool
-/// under GNU `timeout(1)`, which moves its child into a group of its own:
-/// that child outlived both the TERM and the KILL of the op's group and
-/// touched a file after the reply said rc 124 (review, 2026-11-20, local
+/// supervisor has reaped it (`end.<k>`), its process group, its session with
+/// `$X`, and every pid recorded in `kids.<k>`. The leader by its pid because
+/// `$!` is published before it has made its session: until the op's `setsid`
+/// runs, the leader is in the batch's group and leads nothing, so a group or
+/// session signal misses it. One stopped there outlived its deadline, its
+/// cancel and its caller's exit, and ran its op on resume, rc 0 (a `setsid`
+/// wrapper that stopped first). With `t` (a deadline or a cancel: the leader is
+/// still alive) it first walks the leader's process tree and records every
+/// descendant, whatever its group -- first, because the signal kills the leader
+/// and orphans them out of the tree. The op bodies are serve's own and start no
+/// group, but the host tools they run (`head`, `stat`, `cat`, `mv`, `wc`) are
+/// whatever the host's `PATH` finds, and a wrapper there (a shim, a version
+/// manager's) may run the real tool under GNU `timeout(1)`, which moves its
+/// child into a group of its own: that child outlived both the TERM and the
+/// KILL of the op's group and touched a file after the reply said rc 124 (local
 /// repro). A recorded leader of its own group is signalled as a group too.
 ///
 /// `L <k>` sets `p` to op `k`'s leader, from the `pid.<k>` its supervisor
 /// writes, or fails if there is none yet.
 ///
-/// `P <sig> <sid>` signals every process of session `sid`, as `pgrep -s`,
-/// the probed tool, lists them: `pkill -s` was used unprobed, and a host
-/// without it read as a clean session (review, 2026-11-22). It fails only
-/// when `pgrep` says the session is empty (rc 1), never on `kill`'s status:
-/// one `kill` over a snapshot returns 1 if any listed pid has exited, though
-/// it signalled the rest, and read as "empty" that stopped the sweep while
-/// a process forked into the session after the snapshot ran on after the
-/// op's rc 0 (review, 2026-11-22, Linux host). A `pgrep` that errors is not an
-/// empty session either: `P` returns 2, still signalling what it listed.
+/// `P <sig> <sid>` signals every process of session `sid`, as `pgrep -s`, the
+/// probed tool, lists them: `pkill -s` was used unprobed, and a host without it
+/// read as a clean session. It fails only when `pgrep` says the session is
+/// empty (rc 1), never on `kill`'s status: one `kill` over a snapshot returns 1
+/// if any listed pid has exited, though it signalled the rest, and read as
+/// "empty" that stopped the sweep while a process forked into the session after
+/// the snapshot ran on after the op's rc 0 (on Linux). A `pgrep` that errors is
+/// not an empty session either: `P` returns 2, still signalling what it listed.
 ///
-/// `Z <leader> <k>`, at the op's end, KILLs all of that until nothing is
-/// left to signal: a kill that finds no process fails, and so does a `P`
-/// that lists nobody, so a clean op costs one `kill` and one `pgrep`. It
-/// tries 20 times 50ms rather than hold the batch, and then fails unless
-/// `Q` shows that all it still found are zombies, which run nothing: a
-/// zombie answers a kill until its parent reaps it. It fails outright if
-/// the last `pgrep` errored, since what it did not list is unknown. The
-/// supervisor marks `cl.<k>` only when `Z` succeeds, and an op without the
-/// mark is not a success: the cap's failure was dropped, and with `pgrep`
-/// erroring after a partial kill an op replied rc 0 while a process of its
-/// session lived on (review, 2026-11-22, Linux host).
+/// `Z <leader> <k>`, at the op's end, KILLs all of that until nothing is left
+/// to signal: a kill that finds no process fails, and so does a `P` that lists
+/// nobody, so a clean op costs one `kill` and one `pgrep`. It tries 20 times
+/// 50ms rather than hold the batch, and then fails unless `Q` shows that all it
+/// still found are zombies, which run nothing: a zombie answers a kill until
+/// its parent reaps it. It fails outright if the last `pgrep` errored, since
+/// what it did not list is unknown. The supervisor marks `cl.<k>` only when `Z`
+/// succeeds, and an op without the mark is not a success: the cap's failure was
+/// dropped, and with `pgrep` erroring after a partial kill an op replied rc 0
+/// while a process of its session lived on (on Linux).
 ///
-/// `Q <leader> <k>` succeeds only if `ps` lists no live (non-`Z`) process
-/// of the op's group, of `kids.<k>`, or, with `$X`, of the session as a
-/// fresh `pgrep -s` lists it after that `ps`; a `ps` or `pgrep` that fails
-/// is not that proof, and a session member `ps` did not list was born after
-/// it, so is live. Fresh, because the proof must come after the last kill:
-/// the last sweep's `pgrep` snapshot, once kept for it, predates it, and a listed process that
-/// forked into a new group of the session between that snapshot and the
-/// KILL was in neither that snapshot nor the op's group, so the op replied rc 0
-/// while it ran on (review, 2026-11-23, Linux host, a `pgrep` shim forking a
+/// `Q <leader> <k>` succeeds only if `ps` lists no live (non-`Z`) process of
+/// the op's group, of `kids.<k>`, or, with `$X`, of the session as a fresh
+/// `pgrep -s` lists it after that `ps`; a `ps` or `pgrep` that fails is not
+/// that proof, and a session member `ps` did not list was born after it, so is
+/// live. Fresh, because the proof must come after the last kill: the last
+/// sweep's `pgrep` snapshot, once kept for it, predates it, and a listed
+/// process that forked into a new group of the session between that snapshot
+/// and the KILL was in neither that snapshot nor the op's group, so the op
+/// replied rc 0 while it ran on (on Linux, a `pgrep` shim forking a
 /// same-session child after each of 20 snapshots).
 ///
 /// The leader's pid is reaped (by `wait`) before `Z` signals its group or
@@ -189,9 +185,8 @@ L() { p=; read -r p < "$d/pid.$1" 2>/dev/null; case $p in ''|*[!0-9]*) return 1;
 /// the mark: each side writes its file before it reads the other's.
 ///
 /// This replaced a `timeout(1)` per op, which watches only its own child: a
-/// TERM killed the runner, `timeout` saw it exit and never sent the KILL,
-/// and a body ignoring TERM wrote a file after the reply said rc 124
-/// (review, 2026-11-20, local CLI repro).
+/// TERM killed the runner, `timeout` saw it exit and never sent the KILL, and a
+/// body ignoring TERM wrote a file after the reply said rc 124.
 fn deadline() -> String {
     format!(
         "d=$1; X=$2; T=$3; n=$4\n{KILL_FNS}\
@@ -231,13 +226,12 @@ fn watcher() -> String {
 /// supervisor could not prove the op's processes gone (no `cl.<k>`, see
 /// [`KILL_FNS`]), with the rc the state before it had.
 ///
-/// Every byte copy is checked: a failed one exits before `@@ end`, which
-/// fails the batch rather than shift a frame. So is every bound, before its
-/// op's frame: a size row or a cap that is missing or not a number exits
-/// too. Unchecked, an empty `caps` left the bounds empty, the comparisons
-/// errored and fell through uncut, and a read the host had stopped at its
-/// cap + 1 replied rc 0, whole, a byte past the cap (review, 2026-11-23,
-/// Linux host).
+/// Every byte copy is checked: a failed one exits before `@@ end`, which fails
+/// the batch rather than shift a frame. So is every bound, before its op's
+/// frame: a size row or a cap that is missing or not a number exits too.
+/// Unchecked, an empty `caps` left the bounds empty, the comparisons errored
+/// and fell through uncut, and a read the host had stopped at its cap + 1
+/// replied rc 0, whole, a byte past the cap (on Linux).
 ///
 /// One `wc` for every size and `read` for the rcs: a fork per value made 20
 /// ops of 200KB take 7.3s to deliver on a loaded macOS (spawns of 20-40ms).
@@ -302,13 +296,13 @@ pub const BOUND_FN: &str = "TO() { tl=$1; shift; [ -z \"$S\" ] && set -m\n\
 /// The command ssh sends for one batch: [`batch_body`] run by `/bin/sh`,
 /// whatever the account's login shell is.
 ///
-/// ssh hands its command to the login shell, and zsh aborted the body at
-/// `set -m` (no job control without a tty) where `/bin/sh` on the same
-/// macOS host has it: every op failed with an empty `batch_failed` (review,
-/// 2026-11-20). The body travels base64'd inside one single-quoted word
-/// holding no backslash, quote or newline, so sh, bash, zsh, fish and csh
-/// all pass it to `/bin/sh` untouched. A failed decode runs nothing:
-/// `eval` of a half-decoded body would run ops without their bounds.
+/// ssh hands its command to the login shell, and zsh aborted the body at `set
+/// -m` (no job control without a tty) where `/bin/sh` on the same macOS host
+/// has it: every op failed with an empty `batch_failed`. The body travels
+/// base64'd inside one single-quoted word holding no backslash, quote or
+/// newline, so sh, bash, zsh, fish and csh all pass it to `/bin/sh` untouched.
+/// A failed decode runs nothing: `eval` of a half-decoded body would run ops
+/// without their bounds.
 pub fn batch_script(ops: &[Op]) -> String {
     format!(
         "exec /bin/sh -c 'command -v base64 >/dev/null 2>&1 || \
@@ -379,13 +373,12 @@ pub fn batch_body(ops: &[Op]) -> String {
             B64.encode(op.path())
         ));
     }
-    // Every spool file the setup writes is checked: each copy's status and
-    // then its size, by [`COUNT_FN`]. Unchecked, a slice cut short by a
-    // failing `tail` (a full disk) reached its write, which replaced the
-    // old file with it (review, 2026-11-20); a copy that wrote every byte
-    // and then failed was taken as whole, and an arithmetic count read a
-    // failed `wc` as 0 (review, 2026-11-22). Any of them failing fails the
-    // batch before an op runs.
+    // Every spool file the setup writes is checked: each copy's status and then
+    // its size, by [`COUNT_FN`]. Unchecked, a slice cut short by a failing
+    // `tail` (a full disk) reached its write, which replaced the old file with
+    // it; a copy that wrote every byte and then failed was taken as whole, and
+    // an arithmetic count read a failed `wc` as 0. Any of them failing fails
+    // the batch before an op runs.
     s.push_str(
         "d=$(mktemp -d \"${TMPDIR:-/tmp}/mule-serve.XXXXXX\") || \
          { echo 'mule-serve: mktemp failed' >&2; exit 98; }\n\
@@ -440,11 +433,10 @@ pub fn batch_body(ops: &[Op]) -> String {
     s.push_str(&format!("W={}\n", shell_quote(&watcher())));
     s.push_str(KILL_FNS);
     for (k, op) in ops.iter().enumerate() {
-        // A supervisor per op, a subshell in the batch's group: it forks
-        // the op, reports its leader, and once the leader is gone KILLs
-        // what is left (`Z`), so this op's end does not wait for another's
-        // (review, 2026-11-20: one op's background child ran while a
-        // slower sibling did).
+        // A supervisor per op, a subshell in the batch's group: it forks the
+        // op, reports its leader, and once the leader is gone KILLs what is
+        // left (`Z`), so this op's end does not wait for another's (one op's
+        // background child ran while a slower sibling did).
         //
         // `exec`, so `$!` is the leader: a shell may run an async command
         // in a subshell that forks it, and `setsid` must run in the forked

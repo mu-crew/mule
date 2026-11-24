@@ -21,10 +21,10 @@ const STDERR_TAIL = 4096;
  * per batch, against about four for an `exec`. serve itself coalesces what
  * arrives while a batch is in flight, so requests go out as they come.
  *
- * Commands stay detached jobs (human decision, 2026-11-20): exec, poll,
- * output and kill are the exec backend's, and so is what serve cannot do
- * whole -- a read past its 1 MB cap or its 1 s op deadline, a write that
- * needs its parent created or a symlink followed. serve keeps a replaced
+ * Commands stay detached jobs: exec, poll, output and kill are the exec
+ * backend's, and so is what serve cannot do whole -- a read past its 1 MB cap
+ * or its 1 s op deadline, a write that needs its parent created or a symlink
+ * followed. serve keeps a replaced
  * file's mode itself, before its rename publishes the new bytes.
  */
 export class MuleServeBackend implements WorkspaceOps {
@@ -141,8 +141,7 @@ export class MuleServeBackend implements WorkspaceOps {
 		const reply = await this.#op({ op: "write", path, data_b64: data.toString("base64") }, signal);
 		// serve sets the old mode on its temp file before the rename. A chmod
 		// here, after it, left a 0600 file's new bytes at 0644 until it ran,
-		// and for good when it failed or the call was aborted (review,
-		// 2026-11-23).
+		// and for good when it failed or the call was aborted.
 		if (reply.kind || reply.rc !== 0) throw new Error(`Cannot write remote file: ${path}${detail(reply)}`);
 	}
 

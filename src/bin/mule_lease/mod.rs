@@ -211,14 +211,20 @@ fn launcher(
             .join(" ")
     );
     ensure!(
-        command.len() <= 65_536,
+        command.len() <= MU_FIELD_MAX,
         "lease launcher exceeds mu's command limit"
     );
     let config = host.lease_snapshot()?;
     // Avoid emitting a frame mu would reject if the config was extraordinarily large.
-    ensure!(config.len() <= 65_536, "lease host snapshot is too large");
+    ensure!(
+        config.len() <= MU_FIELD_MAX,
+        "lease host snapshot is too large"
+    );
     Ok(json!({"command": command, "env": {LEASE_CONFIG_ENV: config}}))
 }
+
+/// The largest command or env value mu accepts in a launcher frame.
+const MU_FIELD_MAX: usize = 65_536;
 
 #[derive(Clone, Copy)]
 enum Check {
@@ -241,6 +247,7 @@ fn run(
         Ok(Run::Expired) => return expired(&ctx.out, id),
         Ok(Run::Done(r)) if r.cancelled => return,
         Ok(Run::Done(r)) if r.code == Some(3) && !r.timed_out => {
+            // Every Check's args are `[verb, --host, name, ..]`.
             let host = &args[2];
             let remedy = r
                 .stderr

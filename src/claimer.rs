@@ -3,9 +3,8 @@
 //! A keyed lease claims its key (`run::claim`) before it names or starts the
 //! job. If it dies between the claim and the dispatch -- a signal before its
 //! dispatch, a master that went away -- the claim stays: a state dir with a
-//! `key` and no `cmd`. Every later `run --lease --key K` finds that claim,
-//! and holding it as `unknown` forever is a liveness trap (review of P7a,
-//! round 3): the job never starts.
+//! `key` and no `cmd`. Every later `run --lease --key K` finds that claim, and
+//! holding it as `unknown` forever is a liveness trap: the job never starts.
 //!
 //! So the claim records its claimer -- this host's name, the pid and that
 //! process's start time -- and a later lease may roll an unstarted claim
@@ -90,11 +89,11 @@ pub fn local_host() -> Option<String> {
 
 /// The start time of `pid`, from `ps -o lstart=`, or `None`.
 ///
-/// `lstart` is wall-clock time in the caller's zone, so the zone is pinned
-/// as the locale is: two mule processes with different `TZ`s read one live
-/// claimer's start as two times, and the second would take a live claim
-/// for an abandoned one (review of P7a, round 4: `Tue Nov 10 00:26:13 2026`
-/// under UTC is `Mon Nov  9 19:26:13 2026` in New York).
+/// `lstart` is wall-clock time in the caller's zone, so the zone is pinned as
+/// the locale is: two mule processes with different `TZ`s read one live
+/// claimer's start as two times, and the second would take a live claim for an
+/// abandoned one (`Tue Nov 10 00:26:13 2026` under UTC is `Mon Nov  9 19:26:13
+/// 2026` in New York).
 pub fn start_time(pid: u32) -> Option<String> {
     let out = PS
         .command()

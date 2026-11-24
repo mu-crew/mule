@@ -131,7 +131,7 @@ fn state_only_fetches_no_log_bytes() {
         &fake,
         &host(),
         &"abc123".parse().unwrap(),
-        mule::probe::From::StateOnly,
+        mule::probe::Fetch::StateOnly,
     )
     .unwrap();
 
@@ -185,7 +185,7 @@ fn a_screen_probe_carries_the_pane_capture_in_the_same_round_trip() {
         &fake,
         &host(),
         &"abc123".parse().unwrap(),
-        mule::probe::From::Screen,
+        mule::probe::Fetch::Screen,
     )
     .unwrap();
 
@@ -267,7 +267,7 @@ fn a_job_that_ends_between_the_reads_is_done_not_orphaned() {
         state,
     };
 
-    let result = probe(&transport, &host(), &id, mule::probe::From::StateOnly);
+    let result = probe(&transport, &host(), &id, mule::probe::Fetch::StateOnly);
     let _ = std::fs::remove_dir_all(&root);
 
     assert_eq!(result.unwrap().state, State::Done(7));

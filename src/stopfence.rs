@@ -5,8 +5,7 @@
 //! reattaches a new carrier to the same job in that time (`run --lease
 //! --attach`), the old child must not stop it. A cancel marker cannot say
 //! that: removed by attach, it re-arms a sleeping old child; left in place, it
-//! cancels the next carrier's stop of the same id (2026-11-04 lease-adopt
-//! spec, review item mule 2). A generation can.
+//! cancels the next carrier's stop of the same id. A generation can.
 //!
 //! - Each carrier **owns** one generation, fixed before it can own the job and
 //!   never re-read at signal time: a lease reads it before its dispatch, an
@@ -18,16 +17,15 @@
 //!   the generation only once it has proven the job running. The attached
 //!   carrier's own stop carries the bumped number, so the fence never disarms
 //!   a future stop.
-//!
-//! Why owned rather than read when signalled (review of mule_stop, two
-//! executed repros): a dying carrier's signal thread descheduled after its
-//! pane went could read the generation an attach had just bumped to, and its
-//! child then matched and killed the reattached job; and a read error there
-//! dropped `--fence-gen` altogether, arming an unfenced stop that no bump
-//! could cancel.
 //! - The file is unlinked only after an `rm` proved the job gone. Unlinking a
 //!   live flock file lets two holders in (the trap `forward.rs` notes), so it
 //!   is never done while the job may run.
+//!
+//! Why owned rather than read when signalled (two executed repros): a dying
+//! carrier's signal thread descheduled after its pane went could read the
+//! generation an attach had just bumped to, and its child then matched and
+//! killed the reattached job; and a read error there dropped `--fence-gen`
+//! altogether, arming an unfenced stop that no bump could cancel.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};

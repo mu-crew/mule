@@ -34,7 +34,7 @@ pub fn write_job_file(path: &Path, id: &JobId) -> Result<()> {
 /// documented `--job-file /tmp/w1.job` sits in a world-writable directory, and
 /// the old predictable `F.tmp<pid>` opened with create+truncate let a planted
 /// symlink overwrite its target with the id and then become F itself, and let
-/// a planted 0644 file lend its mode to F (both reproduced, review round 1).
+/// a planted 0644 file lend its mode to F (both reproduced).
 /// An existing path is never opened, truncated or followed: a name that is
 /// taken is skipped for another.
 pub fn write_line_file(path: &Path, line: &str) -> Result<()> {
@@ -94,7 +94,7 @@ const PUBLISH_ATTEMPTS: u32 = 4;
 /// Publish `id` as the job file for an attach, never replacing anything.
 ///
 /// The file is mu's handle to the job, and a reattach must not quietly retarget
-/// it (spec 2026-11-04-lease-adopt § mule_attach step 4, review item mule 4):
+/// it (SPEC § Leases):
 ///
 /// - missing: write a temp, then `link(temp, path)`, which fails with EEXIST
 ///   rather than replace a file that appeared since the read. On EEXIST the

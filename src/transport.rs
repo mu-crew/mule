@@ -143,10 +143,9 @@ pub trait Transport {
     ///
     /// **This is the only way callers should reach a host.** The lock covers
     /// every ssh mule issues except the [`MuxOp`]s, because two concurrent
-    /// reads hit exactly the cap that motivated the tool -- but until now that
-    /// was prose, enforced by six call sites each remembering to wrap
-    /// `run_unlocked` in `with_lock`. A seventh that forgot would compile,
-    /// pass every test, and quietly reintroduce the contention.
+    /// reads hit exactly the cap that motivated the tool. A call site that
+    /// forgot the lock would compile, pass every test, and quietly reintroduce
+    /// the contention.
     ///
     /// Provided rather than required, so no implementation can weaken it: the
     /// lock is applied here, once, and an implementor supplies only the
@@ -441,14 +440,14 @@ impl Transport for Ssh {
 /// Runs `$2...` (ssh) and KILLs it `$1` seconds after the start, whatever
 /// becomes of the process that spawned it.
 ///
-/// `spawn_fed`'s own kill is a loop in the caller's thread: it died with
-/// `mule serve`, and a session whose caller hung up (stdin EOF, then serve's
-/// exit) or was SIGKILLed lived on past 16s with the only session slot taken
-/// (review, 2026-11-20, local CLI repro). This shell is the session's parent
-/// and in its own process group, so neither serve's death nor a hangup sent
-/// to the caller's group reaches it, and it ignores SIGHUP besides (as ssh
-/// then does). Its timer's stdio is `/dev/null`, so it holds none of the
-/// session's pipes; it is TERMed, and kills its `sleep`, once ssh ends.
+/// `spawn_fed`'s own kill is a loop in the caller's thread: it died with `mule
+/// serve`, and a session whose caller hung up (stdin EOF, then serve's exit) or
+/// was SIGKILLed lived on past 16s with the only session slot taken. This shell
+/// is the session's parent and in its own process group, so neither serve's
+/// death nor a hangup sent to the caller's group reaches it, and it ignores
+/// SIGHUP besides (as ssh then does). Its timer's stdio is `/dev/null`, so it
+/// holds none of the session's pipes; it is TERMed, and kills its `sleep`, once
+/// ssh ends.
 pub const WATCHDOG: &str = "trap '' HUP; n=$1; shift; exec 3<&0\n\
 \"$@\" <&3 3<&- & c=$!\n\
 exec 3<&- < /dev/null\n\
@@ -553,10 +552,6 @@ impl ControlStream {
     pub fn abandon(&mut self) {
         self.abandoned = true;
         self.stdin = None;
-    }
-
-    pub fn is_abandoned(&self) -> bool {
-        self.abandoned
     }
 
     fn open(&mut self) -> Option<u64> {

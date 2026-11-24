@@ -125,9 +125,8 @@ function operands(args: string[], valued: RegExp) {
 }
 
 // sed and awk are languages, and both can write files from inside a script
-// (`sed -n 'w out'`, `awk '{print > "out"}'`): an option check alone let
-// those through (review, 2026-11-23). Allow a conservative subset, refuse
-// the rest.
+// (`sed -n 'w out'`, `awk '{print > "out"}'`): an option check alone let those
+// through. Allow a conservative subset, refuse the rest.
 const SED_OPTIONS = /^-[nErsuz]+$|^--(?:quiet|silent|regexp-extended|separate|unbuffered|null-data|posix|debug|sandbox)$/;
 
 function refuseSed(args: string[]): string | undefined {

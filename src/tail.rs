@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 
 use crate::config::Host;
 use crate::errors::MuleError;
-use crate::probe::{From as ProbeFrom, State, next_interval, probe};
+use crate::probe::{Fetch, State, next_interval, probe};
 use crate::transport::Transport;
 use crate::wrapper::{JobId, state_dir};
 
@@ -64,9 +64,14 @@ pub fn once_mode_aware(
     Ok(())
 }
 
+/// How much a one-shot `tail` reads: the help's "last 64KB". Payload size is
+/// lock hold time, so this is deliberately conservative until measurements
+/// from real suite logs justify a different cap.
+const LAST_BYTES: u64 = 64 * 1024;
+
 fn selection_command(selection: Selection, dir: &str) -> String {
     match selection {
-        Selection::LastBytes => format!("tail -c 65536 {dir}/log"),
+        Selection::LastBytes => format!("tail -c {LAST_BYTES} {dir}/log"),
         Selection::All => format!("cat {dir}/log"),
         Selection::Lines(lines) => format!("tail -n {lines} {dir}/log"),
     }
@@ -96,13 +101,7 @@ pub fn once(
 ) -> Result<()> {
     crate::errors::require_master(transport, host)?;
     let dir = state_dir(id);
-    let read = match selection {
-        // Payload size is lock hold time. 64KB is deliberately conservative
-        // until measurements from real suite logs justify a different cap.
-        Selection::LastBytes => format!("tail -c 65536 {dir}/log"),
-        Selection::All => format!("cat {dir}/log"),
-        Selection::Lines(lines) => format!("tail -n {lines} {dir}/log"),
-    };
+    let read = selection_command(selection, &dir);
     // Ask about truncation in the SAME round trip -- a second call would take
     // the lock twice to answer a question that is one byte on disk.
     let script = format!(
@@ -126,14 +125,7 @@ pub fn follow(
     from: u64,
     out: &mut dyn Write,
 ) -> Result<i32> {
-    wait_loop(
-        transport,
-        host,
-        id,
-        ProbeFrom::Offset(from),
-        Some(out),
-        None,
-    )
+    wait_loop(transport, host, id, Fetch::Offset(from), Some(out), None)
 }
 
 pub fn follow_deferred(
@@ -159,7 +151,7 @@ pub fn wait_only(
         transport,
         host,
         id,
-        ProbeFrom::StateOnly,
+        Fetch::StateOnly,
         None,
         timeout.map(Duration::from_secs),
     )
@@ -169,7 +161,7 @@ fn wait_loop(
     transport: &dyn Transport,
     host: &Host,
     id: &JobId,
-    mut from: ProbeFrom,
+    mut from: Fetch,
     mut out: Option<&mut dyn Write>,
     timeout: Option<Duration>,
 ) -> Result<i32> {
@@ -185,8 +177,8 @@ fn wait_loop(
         // Advance by bytes received, not the reported remote size: a truncated
         // response must not create a permanent hole in streamed output. A
         // state-only wait has no offset to advance.
-        if let ProbeFrom::Offset(offset) = from {
-            from = ProbeFrom::Offset(offset.saturating_add(result.bytes.len() as u64));
+        if let Fetch::Offset(offset) = from {
+            from = Fetch::Offset(offset.saturating_add(result.bytes.len() as u64));
         }
 
         match result.state {
@@ -202,9 +194,9 @@ fn wait_loop(
             // when someone is actually reading the output.
             State::Done(code) => {
                 if let Some(writer) = out.as_deref_mut()
-                    && let ProbeFrom::Offset(offset) = from
+                    && let Fetch::Offset(offset) = from
                 {
-                    let tail = probe(transport, host, id, ProbeFrom::Offset(offset))?;
+                    let tail = probe(transport, host, id, Fetch::Offset(offset))?;
                     writer.write_all(&tail.bytes)?;
                 }
                 return Ok(code);

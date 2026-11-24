@@ -260,10 +260,6 @@ impl Config {
                 // nests the lock somewhere `create_dir_all` may not reach --
                 // which lets two hosts share one lock and silently breaks the
                 // per-host serialisation the fairness gate depends on.
-                //
-                // Same grammar as `tmux_socket` below, for the same reason: a
-                // host name is a filename component, so this loses nothing
-                // real.
                 if !is_filename_component(&name) {
                     bail!(
                         "invalid host name {name:?}; use letters, digits, dot, \
@@ -273,10 +269,8 @@ impl Config {
                 let tmux_socket = h
                     .tmux_socket
                     .unwrap_or_else(|| DEFAULT_TMUX_SOCKET.to_string());
-                // Interpolated unquoted into every remote script, so a socket
-                // name containing shell syntax would be command injection from
-                // a config file. tmux socket names are a filename component,
-                // so this grammar loses nothing real.
+                // Interpolated unquoted into every remote script: shell syntax
+                // here would be command injection from a config file.
                 if !is_filename_component(&tmux_socket) {
                     bail!(
                         "host {name:?}: invalid tmux_socket {tmux_socket:?}; \

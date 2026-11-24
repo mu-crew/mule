@@ -56,12 +56,11 @@ pub(crate) fn dispatch_script(host: &Host, job: &Job, key: Option<&JobKey>) -> S
         ),
         None => (String::new(), String::new()),
     };
-    // The count is advisory (a warning, never a state answer), so a count
-    // that cannot be taken is `?` and no warning, not a failed dispatch: the
-    // job has started by then. Captured and checked before it is printed:
-    // an `awk` that printed `1` and then failed used to reach stdout as `1?`,
-    // which failed the dispatch of a job already running (review of P7a,
-    // round 3).
+    // The count is advisory (a warning, never a state answer), so a count that
+    // cannot be taken is `?` and no warning, not a failed dispatch: the job has
+    // started by then. Captured and checked before it is printed: an `awk` that
+    // printed `1` and then failed used to reach stdout as `1?`, which failed
+    // the dispatch of a job already running.
     format!(
         "{}; {claim}{} && {{ n=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null) \
            && c=$(printf '%s\\n' \"$n\" | awk '/^mule-/ {{ c++ }} END {{ print c + 0 }}') \
@@ -148,14 +147,14 @@ pub enum Claim {
 /// that looks the key up and, only if it is free, makes `id`'s state dir and
 /// writes its `key`. Nothing is started.
 ///
-/// For `run --lease --key`, whose job file must never name a job that does
-/// not hold its key. Two keyed leases that both looked first and wrote their
-/// job files after (review of P7a) both found the key free; the second's
-/// dispatch then found the first's job, and its job file already named an id
-/// that would never run. Claimed first, under the ticket lock, the loser
-/// sees the winner here and names only it. A claim whose dispatch never
-/// comes (the lease died in between) is a state dir with a key and no
-/// `cmd`: findable by the key, and `unknown`, never `missing`, to `poll`.
+/// For `run --lease --key`, whose job file must never name a job that does not
+/// hold its key. Two keyed leases that both looked first and wrote their job
+/// files after both found the key free; the second's dispatch then found the
+/// first's job, and its job file already named an id that would never run.
+/// Claimed first, under the ticket lock, the loser sees the winner here and
+/// names only it. A claim whose dispatch never comes (the lease died in
+/// between) is a state dir with a key and no `cmd`: findable by the key, and
+/// `unknown`, never `missing`, to `poll`.
 pub fn claim(transport: &dyn Transport, host: &Host, id: &JobId, key: &JobKey) -> Result<Claim> {
     crate::errors::require_master(transport, host)?;
     let dir = crate::wrapper::state_dir(id);
@@ -332,13 +331,13 @@ pub fn lookup(transport: &dyn Transport, host: &Host, key: &JobKey) -> Result<Op
 /// prints them.
 ///
 /// One `find` and one `awk` over every job's `key` file, however many jobs
-/// there are: a per-job loop forking `cat` is the shape that took `ls` to
-/// 14.1s at 300 jobs (SPEC § Listing). awk compares each file's first line
-/// with the key exactly and as a string: `l == k` alone compares two
-/// numeric-looking values as numbers, so `01` and `1` (or `1e0` and `1`)
-/// were one key and the second caller's command never ran (review of P7a).
-/// Concatenating `""` forces string comparison in every POSIX awk. The key's
-/// alphabet ([`JobKey`]) leaves nothing to quote or escape.
+/// there are: a per-job loop forking `cat` is the shape that took `ls` to 14.1s
+/// at 300 jobs (SPEC § Listing). awk compares each file's first line with the
+/// key exactly and as a string: `l == k` alone compares two numeric-looking
+/// values as numbers, so `01` and `1` (or `1e0` and `1`) were one key and the
+/// second caller's command never ran. Concatenating `""` forces string
+/// comparison in every POSIX awk. The key's alphabet ([`JobKey`]) leaves
+/// nothing to quote or escape.
 ///
 /// No glob: the remote shell is the user's login shell, and zsh aborts a
 /// command whose glob matches nothing (`no matches found`), which is every

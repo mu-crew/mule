@@ -156,8 +156,10 @@ impl Record {
 
 /// FNV-1a, 64 bit. Hand-rolled because the record name must be stable across
 /// toolchains: `DefaultHasher` makes no such promise, and an unstable name
-/// would orphan every record on a compiler upgrade.
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// would orphan every record on a compiler upgrade. The plugin's instance id
+/// uses it for the same reason.
+#[doc(hidden)]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
     })

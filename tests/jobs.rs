@@ -3,9 +3,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mule::config::{Config, Host};
-use mule::jobs::{
-    Target, decode_command, kill, list, list_with_hidden, prune, remove, remove_one_script,
-};
+use mule::jobs::{Target, decode_command, kill, list, prune, remove, remove_one_script};
 use mule::probe::State;
 use mule::transport::{Fake, Output, Transport};
 
@@ -95,7 +93,7 @@ fn list_parses_remote_jobs_and_keeps_recent_finished_ones() {
     ));
     let cfg = Config::parse("[hosts.dev]\nsocket = \"/tmp/mule.sock\"\n").unwrap();
 
-    let (rows, unreachable) = list(&cfg, &fake, None, false).unwrap();
+    let (rows, unreachable, _) = list(&cfg, &fake, None, false).unwrap();
 
     assert!(unreachable.is_empty());
     // All three are recent, so the default view shows the finished one too.
@@ -236,7 +234,7 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     let fake = Fake::new();
     fake.push(Output::ok(reply.clone()));
-    let (rows, _, hidden) = list_with_hidden(&cfg, &fake, None, false).unwrap();
+    let (rows, _, hidden) = list(&cfg, &fake, None, false).unwrap();
     let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -247,7 +245,7 @@ fn old_finished_jobs_need_all_but_running_and_orphan_never_do() {
 
     let all = Fake::new();
     all.push(Output::ok(reply));
-    let (rows, _) = list(&cfg, &all, None, true).unwrap();
+    let (rows, _, _) = list(&cfg, &all, None, true).unwrap();
     assert_eq!(rows.len(), 3, "--all shows the old finished job");
 }
 
@@ -288,7 +286,7 @@ fn list_reports_unreachable_hosts_and_visits_live_hosts_sequentially() {
     .unwrap();
     let fake = HostsFake::default();
 
-    let (rows, unreachable) = list(&cfg, &fake, None, false).unwrap();
+    let (rows, unreachable, _) = list(&cfg, &fake, None, false).unwrap();
 
     assert_eq!(rows.len(), 2);
     assert_eq!(unreachable.len(), 1);

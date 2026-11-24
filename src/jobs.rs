@@ -51,16 +51,6 @@ pub fn list(
     transport: &dyn Transport,
     host_filter: Option<&str>,
     all: bool,
-) -> Result<(Vec<Row>, Vec<Unreachable>)> {
-    let (rows, unreachable, _) = list_with_hidden(cfg, transport, host_filter, all)?;
-    Ok((rows, unreachable))
-}
-
-pub fn list_with_hidden(
-    cfg: &Config,
-    transport: &dyn Transport,
-    host_filter: Option<&str>,
-    all: bool,
 ) -> Result<(Vec<Row>, Vec<Unreachable>, usize)> {
     let hosts: Vec<&Host> = match host_filter {
         Some(name) => vec![cfg.host(Some(name))?],
@@ -495,19 +485,18 @@ pub fn prune(host: &Host) -> String {
     // alone. Skip live `mule-{id}` sessions: keep_days can be 1, which makes
     // the orphan horizon four days, and a multi-day job is legitimate work.
     //
-    // Deleting is the one act here that cannot be undone, so every delete
-    // needs a proof and anything less stops the whole prune, deleting
-    // nothing more ([`crate::remote`]): a dir goes only with its `key` seen
-    // not to exist (a keyed job is never pruned: its key must keep returning
-    // it), and either an `rc` read as a regular file (done) or, for an
-    // orphan, `rc` seen absent, `cmd` present and neither session in a list
-    // tmux gave. A `find -exec test` that failed used to read as "no key"
-    // and delete a keyed job (review of P7a, round 2). Runs in a subshell, so
-    // a stop ends the prune and never the dispatch it rides in. Silenced on
-    // stdout as well: the dispatch's reply is its key hits and its count,
-    // and an `rm` that printed `1` before failing turned that count into
-    // `1\n0`, failing the dispatch of a job that had started (fault
-    // injection, review of P7a round 3).
+    // Deleting is the one act here that cannot be undone, so every delete needs
+    // a proof and anything less stops the whole prune, deleting nothing more
+    // ([`crate::remote`]): a dir goes only with its `key` seen not to exist (a
+    // keyed job is never pruned: its key must keep returning it), and either an
+    // `rc` read as a regular file (done) or, for an orphan, `rc` seen absent,
+    // `cmd` present and neither session in a list tmux gave. A `find -exec
+    // test` that failed used to read as "no key" and delete a keyed job. Runs
+    // in a subshell, so a stop ends the prune and never the dispatch it rides
+    // in. Silenced on stdout as well: the dispatch's reply is its key hits and
+    // its count, and an `rm` that printed `1` before failing turned that count
+    // into `1\n0`, failing the dispatch of a job that had started (fault
+    // injection).
     format!(
         "( {prelude}mule_socket={socket}; root={JOBS_ROOT}; \
            if mule_absent \"$root\" \"jobs root\"; then exit 0; fi; \
@@ -647,7 +636,7 @@ impl StopOutcome {
 /// the fence says the job was reattached, or `policy.retry_for` runs out --
 /// then record the failure rather than leave it silent.
 ///
-/// The 2026-11-04 aiv-blog incident is why: a tmux restart hung up six lease
+/// An incident is why: a tmux restart hung up six lease
 /// panes, and on the host whose master was down each detached `rm` failed once
 /// in `require_master`, into `/dev/null`, and the jobs ran on unseen.
 ///
@@ -715,9 +704,9 @@ pub fn remove_with_retry(
         clock.sleep(wait.min(deadline - now));
         // Again after the sleep, immediately before the next attempt: the
         // clamped last sleep lands on the deadline, and a sleep stretched by
-        // scheduling or SIGSTOP can wake far past it (review of mule_stop:
-        // asked for 1s, woke at 900s, and a new `rm` ran). The soft bound
-        // covers only an attempt already in flight, never a new one.
+        // scheduling or SIGSTOP can wake far past it (asked for 1s, woke at
+        // 900s, and a new `rm` ran). The soft bound covers only an attempt
+        // already in flight, never a new one.
         if clock.now() >= deadline {
             break;
         }

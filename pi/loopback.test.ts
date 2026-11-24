@@ -247,7 +247,7 @@ test("serve carries file ops in one child, a burst in shared round trips", { ski
 
 		// A private file's new bytes are never visible wider than it was,
 		// even when nothing after serve's write can run: a chmod after the
-		// rename left them at 0644 when it failed (review, 2026-11-23).
+		// rename left them at 0644 when it failed.
 		writeFileSync(join(root, "secret"), "old\n");
 		chmodSync(join(root, "secret"), 0o600);
 		const command = ops.jobs.command;
