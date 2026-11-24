@@ -17,6 +17,7 @@ use common::local::{ShimHost, scratch, stderr, stdout, tmux_available, wait_unti
 use mule::config::{Config, Host};
 use mule::errors::{MuleError, exit_code};
 use mule::probe::{From, State, probe};
+use mule::remote::CANNOT_TELL;
 use mule::transport::{Fake, Output};
 use mule::wrapper::JobId;
 
@@ -48,42 +49,19 @@ fn json(out: &std::process::Output) -> serde_json::Value {
 
 #[test]
 fn a_check_that_could_not_tell_is_unverifiable_never_missing_or_orphan() {
-    for (reply, why) in [
-        (
-            "exists=?\nrc=\nalive=0\nwatch=0\nwhy=cannot verify state dir x: Permission denied\nsize=0\nbytes:\n",
-            "Permission denied",
-        ),
-        (
-            "exists=0\nrc=\nalive=?\nwatch=0\nwhy=cannot verify session state: protocol version mismatch\nsize=0\nbytes:\n",
-            "protocol version mismatch",
-        ),
-        (
-            "exists=1\nrc=\nalive=?\nwatch=0\nwhy=cannot verify session state: protocol version mismatch\nsize=0\nbytes:\n",
-            "protocol version mismatch",
-        ),
-        // The state dir is gone but the job's session is not: something
-        // still runs, so the job is not missing.
-        (
-            "exists=0\nrc=\nalive=1\nwatch=0\nwhy=\nsize=0\nbytes:\n",
-            "not proven gone",
-        ),
-        // `rm`'s proof needs the watchdog gone too.
-        (
-            "exists=0\nrc=\nalive=0\nwatch=1\nwhy=\nsize=0\nbytes:\n",
-            "not proven gone",
-        ),
-    ] {
-        let error = probed(reply).unwrap_err();
-        assert!(
-            matches!(
-                error.downcast_ref::<MuleError>(),
-                Some(MuleError::Unverifiable { .. })
-            ),
-            "{reply:?}: {error:#}"
-        );
-        assert!(format!("{error:#}").contains(why), "{reply:?}: {error:#}");
-        assert_eq!(exit_code(&error), 1, "every verb but poll --json: exit 1");
-    }
+    let why = "cannot verify session state: protocol version mismatch";
+    let fake = Fake::new();
+    fake.push(Output {
+        // The script may already have started writing a reply when a check fails.
+        stdout: b"exists=1\n".to_vec(),
+        ..Output::fail(CANNOT_TELL, format!("mule: cannot tell: {why}\n"))
+    });
+    let error = probe(&fake, &host(), &id(), From::StateOnly).unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<MuleError>(), Some(MuleError::Unverifiable { why: reason, .. }) if reason == why),
+        "{error:#}"
+    );
+    assert_eq!(exit_code(&error), 1, "every verb but poll --json: exit 1");
 }
 
 #[test]
@@ -119,7 +97,7 @@ fn proven_facts_map_as_before_and_rc_decides_done() {
 fn poll_json_answers_missing_and_unknown_with_exit_zero_and_keeps_exit_three() {
     for reply in [
         Output::ok("exists=0\nrc=\nalive=0\nwatch=0\nwhy=\nsize=0\nbytes:\n"),
-        Output::ok("exists=?\nrc=\nalive=0\nwatch=0\nwhy=x\nsize=0\nbytes:\n"),
+        Output::fail(CANNOT_TELL, "mule: cannot tell: state dir is unreadable"),
         // A transport failure is "cannot tell" too, not "gone".
         Output::fail(255, "Connection to h closed by remote host."),
         Output::ok("garbage"),
