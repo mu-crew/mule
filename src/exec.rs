@@ -32,7 +32,7 @@ use crate::config::Host;
 use crate::errors::{EXIT_NO_MASTER, EXIT_TRUNCATED, MuleError, strict_code, strict_note};
 use crate::probe::{From as ProbeFrom, State, probe};
 use crate::transport::{InFlight, Ssh, Transport};
-use crate::wrapper::{JobId, JobMetadata, JobMode, new_id, state_dir};
+use crate::wrapper::{Job, JobId, JobMetadata, JobMode, new_id, state_dir};
 
 const FIRST_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INTERVAL: Duration = Duration::from_secs(1);
@@ -91,36 +91,14 @@ pub fn next_interval(current: Duration) -> Duration {
 /// derived from those two sources. SPEC § The dispatch size cap.
 pub const MAX_DISPATCH_BYTES: usize = 112 * 1024;
 
-/// A transport that sends nothing: it records the script a dispatch would have
-/// sent, so the size is measured on the exact string handed to ssh rather than
-/// re-derived from the pieces that build it.
-struct Measure(std::cell::RefCell<Option<usize>>);
-
-impl Transport for Measure {
-    fn run_unlocked(&self, _: &Host, script: &str) -> Result<crate::transport::Output> {
-        *self.0.borrow_mut() = Some(script.len());
-        bail!("measured, not sent")
-    }
-    fn mux_op(&self, _: &Host, _: crate::transport::MuxOp) -> Result<crate::transport::Output> {
-        bail!("measuring makes no mux call")
-    }
-    fn master_alive(&self, _: &Host) -> bool {
-        true
-    }
-    // In memory only: no ssh and no session channel, so there is nothing for
-    // the ticket lock to order, and waiting on it would make a size check
-    // block behind other callers.
-    fn run(&self, host: &Host, script: &str) -> Result<crate::transport::Output> {
-        self.run_unlocked(host, script)
-    }
-}
-
 /// Refuse a dispatch too big for one ssh argument, before any transport call
 /// (not even a `-O check` or a cleanup `rm`: nothing was dispatched).
 pub fn preflight(host: &Host, id: &JobId, request: &Request) -> Result<()> {
-    let measure = Measure(Default::default());
-    let _ = dispatch(&measure, host, id.clone(), request);
-    let size = measure.0.borrow().context("could not size the dispatch")?;
+    check_size(host, &exec_job(host, id.clone(), request))
+}
+
+fn check_size(host: &Host, job: &Job) -> Result<()> {
+    let size = crate::run::dispatch_script(host, job, None).len();
     if size > MAX_DISPATCH_BYTES {
         bail!(
             "command too large for one dispatch ({size} bytes of remote script, limit \
@@ -130,27 +108,23 @@ pub fn preflight(host: &Host, id: &JobId, request: &Request) -> Result<()> {
     Ok(())
 }
 
-/// The one dispatch call, so [`preflight`] measures what [`start`] sends.
-fn dispatch(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<JobId> {
-    crate::run::dispatch_with_id(
-        transport,
-        host,
+fn exec_job(host: &Host, id: JobId, request: &Request) -> Job {
+    Job {
         id,
-        request.cmd,
-        request.cwd,
-        request.max_secs,
-        // Not an agent: `MU_MANAGED_AGENT` would make murmur list a one-shot
-        // `git rev-parse` as crew.
-        JobMetadata::Human,
-        JobMode::Exec,
-        &mut std::io::sink(),
-    )
+        cmd: request.cmd.to_owned(),
+        cwd: request.cwd.map(str::to_owned),
+        max_secs: request.max_secs.unwrap_or(host.max_job_secs),
+        // A one-shot command is not an agent for murmur to list as crew.
+        metadata: JobMetadata::Human,
+        mode: JobMode::Exec,
+    }
 }
 
 /// Start the job under `id`. Silent: warnings go nowhere.
 pub fn start(transport: &dyn Transport, host: &Host, id: JobId, request: &Request) -> Result<()> {
-    preflight(host, &id, request)?;
-    dispatch(transport, host, id, request).map(drop)
+    let job = exec_job(host, id, request);
+    check_size(host, &job)?;
+    crate::run::dispatch_job(transport, host, job, None, &mut std::io::sink()).map(drop)
 }
 
 /// Wait for the job, print its output, remove it, and return the exit code.

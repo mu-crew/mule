@@ -120,12 +120,6 @@ pub fn dispatch_keyed(
     mode: JobMode,
     warnings: &mut dyn Write,
 ) -> Result<Dispatched> {
-    // `ssh -O check` measured at 0s and opens no session channel, so it is the
-    // one transport call deliberately outside the lock.
-    if !transport.master_alive(host) {
-        return Err(crate::errors::no_master(host));
-    }
-
     let job = Job {
         id,
         cmd: cmd.to_owned(),
@@ -134,6 +128,12 @@ pub fn dispatch_keyed(
         metadata,
         mode,
     };
+    dispatch_job(transport, host, job, key, warnings)
+}
+
+/// Build the exact script handed to ssh, including prune and the advisory
+/// count, so `exec` can check its size without touching the transport.
+pub(crate) fn dispatch_script(host: &Host, job: &Job, key: Option<&JobKey>) -> String {
     // The key is written before `new-session`, so no job ever runs without
     // the key that names it: a lookup that finds no key has proved no job
     // holds it.
@@ -162,14 +162,25 @@ pub fn dispatch_keyed(
     // an `awk` that printed `1` and then failed used to reach stdout as `1?`,
     // which failed the dispatch of a job already running (review of P7a,
     // round 3).
-    let script = format!(
+    format!(
         "{}; {claim}{} && {{ n=$(tmux -L {} list-sessions -F '#{{session_name}}' 2>/dev/null) \
            && c=$(printf '%s\\n' \"$n\" | awk '/^mule-/ {{ c++ }} END {{ print c + 0 }}') \
            && case $c in ''|*[!0-9]*) false;; esac && echo \"$c\" || echo '?'; }}",
         crate::jobs::prune(host),
-        dispatch_script_with(host, &job, &write_key),
+        dispatch_script_with(host, job, &write_key),
         host.tmux_socket
-    );
+    )
+}
+
+pub(crate) fn dispatch_job(
+    transport: &dyn Transport,
+    host: &Host,
+    job: Job,
+    key: Option<&JobKey>,
+    warnings: &mut dyn Write,
+) -> Result<Dispatched> {
+    crate::errors::require_master(transport, host)?;
+    let script = dispatch_script(host, &job, key);
 
     // The retrospective count shares the measured 0s dispatch round trip. A
     // pre-flight warning would double both ssh round trips and lock cycles for
