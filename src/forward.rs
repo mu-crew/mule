@@ -184,10 +184,10 @@ pub fn read_record(host: &Host, local: &Path) -> Option<Record> {
     Record::parse(&text).filter(|record| record.local == local)
 }
 
-type ReadHook = Box<dyn Fn(&Host, &Path)>;
+type Hook = Box<dyn Fn(&Host, &Path)>;
 
 thread_local! {
-    static READ_HOOK: std::cell::RefCell<Option<ReadHook>> = const { std::cell::RefCell::new(None) };
+    static READ_HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Test seam: run `hook` on every [`read_record`] made by *this thread*, until
@@ -208,6 +208,28 @@ pub struct ReadHookGuard(());
 impl Drop for ReadHookGuard {
     fn drop(&mut self) {
         READ_HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+thread_local! {
+    static CONTENDED_HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: run `hook` each time [`lock_local`] on *this thread* finds the
+/// LOCAL's lock held by someone else, just before it blocks, until the guard
+/// drops. Event order instead of a stopwatch: a test holds the lock until this
+/// fires, so it never depends on how soon the second caller is scheduled.
+pub fn on_lock_contended(hook: impl Fn(&Host, &Path) + 'static) -> ContendedHookGuard {
+    CONTENDED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    ContendedHookGuard(())
+}
+
+/// Removes the [`on_lock_contended`] hook on drop.
+pub struct ContendedHookGuard(());
+
+impl Drop for ContendedHookGuard {
+    fn drop(&mut self) {
+        CONTENDED_HOOK.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
@@ -285,7 +307,11 @@ fn flock_local(host: &Host, local: &Path, wait: bool) -> Result<Option<LocalLock
         .truncate(false)
         .open(&path)
         .with_context(|| format!("cannot open forward lock {}", path.display()))?;
-    let operation = if wait { LOCK_EX } else { LOCK_EX | LOCK_NB };
+    // A blocking lock tries without waiting first, so that a held lock is a
+    // fact the kernel reported, which [`on_lock_contended`] hands to a test:
+    // "the second caller found it held" is what exclusion means, and no sleep
+    // can observe it.
+    let mut operation = LOCK_EX | LOCK_NB;
     // The lock is per open file description, so two threads of one process
     // exclude each other too, which the layer-1 tests rely on.
     loop {
@@ -297,6 +323,14 @@ fn flock_local(host: &Host, local: &Path, wait: bool) -> Result<Option<LocalLock
         match error.kind() {
             ErrorKind::Interrupted => {}
             ErrorKind::WouldBlock if !wait => return Ok(None),
+            ErrorKind::WouldBlock if operation != LOCK_EX => {
+                CONTENDED_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        hook(host, local);
+                    }
+                });
+                operation = LOCK_EX;
+            }
             _ => {
                 return Err(error)
                     .with_context(|| format!("cannot lock forward state {}", path.display()));
