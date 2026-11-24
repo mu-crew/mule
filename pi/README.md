@@ -166,4 +166,5 @@ Tests (Node 22.18+):
 - `cargo test --test local_sshd pi_ops_over_a_capped_master` drives the real
   exec and serve backends against a private Linux loopback sshd with
   `MaxSessions 1`, and, given a standalone Pi (`MULE_TEST_PI`), a burst of
-  parallel Pi tool calls through the extension.
+  parallel Pi tool calls through the extension. Linux CI requires all three
+  suites; locally `MULE_SKIP_SSHD=1` skips SSH fixtures.
