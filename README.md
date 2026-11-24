@@ -29,24 +29,12 @@ user-owned install or follow the copy commands `mule init` prints.
 ## Set up a host
 
 `mule init` writes a commented template to `~/.config/mule/config.toml` if it
-is missing. The minimum is two lines:
+is missing. Add a host section such as `[hosts.build]`; the section name is
+both the default SSH target and what `--host` takes.
 
-```toml
-[hosts.build]
-target = "build"
-```
-
-The section name is what `--host` takes; with one host you can omit it. Rerun
-`mule init` after editing to print the command for each host.
-
-mule needs an SSH control master on its own socket and never opens it. Open
-it yourself (this can require a hardware-key tap):
-
-```sh
-ssh -MNf -S ~/.ssh/mule/build.sock -o ControlPersist=8h build
-```
-
-Without it, a job command exits 3 and prints that line.
+Rerun `mule init` and run the SSH command it prints for your host. mule never
+opens the control master itself: it can require a hardware-key tap. Without
+it, a job command exits 3 and prints the command again.
 
 ## Use it from mu
 
