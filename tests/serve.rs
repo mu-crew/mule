@@ -1363,7 +1363,7 @@ fn a_child_that_leaves_the_ops_group_dies_with_it_at_the_deadline() {
         let marker = scratch("own-group").join("late");
         // A host `stat` that wraps its work in GNU timeout, which puts its
         // child in a group of its own; this one outlived the op's TERM and
-        // KILL (review, 2026-11-20, then through a command op).
+        // KILL.
         let body = format!(
             "timeout 5 sh -c 'sleep 2.8; touch \"$1\"' x '{}'",
             marker.display()
@@ -2014,9 +2014,8 @@ fn write_replaces_only_the_named_file() {
 /// visible. The rename publishes the temp file's inode, so its mode must be
 /// the target's before `mv`: restored by a chmod after it, a 0600 file sat
 /// at 0644 until the chmod ran, and stayed there when it failed or the
-/// caller aborted (review, 2026-11-23, Linux host). An `mv` shim records the
-/// temp file's mode as it publishes it; a second shim fails the `mv`, and the
-/// old bytes and mode stay.
+/// caller aborted. One `mv` shim records the mode at publication; another
+/// fails `mv`, leaving the old bytes and mode.
 #[test]
 fn a_write_publishes_the_target_mode_never_a_wider_one() {
     if !have_tools() {
@@ -2134,11 +2133,9 @@ fn a_write_never_touches_a_sibling_on_its_temp_name() {
 /// A name in the destination's directory is anyone's until an exclusive
 /// create takes it. The temp file was checked (`-e`, `-L`) and then created
 /// under `set -C`, which opens an existing FIFO: one planted between the two
-/// received the payload, and the failed size check then `rm -f`'d it
-/// (review, 2026-11-23, Linux host, an `LD_PRELOAD` pause). Here a bash DEBUG
-/// trap is that stranger: before any command that names the temp path `$t`
-/// while it lies in the destination's directory `$r`, other than a `[`
-/// test, it plants a FIFO there with a reader. A write that never opens a
+/// received the payload and the failed size check then unlinked it. A bash
+/// DEBUG trap plants a FIFO with a reader before a command other than `[`
+/// uses the temp path `$t` in the destination directory `$r`. A write that never opens a
 /// shared-directory name it did not create exclusively gives it no chance.
 #[test]
 fn a_fifo_planted_on_the_temp_name_after_its_check_is_never_opened() {
