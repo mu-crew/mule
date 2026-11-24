@@ -118,8 +118,9 @@ pub fn list_with_hidden(
 /// `cmd` is base64-encoded inside awk. A command may contain a tab or newline,
 /// either of which would corrupt the row format. Keeping the encoder in the
 /// existing awk process avoids restoring the per-job `base64` forks that made
-/// listing take 14.1s. The same batched stat includes `cmd` and `rc`: spawning
-/// one stat per artifact would undo that improvement.
+/// listing take 14.1s. The encoder needs byte offsets even in a UTF-8
+/// login locale (gawk otherwise counts characters). The same batched stat
+/// includes `cmd` and `rc`: one stat per artifact would undo the improvement.
 ///
 /// The live session names reach awk through its environment, not `-v`:
 /// BSD awk (macOS) refuses a `-v` value holding a newline (`awk: newline in
@@ -136,7 +137,7 @@ fn list_script(host: &Host) -> String {
            || mule_u \"cannot list the jobs under $root\"; \
          odd=$(find \"$root\" -mindepth 2 -maxdepth 2 \\( -name rc -o -name key \\) ! -type f) \
            || mule_u \"cannot list the jobs under $root\"; \
-         printf '%s\\n' \"$listing\" | live=\"$SESSIONS\" odd=\"$odd\" awk -v now=\"$now\" '\
+         printf '%s\\n' \"$listing\" | LC_ALL=C live=\"$SESSIONS\" odd=\"$odd\" awk -v now=\"$now\" '\
              BEGIN {{ \
                n = split(ENVIRON[\"live\"], L, \"\\n\"); \
                for (i = 1; i <= n; i++) if (sub(/^mule-/, \"\", L[i])) alive[L[i]] = 1; \
