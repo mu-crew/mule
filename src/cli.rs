@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::config::{Config, Host};
@@ -1670,6 +1670,38 @@ pub fn command_from_args(args: &[String]) -> String {
     }
 }
 
+/// The words after the command's first that are `run`'s own long flags.
+///
+/// Clap's automatic `--help` and `--version` are not among them: `mule run
+/// tool --help` is a plain request for the tool's help, and no mule flag
+/// placement would make it anything else.
+fn swallowed_run_flags(cmd: &[String]) -> Vec<&str> {
+    let mut cli = Cli::command();
+    cli.build(); // Propagate global arguments (such as --quiet) to run.
+    let run = cli.find_subcommand("run").expect("run is a subcommand");
+    cmd.iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|arg| {
+            let Some(name) = arg.strip_prefix("--") else {
+                return false;
+            };
+            let name = name.split('=').next().unwrap_or(name);
+            run.get_arguments().any(|arg| {
+                !arg.is_hide_set()
+                    && arg.get_long() == Some(name)
+                    && !matches!(
+                        arg.get_action(),
+                        ArgAction::Help
+                            | ArgAction::HelpShort
+                            | ArgAction::HelpLong
+                            | ArgAction::Version
+                    )
+            })
+        })
+        .collect()
+}
+
 /// Warn when the command contains something that looks like a mule flag.
 ///
 /// `run` takes the command as trailing arguments, so `mule run ls --wait` sends
@@ -1682,22 +1714,9 @@ pub fn command_from_args(args: &[String]) -> String {
 /// So this warns rather than erroring: the command really might want the flag,
 /// and refusing would break `mule run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
+    let found = swallowed_run_flags(cmd);
     let mut cli = Cli::command();
-    cli.build(); // Propagate global arguments (such as --quiet) to run.
-    let run = cli.find_subcommand("run").expect("run is a subcommand");
-    let found: Vec<&str> = cmd
-        .iter()
-        .skip(1)
-        .map(String::as_str)
-        .filter(|arg| {
-            let Some(name) = arg.strip_prefix("--") else {
-                return false;
-            };
-            let name = name.split('=').next().unwrap_or(name);
-            run.get_arguments()
-                .any(|arg| !arg.is_hide_set() && arg.get_long() == Some(name))
-        })
-        .collect();
+    cli.build(); // The correction check below needs the built command.
     if found.is_empty() {
         return;
     }
@@ -1792,12 +1811,30 @@ fn collapse_whitespace(command: &str) -> String {
 mod tests {
     use super::{
         Cli, collapse_whitespace, command_from_args, display_command, host_info,
-        looks_like_missing_tool, poll_json, tui_hints,
+        looks_like_missing_tool, poll_json, swallowed_run_flags, tui_hints,
     };
     use crate::config::Config;
     use crate::probe::State;
     use crate::transport::{Fake, Output};
     use clap::Parser;
+
+    #[test]
+    fn swallowed_flags_are_run_flags_and_never_the_commands_own_help() {
+        let words = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let found = |args: &[&str]| swallowed_run_flags(&words(args)).join(",");
+        // `--help` is a flag of `run` to clap, but a request to the command here.
+        assert_eq!(found(&["tool", "--help"]), "");
+        assert_eq!(found(&["tool", "--version"]), "");
+        // Flags that change idempotency or exit codes, with `=` values; ls-only
+        // flags are not run's.
+        assert_eq!(
+            found(&["tool", "--key=once", "--strict-codes", "--all", "--json"]),
+            "--key=once,--strict-codes"
+        );
+        assert_eq!(found(&["tool", "--wait", "--help"]), "--wait");
+        // The command word itself is the command, whatever it looks like.
+        assert_eq!(found(&["--wait"]), "");
+    }
 
     #[test]
     fn tui_run_is_explicit_and_rejects_local_wait_modes() {
