@@ -82,6 +82,22 @@ function put(base: string, name: string, content: string) {
 	writeFileSync(path, content);
 }
 
+async function checkFindGitNewline(s: ReturnType<typeof register>) {
+	const outer = join(dir, "find-newline");
+	const repo = join(outer, "repo\n\n");
+	put(outer, ".gitignore", "*.ts\n");
+	put(repo, "src/a.ts", "tracked\n");
+	for (const args of [["init", "-q"], ["add", "--", "src/a.ts"]]) {
+		const git = spawnSync("git", args, { cwd: repo, encoding: "utf8", timeout: 5_000 });
+		assert.equal(git.status, 0, git.error?.message ?? git.stderr);
+	}
+	const params = { pattern: "./*.ts", path: join(repo, "src") };
+	const oracle = await createFindToolDefinition(dir).execute("oracle", params, undefined, undefined, {} as ExtensionContext);
+	const local = oracle.content.map((part) => part.type === "text" ? part.text : "").join("\n");
+	assert.match(local, /(?:^|\/)a\.ts$/m, "Pi finds the tracked file despite the ignore above the repo");
+	assert.match(await s.run("find", params), /(?:^|\/)a\.ts$/m, "remote find must also find the tracked file");
+}
+
 const checks = {
 	async routing() {
 		const off = register();
@@ -200,6 +216,7 @@ const checks = {
 		}
 		assert.equal(norm(await s.run("find", { pattern: "*.ts", path: join(dir, "inrepo/repo") }), join(dir, "inrepo/repo")).length, 2, "tracked files survive a parent .gitignore");
 		assert.equal(norm(await s.run("find", { pattern: "*.ts", path: join(dir, "norepo") }), join(dir, "norepo")).length, 0, "outside a repo the .gitignore applies");
+		await checkFindGitNewline(s);
 	},
 	async search() {
 		const s = enabled();
@@ -260,6 +277,7 @@ const checks = {
 		// keeps a mode itself.
 		assert.equal(burst.match(/^exec$/gm)?.length, 2, burst);
 		assert.equal(burst.match(/^run$/gm)?.length, 3, burst);
+		await checkFindGitNewline(s);
 
 		// Esc on a running bash: the real `mule kill` stops the remote job.
 		const controller = new AbortController();
