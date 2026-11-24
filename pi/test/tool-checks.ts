@@ -409,14 +409,18 @@ const checks = {
 			assert.ok(!existsSync(join(root, "never")));
 			await reopened.stop();
 
-			// Reported once: the next reopen sees the result in the branch.
+			// Reported once: the next reopen sees the result in the branch. The
+			// reattach is not awaited at startup, so wait for the lookup it should
+			// make to finish, then stop, and name every key it asked for.
 			const after = calls().length;
+			const never = jobKey("fixture-session", "toolu_never", prefix);
 			const again = register(`fixture:${root}`, {}, {}, [...branch.slice(0, 3), { type: "custom_message", customType: "mule-reattach", details: reopened.messages[1].details }]);
 			await again.start();
-			await delay(300);
-			assert.equal(calls().slice(after).match(/^lookup$/gm)?.length, 1, "only the call never started is looked up");
-			assert.deepEqual(again.messages, []);
+			await waitFor("the never-started call's lookup", () => calls().slice(after).includes(`lookup-done ${never}\n`));
 			await again.stop();
+			const looked = calls().slice(after).match(/^lookup-key .*$/gm)?.map((line) => line.slice("lookup-key ".length));
+			assert.deepEqual(looked, [never], "only the call never started is looked up, never the reported one");
+			assert.deepEqual(again.messages, [], "the reported result is not reported again");
 
 			// The master drops while a reattached job is watched: the user is
 			// told, nothing retries in the background, and the next workspace

@@ -86,8 +86,12 @@ head -c "$3" >"$2/log"; cat >"$2/.overflow"; if [ -s "$2/.overflow" ]; then echo
 	// No `drained`: like mule's, the pipeline is cut, not finalized.
 	try { process.kill(group, "SIGKILL"); } catch { /* gone */ }
 } else if (verb === "lookup") {
+	// By key, at the start and once answered: a test can wait for one lookup
+	// to finish and name every key asked for, not just count them.
+	appendFileSync(join(dir, "calls"), `lookup-key ${args[0]}\n`);
 	const key = join(dir, "keys", args[0]);
 	console.log(JSON.stringify(existsSync(key) ? readFileSync(key, "utf8") : null));
+	appendFileSync(join(dir, "calls"), `lookup-done ${args[0]}\n`);
 } else if (verb === "serve") {
 	// The reply shapes of mule serve's read, stat and write, run locally.
 	// Real serve is exercised against sshd by the loopback test.
