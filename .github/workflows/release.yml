@@ -61,6 +61,8 @@ jobs:
           node-version: 24
       - name: Check release versions
         run: node scripts/npm-version.js --check "${{ github.ref_name }}"
+      - name: Extract release notes before publishing
+        run: python3 scripts/changelog-section.py CHANGELOG.md "${GITHUB_REF_NAME#v}" > "$RUNNER_TEMP/mule-release-notes.md"
       - uses: actions/download-artifact@v5
         with:
           path: artifacts
@@ -91,7 +93,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          python3 scripts/changelog-section.py CHANGELOG.md "$version" > notes.md
           mkdir dist
           for pair in x86_64-unknown-linux-musl:mule-linux-x64 aarch64-unknown-linux-musl:mule-linux-arm64 aarch64-apple-darwin:mule-darwin-arm64; do
             target="${pair%%:*}" package="${pair#*:}"
@@ -99,4 +100,4 @@ jobs:
             tar -C "artifacts/$package" -czf "dist/mule-$version-$target.tar.gz" mule mu-plugin-mule
           done
           (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" --title "mule $version" --notes-file notes.md --verify-tag dist/*
+          gh release create "$GITHUB_REF_NAME" --title "mule $version" --notes-file "$RUNNER_TEMP/mule-release-notes.md" --verify-tag dist/*
