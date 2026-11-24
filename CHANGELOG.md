@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.0] — 2026-11-24
+
 ### Added
 
 - `mule serve --stdio`: bounded synchronous file ops (read, stat, write,
@@ -41,9 +43,9 @@
   and tells the user once (`HANDBACK`), without retrying or killing jobs
   through the missing master; the next call reconnects. `--mule-role
   read-only` (or `MULE_PI_ROLE`) hides `write` and `edit` and runs only
-  known read-only bash. Heavy bash queues on the host's `muzzle` when it
+  known read-only bash (a guard against accidents, not a sandbox). Heavy bash queues on the host's `muzzle` when it
   has one (`MULE_PI_MUZZLE` to pin or turn it off), with the Pi timeout
-  counted from admission. A log cut at `max_log_bytes` or a tail clipped at
+  counted from admission. Files are capped at 4 MiB; a log cut at `max_log_bytes` or a tail clipped at
   64 KiB is a note after the output; a command's own 3 or 7 is its result.
   Reopening Pi reattaches to the jobs of `bash` calls left without a
   result (found with `mule lookup`, never restarted) and reports their
