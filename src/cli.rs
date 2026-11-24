@@ -159,7 +159,7 @@ Exit status:
   8   only with --strict-codes: the command's 3, or its own 8 (ambiguous; 3 is
       always mule's handback)
   9   init only: mu is installed but plugin registration could not be completed
-  129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (job stopped)
+  129/130/143  exec and run --lease after SIGHUP/SIGINT/SIGTERM (not proof of cleanup)
   <n> wait/--wait/--lease return the job's own exit code; exec returns the
       command's; run --lease exits 3 only at startup"
 )]
@@ -229,9 +229,9 @@ pub enum Commands {
         /// Exits with the job's code when it ends; 1 if the job is missing; 5
         /// if orphaned; 3 only at startup (no master). A master that goes away
         /// later does NOT end the lease: it prints the command a human must run
-        /// and keeps holding. SIGHUP/SIGINT/SIGTERM stop the job through a
-        /// detached `mule rm` and exit 129/130/143. That stop retries for up
-        /// to 10 minutes; if it gives up it writes F.<id>.stop-failed.
+        /// and keeps holding. SIGHUP/SIGINT/SIGTERM hand cleanup to a detached
+        /// `mule rm` and exit 129/130/143, without proving removal. The child
+        /// retries for up to 10 minutes and records failure in F.<id>.stop-failed.
         #[arg(long, requires = "job_file", conflicts_with_all = ["wait", "no_tail"])]
         lease: bool,
         /// With --lease: file the job id is written to before dispatch
@@ -242,9 +242,9 @@ pub enum Commands {
         /// For a new carrier pane after the old one died (mu's `agent
         /// reattach`). Exits 3 with no master, 1 if the job is not running or
         /// --job-file names another job, before holding or changing anything.
-        /// The job file is written only if missing, never replaced. Then it
-        /// holds exactly like a lease, and a signal stops the job. A stop an
-        /// old carrier left retrying is fenced off and stops nothing.
+        /// The job file is written only if missing, never replaced. It then
+        /// holds and handles signals like a lease. An old carrier's retrying
+        /// cleanup is fenced off.
         #[arg(
             long,
             value_name = "ID",
@@ -464,8 +464,8 @@ pub enum Commands {
     /// incomplete -- truncated at max_log_bytes, or a process the command left
     /// behind still holds the job's stdout -- so never parse it as complete.
     /// Exit 1 names a job that could not be removed (never the command's code). Exit 3 means
-    /// no master: stop and ask a human. SIGINT/SIGTERM stop the remote job
-    /// through a detached `mule rm`, unlike `run --wait`, where it continues.
+    /// no master: stop and ask a human. On SIGHUP/SIGINT/SIGTERM, exec hands
+    /// cleanup to a detached `mule rm`; the exit does not prove removal.
     ///
     /// For control-sized output: the whole log comes back in one locked read.
     /// Flags go before the command, or after `--`.
@@ -478,15 +478,14 @@ pub enum Commands {
         /// Kill the remote command after S seconds (0 means unbounded); exits 124
         #[arg(long, value_name = "S")]
         max_secs: Option<u64>,
-        /// On a signal, stop the job from this process, never a detached child
+        /// On a signal, attempt cleanup in-process, never in a detached child
         ///
         /// For a caller that cancels by signalling exec's process group and
         /// then kills the group after a grace: everything mule starts stays in
         /// that group, so nothing outlives the kill. One `rm` attempt runs
         /// in-process before the exit; it can outlast the caller's grace (it
-        /// queues on the ticket lock), so a killed exec leaves the job's fate
-        /// unknown, and the caller must treat it so. Without this flag the
-        /// stop is a detached, retrying `rm` that survives the group.
+        /// queues on the ticket lock) or fail; the exit is not proof. Without
+        /// this flag a detached, retrying `rm` survives the group.
         #[arg(long)]
         no_detach: bool,
         /// Report a command's own exit 3 as 8, so 3 only ever means no master
