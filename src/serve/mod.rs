@@ -50,6 +50,30 @@ use crate::transport::{Control, Feed, Transport};
 /// Hard per-op limit on the host. 1s: rung 2 wants a single op at <=0.5s, so
 /// a bounded op needing twice that is a job (human decision, 2026-11-20).
 pub const MAX_OP_SECS: u32 = 1;
+/// Test seam: a longer op deadline, for a test whose subject is not the
+/// deadline (a cancel) and which must not race it. A delayed test thread lost
+/// a cancel to a correct 1s timeout. Never shorter than [`MAX_OP_SECS`], and
+/// at most [`TEST_OP_SECS_MAX`]: the remote bounds together must stay under
+/// [`LOCAL_KILL`]. Anything else is ignored.
+#[doc(hidden)]
+pub const TEST_OP_SECS_ENV: &str = "MULE_SERVE_TEST_OP_SECS";
+/// 5 payload + 3 op + 1 kill grace + 5 delivery = 14s, under the 15s
+/// [`LOCAL_KILL`].
+#[doc(hidden)]
+pub const TEST_OP_SECS_MAX: u32 = 3;
+const _: () = assert!(
+    PAYLOAD_SECS + TEST_OP_SECS_MAX + KILL_GRACE_SECS + DELIVER_SECS < LOCAL_KILL.as_secs() as u32
+);
+
+/// The op deadline this process uses: [`MAX_OP_SECS`] unless a test asked
+/// for longer through [`TEST_OP_SECS_ENV`].
+fn op_secs() -> u32 {
+    std::env::var(TEST_OP_SECS_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|secs| (MAX_OP_SECS..=TEST_OP_SECS_MAX).contains(secs))
+        .unwrap_or(MAX_OP_SECS)
+}
 /// Bound on reading the batch's payloads off stdin on the host. A 200KB write
 /// took 0.54-1.05s whole on two real hosts; 5s leaves room for 8MB on a slow
 /// link.
@@ -382,10 +406,11 @@ L() { p=; read -r p < "$d/pid.$1" 2>/dev/null; case $p in ''|*[!0-9]*) return 1;
 fn deadline() -> String {
     format!(
         "d=$1; X=$2; T=$3; n=$4\n{KILL_FNS}\
-         sleep {MAX_OP_SECS}; k=0\n\
+         sleep {}; k=0\n\
          while [ $k -lt $n ]; do [ -s \"$d/rc.$k\" ] || {{ : > \"$d/to.$k\"; L $k && K TERM $p $k t; }}; k=$((k+1)); done\n\
          sleep {KILL_GRACE_SECS}; k=0\n\
-         while [ $k -lt $n ]; do [ -s \"$d/rc.$k\" ] || {{ L $k && K KILL $p $k t; }}; k=$((k+1)); done"
+         while [ $k -lt $n ]; do [ -s \"$d/rc.$k\" ] || {{ L $k && K KILL $p $k t; }}; k=$((k+1)); done",
+        op_secs()
     )
 }
 
@@ -1163,8 +1188,9 @@ fn op_reply(f: &Frame, id: u64, cancel_requested: bool, batch: u64, size: usize)
         Ended::TimedOut => (
             Some("timeout"),
             Some(format!(
-                "exceeded the {MAX_OP_SECS}s bounded-op limit; \
-                 run it as a detached job (mule run, mule exec)"
+                "exceeded the {}s bounded-op limit; \
+                 run it as a detached job (mule run, mule exec)",
+                op_secs()
             )),
         ),
         Ended::Lost => (

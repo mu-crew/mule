@@ -65,10 +65,15 @@ fn setup() -> (Sshd, Master, PathBuf) {
 }
 
 fn serve(sshd: &Sshd, config: &Path) -> Serve {
+    serve_with(sshd, config, &[])
+}
+
+fn serve_with(sshd: &Sshd, config: &Path, env: &[(&str, &str)]) -> Serve {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mule"))
         .arg("--config")
         .arg(config)
         .args(["serve", "--stdio"])
+        .envs(env.iter().copied())
         .env("PATH", sshd.path_env())
         .env("XDG_STATE_HOME", &sshd.state_root)
         .stdin(Stdio::piped())
@@ -285,21 +290,26 @@ fn caller_eof_frees_the_only_session_and_serve_exits() {
 fn cancel_stops_the_op_on_the_same_session() {
     require_sshd!();
     let (sshd, _master, config) = setup();
-    let mut s = serve(&sshd, &config);
+    // The subject is the cancel, not the deadline: with the host's 1s already
+    // ticking when the reader is seen, a delayed test thread lost to a correct
+    // timeout. The longest deadline the seam allows takes that race away; the
+    // deadline itself is covered by the timeout cases.
+    let secs = mule::serve::TEST_OP_SECS_MAX.to_string();
+    let mut s = serve_with(&sshd, &config, &[(mule::serve::TEST_OP_SECS_ENV, &secs)]);
     let (f, req) = stuck_read(&sshd.dir, "cancel", 1);
     s.send(req);
     let mut w = reading(f.path());
-    let t = Instant::now();
     s.send(json!({"op":"cancel","id":1}));
     let v = s.reply();
-    assert_eq!(v["cancelled"], true, "{v}");
-    assert!(
-        t.elapsed() < Duration::from_millis(900),
-        "{:?}",
-        t.elapsed()
+    assert_eq!(
+        (&v["kind"], &v["cancelled"]),
+        (&json!("cancelled"), &json!(true)),
+        "{v}"
     );
-    assert!(session_free(&sshd));
-    reader_gone_within(&mut w, Duration::from_secs(1));
+    // Released, not merely replied to: the op's reader is gone and the
+    // session can be taken. Each within a hang guard, not a latency bound.
+    reader_gone_within(&mut w, WATCHDOG);
+    session_frees_within(&sshd, WATCHDOG);
 }
 
 #[test]
