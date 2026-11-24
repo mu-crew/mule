@@ -127,7 +127,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
            mule_sessions; \
            if mule_has mule-{id} || mule_has watch-{id}; then \
              mule_u \"the state dir is gone but a session for the job is not proven gone\"; fi; \
-           printf 'exists=0\\nrc=\\nalive=0\\nwatch=0\\nwhy=\\nruntime=\\nsize=0\\nbytes:\\n'; exit 0; \
+           printf 'exists=0\\nrc=\\nalive=0\\nwatch=0\\nruntime=\\nsize=0\\nbytes:\\n'; exit 0; \
          fi; \
          [ -d $d ] || mule_u \"state path $d is not a directory\"; \
          printf 'exists=1\\n'; \
@@ -143,7 +143,7 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
          elif [ $alive = 0 ]; then \
            mule_regular $d/cmd cmd || mule_u \"the job is claimed by its key but has not started (no cmd); if its claimer is gone: mule rm {id}\"; \
          fi; \
-         printf 'rc=%s\\nalive=%s\\nwatch=%s\\nwhy=\\n' \"$rc\" $alive $watch; \
+         printf 'rc=%s\\nalive=%s\\nwatch=%s\\n' \"$rc\" $alive $watch; \
          runtime=; \
          if mule_regular $d/cmd cmd; then \
            mule_mtime $d/cmd; start=$REPLY; end=; \
@@ -191,36 +191,27 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     let mut exists = None;
     let mut rc = None;
     let mut alive = None;
-    let mut watch = Seen::No;
-    let mut rc_read = true;
-    let mut has_cmd = true;
-    let mut why = String::new();
+    let mut watch = false;
     let mut runtime_secs = None;
     let mut log_size = None;
     let mut drained = false;
     for line in output.text().lines() {
         if let Some(value) = line.strip_prefix("exists=") {
-            exists = Some(Seen::parse(value));
+            exists = Some(probe_flag("exists", value)?);
         } else if let Some(value) = line.strip_prefix("rc=") {
             if !value.is_empty() {
                 rc = Some(value.parse::<i32>().context("invalid rc in probe reply")?);
             }
         } else if let Some(value) = line.strip_prefix("alive=") {
-            alive = Some(Seen::parse(value));
+            alive = Some(probe_flag("alive", value)?);
         } else if let Some(value) = line.strip_prefix("watch=") {
-            watch = Seen::parse(value);
-        } else if let Some(value) = line.strip_prefix("rcread=") {
-            rc_read = value != "0";
-        } else if let Some(value) = line.strip_prefix("cmd=") {
-            has_cmd = value != "0";
-        } else if let Some(value) = line.strip_prefix("why=") {
-            why = value.trim().to_string();
+            watch = probe_flag("watch", value)?;
         } else if let Some(value) = line.strip_prefix("runtime=") {
             if !value.is_empty() {
                 runtime_secs = Some(value.parse().context("invalid runtime in probe reply")?);
             }
         } else if let Some(value) = line.strip_prefix("drained=") {
-            drained = value == "1";
+            drained = probe_flag("drained", value)?;
         } else if let Some(value) = line.strip_prefix("size=") {
             log_size = Some(
                 value
@@ -232,71 +223,31 @@ pub fn probe(t: &dyn Transport, host: &Host, id: &JobId, from: impl Into<From>) 
     }
 
     let exists = exists.context("invalid probe reply: missing exists")?;
-    let unverifiable = |fallback: &str| -> anyhow::Error {
-        let why = if why.is_empty() { fallback } else { &why };
-        MuleError::Unverifiable {
-            id: id.to_string(),
-            why: why.to_string(),
-        }
-        .into()
-    };
-    // A job with `rc` is `Done` whatever its session looks like; only it can
-    // leave `alive` unknown, and then the session is assumed to live on, so
-    // `exec` waits out the drain rather than read a log still being written.
-    let alive_now = matches!(alive, Some(Seen::Yes | Seen::Unknown));
-    let state = match (exists, rc) {
-        (Seen::Unknown, _) => return Err(unverifiable("the state dir could not be checked")),
-        (Seen::Yes, _) if !rc_read => {
-            return Err(unverifiable("the job's rc could not be read"));
-        }
-        (Seen::No, _) => {
-            if alive != Some(Seen::No) || watch != Seen::No {
-                return Err(unverifiable(
-                    "the state dir is gone but a session for the job is not proven gone",
-                ));
-            }
-            State::Missing
-        }
-        (Seen::Yes, Some(code)) => State::Done(code),
-        (Seen::Yes, None) => match alive.context("invalid probe reply: missing alive")? {
-            Seen::Yes => State::Running,
-            // Not started: no `cmd`, so this is a claim, not a job that died.
-            Seen::No if !has_cmd => {
-                return Err(unverifiable(
-                    "the job is claimed by its key but has not started (no cmd)",
-                ));
-            }
-            Seen::No => State::Orphan,
-            Seen::Unknown => return Err(unverifiable("the session could not be checked")),
-        },
+    let alive = alive.context("invalid probe reply: missing alive")?;
+    let state = match (exists, rc, alive) {
+        (false, None, false) if !watch => State::Missing,
+        (false, _, _) => bail!("invalid probe reply: artifacts or sessions for an absent job"),
+        (true, Some(code), _) => State::Done(code),
+        (true, None, true) => State::Running,
+        (true, None, false) => State::Orphan,
     };
     Ok(Probe {
         state,
         runtime_secs,
-        alive: alive_now,
+        alive,
         drained,
         log_size: log_size.context("invalid probe reply: missing size")?,
         bytes,
     })
 }
 
-/// One fact as the probe script saw it: `1`, `0`, or `?` for "could not
-/// tell". Anything unexpected is `?`: a reply that says neither cannot prove
-/// either.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Seen {
-    Yes,
-    No,
-    Unknown,
-}
-
-impl Seen {
-    fn parse(value: &str) -> Self {
-        match value {
-            "1" => Self::Yes,
-            "0" => Self::No,
-            _ => Self::Unknown,
-        }
+// The script signals unverifiable facts with CANNOT_TELL, not with a value
+// in a successful reply.
+fn probe_flag(name: &str, value: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => bail!("invalid {name} in probe reply"),
     }
 }
 
