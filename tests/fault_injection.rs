@@ -462,6 +462,62 @@ struct Scenario {
     verb: fn(&[String]) -> Vec<String>,
     /// `Err(why)` when the outcome breaks the discipline.
     check: fn(&ShimHost, &[String], &Output) -> Result<(), String>,
+    /// `Err(why)` when the unfaulted run is not the scenario's success. The
+    /// enumeration is that run: one that failed early ran fewer commands, and
+    /// every command it skipped would go untested, silently.
+    baseline: fn(&ShimHost, &[String], &Output) -> Result<(), String>,
+}
+
+/// Every scenario's name, so a `MULE_FI_CASE` naming none of them is a typo,
+/// not a run of zero cases in every test.
+const SCENARIOS: &[&str] = &[
+    "poll-running",
+    "poll-done",
+    "poll-orphan",
+    "poll-missing",
+    "ls",
+    "ls-key-prefix",
+    "ls-running-key-prefix",
+    "ls-all",
+    "prune",
+    "rm-running",
+    "rm-done",
+    "run-key",
+    "run-key-new",
+    "run-key-new-strict",
+    "run-tui-key-wd",
+    "lease-existing",
+    "lease-hold",
+    "lease-new",
+    "lease-abandoned",
+    "lease-claim-alive",
+    "attach-running",
+    "exec-no-detach",
+];
+
+/// `MULE_FI_CASE=<scenario>:<n>:<mode>`, checked for shape, scenario and
+/// mode before any setup. `None` when unset; `Some(None)` when it names
+/// another scenario, which this test then skips.
+fn selector(scenario: &str) -> Option<Option<(usize, String)>> {
+    let raw = std::env::var("MULE_FI_CASE").ok()?;
+    let usage = format!(
+        "MULE_FI_CASE={raw:?}: want <scenario>:<n>:<mode>, e.g. poll-done:1:exit2; \
+         scenarios: {}; modes: {}",
+        SCENARIOS.join(" "),
+        MODES.join(" ")
+    );
+    let mut parts = raw.rsplitn(3, ':');
+    let (Some(mode), Some(n), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+        panic!("{usage}");
+    };
+    assert!(SCENARIOS.contains(&name), "no scenario {name:?}. {usage}");
+    assert!(MODES.contains(&mode), "no mode {mode:?}. {usage}");
+    let n: usize = n
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| panic!("{n:?} is not a command number (1-based). {usage}"));
+    Some((name == scenario).then(|| (n, mode.to_string())))
 }
 
 fn json(out: &Output) -> Option<serde_json::Value> {
@@ -475,13 +531,25 @@ fn exercise(scenario: &Scenario) {
         eprintln!("skipping: tmux is not on PATH");
         return;
     }
+    assert!(
+        SCENARIOS.contains(&scenario.name),
+        "add {:?} to SCENARIOS",
+        scenario.name
+    );
+    // `MULE_FI_CASE=<scenario>:<n>:<mode>` runs one case and shows its log,
+    // for debugging a failure the full sweep reported. Every other scenario
+    // returns here, before its setup.
+    let selected = selector(scenario.name);
+    if let Some(None) = selected {
+        return;
+    }
     let _one_at_a_time = serial();
     let host = fault_host(&format!("fi-{}-enum", scenario.name));
     let ids = (scenario.setup)(&host);
     let args = (scenario.verb)(&ids);
     let fault = Fault::new(&host, None, scenario.max_call);
     let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-    let _ = match scenario.hold_for {
+    let base = match scenario.hold_for {
         Some(limit) => mule_for(&host, &fault, &args_ref, limit),
         None => mule_with(&host, &fault, &args_ref),
     };
@@ -492,16 +560,50 @@ fn exercise(scenario: &Scenario) {
         scenario.name,
         tools.join(" ")
     );
+    let broken = |why: String| {
+        panic!(
+            "{}: the unfaulted run, which enumerates the cases, {why}\n    stdout: {}\n    stderr: {}",
+            scenario.name,
+            stdout(&base),
+            String::from_utf8_lossy(&base.stderr).trim()
+        )
+    };
+    if fixture_timeout(&base) {
+        broken("lost the fake master: a harness failure".into());
+    }
+    if let Err(why) = (scenario.baseline)(&host, &ids, &base) {
+        broken(format!("did not succeed: {why}"));
+    }
+    // A lease that rightly holds on must still be holding when the harness
+    // kills it; one that ended on its own took another path.
+    if scenario.hold_for.is_some() && base.status.code().is_some() {
+        broken(format!("was not held: it exited {:?}", base.status.code()));
+    }
+    // The window must have been reached, or its last calls are never injected.
+    if let Some(max) = scenario.max_call {
+        let calls = std::fs::read_to_string(fault.dir.join("calls"))
+            .ok()
+            .and_then(|c| c.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if calls < max {
+            broken(format!(
+                "made {calls} remote calls, short of the {max} injected in"
+            ));
+        }
+    }
     assert!(count > 0, "{}: enumerated no commands", scenario.name);
 
     let mut cases: Vec<(usize, &str)> = (1..=count)
         .flat_map(|n| MODES.iter().map(move |mode| (n, *mode)))
         .collect();
-    // `MULE_FI_CASE=<scenario>:<n>:<mode>` runs one case and shows its log,
-    // for debugging a failure the full sweep reported.
-    let only = std::env::var("MULE_FI_CASE").ok();
-    if let Some(only) = &only {
-        cases.retain(|(n, mode)| *only == format!("{}:{n}:{mode}", scenario.name));
+    let only = selected.flatten();
+    if let Some((n, mode)) = &only {
+        assert!(
+            *n <= count,
+            "MULE_FI_CASE: {} has commands 1..={count}, not {n}",
+            scenario.name
+        );
+        cases.retain(|case| case == &(*n, mode.as_str()));
     }
     let only = only.is_some();
     let failures = std::sync::Mutex::new(Vec::new());
@@ -596,6 +698,67 @@ fn poll_is_unknown(_: &ShimHost, _: &[String], out: &Output) -> Result<(), Strin
     }
 }
 
+/// A `poll --json` baseline: exit 0 and `want` as the state.
+fn polled_as(out: &Output, want: &str) -> Result<(), String> {
+    let v = json(out).ok_or("no JSON object")?;
+    if out.status.code() != Some(0) || v["state"] != want {
+        return Err(format!(
+            "exit {:?}, state {}, not {want}",
+            out.status.code(),
+            v["state"]
+        ));
+    }
+    Ok(())
+}
+
+/// A baseline that exited `code`.
+fn exited(out: &Output, code: i32) -> Result<(), String> {
+    match out.status.code() {
+        Some(c) if c == code => Ok(()),
+        other => Err(format!("exit {other:?}, not {code}")),
+    }
+}
+
+/// An `ls --json` baseline: exit 0 and exactly `want` listed.
+fn listed(out: &Output, want: &[&String]) -> Result<(), String> {
+    exited(out, 0)?;
+    let v = json(out).ok_or("no JSON object")?;
+    let got: BTreeSet<&str> = v["items"]
+        .as_array()
+        .ok_or("no items")?
+        .iter()
+        .filter_map(|i| i["id"].as_str())
+        .collect();
+    let want: BTreeSet<&str> = want.iter().map(|s| s.as_str()).collect();
+    if got != want {
+        return Err(format!("listed {got:?}, not {want:?}"));
+    }
+    Ok(())
+}
+
+/// The jobs holding `key`.
+fn holders(host: &ShimHost, key: &str) -> Vec<String> {
+    jobs(host)
+        .into_iter()
+        .filter(|id| key_of(host, id).as_deref() == Some(key))
+        .collect()
+}
+
+/// A keyed lease's baseline: the job's code 4, one job for the key, and the
+/// job file naming it. `not` is a job that must not be that one.
+fn lease_ran(host: &ShimHost, file: &str, out: &Output, not: Option<&str>) -> Result<(), String> {
+    exited(out, 4)?;
+    let held = holders(host, "mu.lease");
+    let named = std::fs::read_to_string(file).map_err(|e| format!("job file: {e}"))?;
+    match held.as_slice() {
+        [one] if one == named.trim() && Some(one.as_str()) != not => Ok(()),
+        _ => Err(format!(
+            "key held by {held:?}, job file names {}",
+            named.trim()
+        )),
+    }
+}
+
 fn refused(_: &ShimHost, _: &[String], out: &Output) -> Result<(), String> {
     if out.status.success() {
         return Err("answered".into());
@@ -632,6 +795,7 @@ fn poll_check(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), Strin
 fn poll_of_a_running_job() {
     exercise(&Scenario {
         name: "poll-running",
+        baseline: |_, _, out| polled_as(out, "running"),
         hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "sleep 60"])],
@@ -644,6 +808,13 @@ fn poll_of_a_running_job() {
 fn poll_of_a_done_job() {
     exercise(&Scenario {
         name: "poll-done",
+        baseline: |_, _, out| {
+            polled_as(out, "done")?;
+            match json(out).map(|v| v["rc"].clone()) {
+                Some(rc) if rc == 17 => Ok(()),
+                rc => Err(format!("rc {rc:?}, not 17")),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| vec![finished(h, &["run", "--quiet", "exit 17"])],
@@ -656,6 +827,7 @@ fn poll_of_a_done_job() {
 fn poll_of_an_orphan() {
     exercise(&Scenario {
         name: "poll-orphan",
+        baseline: |_, _, out| polled_as(out, "orphan"),
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -679,6 +851,7 @@ fn poll_of_a_missing_job_with_a_live_watchdog() {
     // Round 1's grep finding: absence of `mule-` and `watch-` must be seen.
     exercise(&Scenario {
         name: "poll-missing",
+        baseline: |_, _, out| polled_as(out, "missing"),
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -713,6 +886,7 @@ fn ls_check(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), String>
 fn ls_plain() {
     exercise(&Scenario {
         name: "ls",
+        baseline: |_, ids, out| listed(out, &ids.iter().collect::<Vec<_>>()),
         hold_for: None,
         max_call: None,
         setup: ls_setup,
@@ -725,6 +899,7 @@ fn ls_plain() {
 fn ls_key_prefix() {
     exercise(&Scenario {
         name: "ls-key-prefix",
+        baseline: |_, ids, out| listed(out, &[&ids[0], &ids[1]]),
         hold_for: None,
         max_call: None,
         setup: ls_setup,
@@ -744,6 +919,7 @@ fn ls_key_prefix() {
 fn ls_running_key_prefix() {
     exercise(&Scenario {
         name: "ls-running-key-prefix",
+        baseline: |_, ids, out| listed(out, &[&ids[0]]),
         hold_for: None,
         max_call: None,
         setup: ls_setup,
@@ -768,6 +944,18 @@ fn prune_in_a_dispatch() {
     // unkeyed done job and an old orphan may go (prune's job).
     exercise(&Scenario {
         name: "prune",
+        baseline: |host, ids, out| {
+            // Prune ran: the old unkeyed done job and the old orphan are
+            // gone, leaving the three kept and the new job.
+            exited(out, 0)?;
+            let mut want: BTreeSet<String> = ids.iter().cloned().collect();
+            want.insert(stdout(out));
+            let now = jobs(host);
+            if now != want {
+                return Err(format!("jobs are {now:?}, not {want:?}"));
+            }
+            Ok(())
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -807,6 +995,13 @@ fn rm_check(_: &ShimHost, _: &[String], out: &Output) -> Result<(), String> {
 fn rm_of_a_running_job() {
     exercise(&Scenario {
         name: "rm-running",
+        baseline: |host, ids, out| {
+            exited(out, 0)?;
+            match jobs(host).contains(&ids[0]) {
+                true => Err("the job is still there".into()),
+                false => Ok(()),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "sleep 60"])],
@@ -819,6 +1014,13 @@ fn rm_of_a_running_job() {
 fn rm_of_a_done_job() {
     exercise(&Scenario {
         name: "rm-done",
+        baseline: |host, ids, out| {
+            exited(out, 0)?;
+            match jobs(host).contains(&ids[0]) {
+                true => Err("the job is still there".into()),
+                false => Ok(()),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -858,6 +1060,13 @@ fn no_second_job(host: &ShimHost, ids: &[String], out: &Output) -> Result<(), St
 fn run_key_of_an_existing_key() {
     exercise(&Scenario {
         name: "run-key",
+        baseline: |host, ids, out| {
+            exited(out, 0)?;
+            match stdout(out) == ids[0] && jobs(host).len() == 1 {
+                true => Ok(()),
+                false => Err(format!("printed {}, jobs {:?}", stdout(out), jobs(host))),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| vec![running(h, &["run", "--quiet", "--key", "mu.k", "sleep 60"])],
@@ -878,6 +1087,13 @@ fn run_key_of_an_existing_key() {
 fn run_key_of_a_new_key() {
     exercise(&Scenario {
         name: "run-key-new",
+        baseline: |host, _, out| {
+            exited(out, 0)?;
+            match holders(host, "mu.new") {
+                held if held == [stdout(out)] => Ok(()),
+                held => Err(format!("printed {}, key held by {held:?}", stdout(out))),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -941,6 +1157,7 @@ fn keyed_lease_of_an_existing_key() {
     // and name only that job.
     exercise(&Scenario {
         name: "lease-existing",
+        baseline: |host, ids, out| lease_ran(host, &ids[1], out, None),
         hold_for: None,
         max_call: Some(3),
         setup: |h| {
@@ -974,6 +1191,7 @@ fn keyed_lease_through_its_first_hold_tick() {
     // the job's code, never with a state it could not read.
     exercise(&Scenario {
         name: "lease-hold",
+        baseline: |host, ids, out| lease_ran(host, &ids[1], out, None),
         hold_for: None,
         max_call: Some(4),
         setup: |h| {
@@ -1003,6 +1221,7 @@ fn keyed_lease_of_a_new_key() {
     // for the key, and its job file names that job or nothing.
     exercise(&Scenario {
         name: "lease-new",
+        baseline: |host, ids, out| lease_ran(host, &ids[0], out, None),
         hold_for: None,
         max_call: Some(2),
         setup: |h| {
@@ -1135,6 +1354,7 @@ fn an_unreadable_key_is_refused_with_running_too() {
 fn r3_ls_all_with_uname() {
     exercise(&Scenario {
         name: "ls-all",
+        baseline: |_, ids, out| listed(out, &ids.iter().collect::<Vec<_>>()),
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -1151,6 +1371,14 @@ fn r3_ls_all_with_uname() {
 fn r3_attach_of_a_running_job() {
     exercise(&Scenario {
         name: "attach-running",
+        baseline: |_, ids, out| {
+            // Attached and held to the job's end: `sleep 60` exits 0.
+            exited(out, 0)?;
+            match std::fs::read_to_string(&ids[1]) {
+                Ok(named) if named.trim() == ids[0] => Ok(()),
+                named => Err(format!("job file {named:?}, not {}", ids[0])),
+            }
+        },
         hold_for: None,
         max_call: Some(1),
         setup: |h| {
@@ -1181,6 +1409,14 @@ fn r3_attach_of_a_running_job() {
 fn r3_exec_no_detach() {
     exercise(&Scenario {
         name: "exec-no-detach",
+        baseline: |host, _, out| {
+            exited(out, 0)?;
+            let err = String::from_utf8_lossy(&out.stderr);
+            match (stdout(out).as_str(), err.trim(), jobs(host).is_empty()) {
+                ("hello-exec", "err-exec", true) => Ok(()),
+                other => Err(format!("{other:?}")),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -1223,6 +1459,13 @@ fn r3_exec_no_detach() {
 fn r3_run_key_new_never_poisons_key_with_unstarted_orphan() {
     exercise(&Scenario {
         name: "run-key-new-strict",
+        baseline: |host, _, out| {
+            exited(out, 0)?;
+            match holders(host, "mu.new") {
+                held if held == [stdout(out)] => Ok(()),
+                held => Err(format!("printed {}, key held by {held:?}", stdout(out))),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -1273,6 +1516,13 @@ fn r3_run_key_new_never_poisons_key_with_unstarted_orphan() {
 fn r3_run_tui_key_new_and_watchdog() {
     exercise(&Scenario {
         name: "run-tui-key-wd",
+        baseline: |host, _, out| {
+            exited(out, 0)?;
+            match holders(host, "mu.tui") {
+                held if held == [stdout(out)] => Ok(()),
+                held => Err(format!("printed {}, key held by {held:?}", stdout(out))),
+            }
+        },
         hold_for: None,
         max_call: None,
         setup: |h| {
@@ -1425,6 +1675,7 @@ fn keyed_lease_of_an_abandoned_claim() {
     // makes at most one job for the key, and names that job or nothing.
     exercise(&Scenario {
         name: "lease-abandoned",
+        baseline: |host, ids, out| lease_ran(host, &ids[0], out, Some("0c1a1d")),
         hold_for: None,
         max_call: Some(5),
         setup: |h| {
@@ -1467,6 +1718,18 @@ fn keyed_lease_of_a_live_claimers_claim() {
     // never dispatches; it holds the claim as unknown until killed.
     exercise(&Scenario {
         name: "lease-claim-alive",
+        baseline: |host, ids, _| {
+            // Held as unknown (the harness checks it was still running):
+            // the claim untouched, nothing started.
+            let now = jobs(host);
+            if now.len() != 1 || !now.contains(&ids[0]) {
+                return Err(format!("jobs are {now:?}"));
+            }
+            match host.jobs().join(&ids[0]).join("cmd").exists() {
+                true => Err("the live claim was started".into()),
+                false => Ok(()),
+            }
+        },
         hold_for: Some(Duration::from_secs(30)),
         max_call: Some(3),
         setup: |h| {
