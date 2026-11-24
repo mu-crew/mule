@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 use mule::config::{Config, Host};
 use mule::errors::{EXIT_NO_MASTER, exit_code};
 use mule::forward::{
-    Spec, forward, lock_local, on_record_read, read_record, try_lock_local, unforward,
+    Spec, forward, lock_local, on_lock_contended, on_record_read, read_record, try_lock_local,
+    unforward,
 };
 use mule::transport::{Fake, MuxOp};
 
@@ -385,34 +386,66 @@ fn the_master_command_sets_stream_local_bind_unlink() {
     assert!(command.contains("ssh -MNf"), "{command}");
 }
 
-/// Run `f` on a thread and report whether it finished within `wait`.
-fn finishes_within<T: Send + 'static>(
-    wait: std::time::Duration,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> (bool, std::thread::JoinHandle<T>) {
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag = Arc::clone(&done);
-    let handle = std::thread::spawn(move || {
-        let out = f();
-        flag.store(true, Ordering::SeqCst);
-        out
-    });
-    std::thread::sleep(wait);
-    (done.load(Ordering::SeqCst), handle)
+/// Only a hang guard: every lock test below is ordered by events, and a
+/// correct build meets each within milliseconds.
+const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What a lock test sees of `op` on its own thread: `Contended` when its lock
+/// attempt found the LOCAL's lock held (the kernel's answer, not a guess from
+/// timing), `Entered(released)` at its first record read -- inside the locked
+/// section -- with whether the test had released its hold by then.
+#[derive(Debug, PartialEq)]
+enum Seen {
+    Contended,
+    Entered { released: bool },
 }
 
-/// While another holder has LOCAL's lock, `op` must not finish; once released
-/// it must. Layer-1 evidence for lock acquisition order.
+fn observe(
+    released: Arc<std::sync::atomic::AtomicBool>,
+    op: impl FnOnce() + Send + 'static,
+) -> (std::sync::mpsc::Receiver<Seen>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let contended = tx.clone();
+        let _c = on_lock_contended(move |_, _| {
+            let _ = contended.send(Seen::Contended);
+        });
+        let _r = on_record_read(move |_, _| {
+            let _ = tx.send(Seen::Entered {
+                released: released.load(Ordering::SeqCst),
+            });
+        });
+        op();
+    });
+    (rx, handle)
+}
+
+/// While another holder has LOCAL's lock, `op` must find it held before it
+/// enters, and enter only once it is released. Layer-1 evidence for lock
+/// acquisition order. The hold lasts until the attempt is seen, so a slow
+/// thread cannot pass for a waiting one (a 300ms window could not tell).
 fn assert_waits_for_the_lock(name: &str, op: impl FnOnce(&Path) + Send + 'static) {
-    use std::time::Duration;
     isolate_state();
     let dir = scratch();
     let local = dir.join("lk.sock");
     let lock = lock_local(&host(), &local).unwrap();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let target = local.clone();
-    let (finished, handle) = finishes_within(Duration::from_millis(300), move || op(&target));
-    assert!(!finished, "{name} must wait for the LOCAL's lock");
+    let (seen, handle) = observe(Arc::clone(&released), move || op(&target));
+    let first = seen.recv_timeout(WATCHDOG);
+    // Released either way, so a failing op cannot hang the test on our hold.
+    released.store(true, Ordering::SeqCst);
     drop(lock);
+    assert_eq!(
+        first,
+        Ok(Seen::Contended),
+        "{name} must find the LOCAL's lock held before it reads the record"
+    );
+    assert_eq!(
+        seen.recv_timeout(WATCHDOG),
+        Ok(Seen::Entered { released: true }),
+        "{name} must enter once the lock is released"
+    );
     handle.join().unwrap();
 }
 
@@ -434,15 +467,22 @@ fn unforward_waits_for_the_locals_lock() {
 
 #[test]
 fn a_held_lock_on_another_local_does_not_block() {
-    use std::time::Duration;
     isolate_state();
     let dir = scratch();
-    let _held = lock_local(&host(), &dir.join("other.sock")).unwrap();
+    let held = lock_local(&host(), &dir.join("other.sock")).unwrap();
     let s = spec(&dir.join("lk.sock"), "/r/x");
-    let (finished, handle) = finishes_within(Duration::from_millis(300), move || {
+    // `released` stays false: the other LOCAL is held throughout.
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (seen, handle) = observe(released, move || {
         unforward(&Fake::new(), &host(), &[s]).unwrap()
     });
-    assert!(finished, "a different LOCAL's lock must not block this one");
+    let first = seen.recv_timeout(WATCHDOG);
+    drop(held);
+    assert_eq!(
+        first,
+        Ok(Seen::Entered { released: false }),
+        "a different LOCAL's lock must not block this one"
+    );
     handle.join().unwrap();
 }
 

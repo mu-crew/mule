@@ -35,34 +35,63 @@ fn isolate_state() {
     });
 }
 
-/// Two callers meet here, or give up after `wait`.
+/// Only a hang guard: the window below is ordered by events.
+const WATCHDOG: Duration = Duration::from_secs(60);
+
+/// The window between a caller's pre-cancel and its ForwardUnix, shared by
+/// two concurrent `forward`s of one LOCAL.
 ///
-/// A plain `Barrier` would deadlock exactly when the code under test is
-/// correct: with the per-LOCAL lock the second caller cannot arrive while the
-/// first sits at the rendezvous, so the first must be allowed to time out and
-/// carry on. Without the lock both arrive, and `wait` returns `true` for each.
-struct Rendezvous {
-    arrived: Mutex<usize>,
+/// The first caller in holds there until the other is seen: either its lock
+/// attempt found the LOCAL's lock held ([`mule::forward::on_lock_contended`],
+/// the kernel's answer), or it walked into the window too, which only an
+/// unserialised build allows. A 750ms rendezvous stood in for this, and missed
+/// the race whenever the second caller was scheduled late.
+#[derive(Default)]
+struct Window {
+    state: Mutex<WindowState>,
     cv: Condvar,
 }
 
-impl Rendezvous {
-    fn meet(&self, wait: Duration) -> bool {
-        let mut arrived = self.arrived.lock().unwrap();
-        *arrived += 1;
+#[derive(Default)]
+struct WindowState {
+    inside: usize,
+    contended: bool,
+    overlapped: bool,
+}
+
+impl Window {
+    fn contended(&self) {
+        self.state.lock().unwrap().contended = true;
         self.cv.notify_all();
-        let (arrived, _) = self
+    }
+
+    /// Enter, and hold until the other caller is seen.
+    fn enter(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.inside += 1;
+        if state.inside == 2 {
+            state.overlapped = true;
+        }
+        self.cv.notify_all();
+        let (state, timeout) = self
             .cv
-            .wait_timeout_while(arrived, wait, |n| *n < 2)
+            .wait_timeout_while(state, WATCHDOG, |s| !s.contended && !s.overlapped)
             .unwrap();
-        *arrived >= 2
+        assert!(
+            !timeout.timed_out() || state.contended || state.overlapped,
+            "the other forward neither contended for the lock nor entered"
+        );
+    }
+
+    fn leave(&self) {
+        self.state.lock().unwrap().inside -= 1;
     }
 }
 
-/// The real `ssh -O ...`, with an optional rendezvous just before ForwardUnix.
+/// The real `ssh -O ...`, with an optional window just before ForwardUnix.
 struct Real<'a> {
     sshd: &'a Sshd,
-    rendezvous: Option<Rendezvous>,
+    window: Option<std::sync::Arc<Window>>,
 }
 
 impl Transport for Real<'_> {
@@ -71,25 +100,22 @@ impl Transport for Real<'_> {
     }
 
     fn mux_op(&self, host: &Host, op: MuxOp) -> anyhow::Result<Output> {
-        if let MuxOp::ForwardUnix(local, remote) = &op
-            && let Some(rendezvous) = &self.rendezvous
-        {
+        let window = match &op {
+            MuxOp::ForwardUnix(..) => self.window.as_deref(),
+            _ => None,
+        };
+        if let Some(window) = window {
             // Both callers have, by now, read the record, cancelled and
             // unlinked; neither has added its forward. That is the window.
-            let both = rendezvous.meet(Duration::from_millis(750));
-            if both && remote.ends_with("r2.sock") {
-                // Pin the order: R1's record lands before R2 returns, so the
-                // final record names R2 -- the reviewer's wedge ordering.
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while read_record(host, local).is_none() {
-                    assert!(Instant::now() < deadline, "R1 never saved its record");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
+            window.enter();
         }
         let out = Command::new(self.sshd.dir.join("ssh"))
             .args(mule::transport::mux_args(host, &op))
-            .output()?;
+            .output();
+        if let Some(window) = window {
+            window.leave();
+        }
+        let out = out?;
         Ok(Output {
             code: out.status.code().unwrap_or(-1),
             stdout: out.stdout,
@@ -162,19 +188,32 @@ fn concurrent_forwards_of_one_local_leave_one_consistent_record_and_no_wedge() {
     serve(r1.clone(), "one");
     serve(r2.clone(), "two");
 
+    let window = std::sync::Arc::new(Window::default());
     let t = Real {
         sshd: &sshd,
-        rendezvous: Some(Rendezvous {
-            arrived: Mutex::new(0),
-            cv: Condvar::new(),
-        }),
+        window: Some(std::sync::Arc::clone(&window)),
+    };
+    let run = |remote: &Path| {
+        let window = std::sync::Arc::clone(&window);
+        let _seen = mule::forward::on_lock_contended(move |_, _| window.contended());
+        forward(&t, &host, &[spec(&local, remote)])
     };
     std::thread::scope(|scope| {
-        let a = scope.spawn(|| forward(&t, &host, &[spec(&local, &r1)]));
-        let b = scope.spawn(|| forward(&t, &host, &[spec(&local, &r2)]));
+        let a = scope.spawn(|| run(&r1));
+        let b = scope.spawn(|| run(&r2));
         a.join().unwrap().unwrap();
         b.join().unwrap().unwrap();
     });
+    let state = window.state.lock().unwrap();
+    assert!(
+        !state.overlapped,
+        "both forwards were between pre-cancel and ForwardUnix at once: one LOCAL is not serialised"
+    );
+    assert!(
+        state.contended,
+        "neither forward found the other's lock held"
+    );
+    drop(state);
 
     // The record must describe what the master actually carries.
     let recorded = read_record(&host, &local).expect("a record");
@@ -188,7 +227,7 @@ fn concurrent_forwards_of_one_local_leave_one_consistent_record_and_no_wedge() {
     // And the table is not wedged: undo what the record says, forward fresh.
     let serial = Real {
         sshd: &sshd,
-        rendezvous: None,
+        window: None,
     };
     unforward(
         &serial,
@@ -222,7 +261,7 @@ fn unforward_of_a_mismatched_remote_cancels_the_recorded_one_and_does_not_wedge(
     serve(r2.clone(), "two");
     let t = Real {
         sshd: &sshd,
-        rendezvous: None,
+        window: None,
     };
 
     forward(&t, &host, &[spec(&local, &r1)]).unwrap();
