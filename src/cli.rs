@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::config::{Config, Host};
@@ -281,7 +281,7 @@ pub enum Commands {
         /// Everything after the first word is part of the command, so mule's
         /// own flags go BEFORE it: `mule run --wait ls`, not
         /// `mule run ls --wait`. Use `--` when the command takes flags mule
-        /// also has: `mule run -- ls --all`.
+        /// also has: `mule run -- other-tool --quiet`.
         ///
         /// stdout and stderr are merged into one log, in the order the job
         /// wrote them; redirect inside your command to separate them.
@@ -1048,6 +1048,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
             cmd,
         } => {
             let host = cfg.host(host.host.as_deref())?;
+            // Clap strips the explicit separator, so check the raw arguments.
+            if !std::env::args().any(|a| a == "--") {
+                warn_about_swallowed_flags(&cmd);
+            }
             if lease {
                 let specs = crate::forward::Spec::parse_all(&forward_unix)?;
                 let job_file = job_file
@@ -1079,12 +1083,6 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
                     },
                     key.as_ref(),
                 );
-            }
-            // `--` is the caller saying "everything after this is the
-            // command", so an explicit separator silences the warning. clap
-            // strips it, so look at the raw arguments.
-            if !std::env::args().any(|a| a == "--") {
-                warn_about_swallowed_flags(&cmd);
             }
             let command = command_from_args(&cmd);
             let has_runtime_cap = max_secs.unwrap_or(host.max_job_secs) > 0;
@@ -1686,21 +1684,21 @@ pub fn command_from_args(args: &[String]) -> String {
 /// So this warns rather than erroring: the command really might want the flag,
 /// and refusing would break `mule run -- rsync --delete ...`.
 fn warn_about_swallowed_flags(cmd: &[String]) {
-    const MULE_FLAGS: [&str; 9] = [
-        "--wait",
-        "--no-tail",
-        "--max-secs",
-        "--human",
-        "--quiet",
-        "--cwd",
-        "--host",
-        "--json",
-        "--all",
-    ];
+    let mut cli = Cli::command();
+    cli.build(); // Propagate global arguments (such as --quiet) to run.
+    let run = cli.find_subcommand("run").expect("run is a subcommand");
     let found: Vec<&str> = cmd
         .iter()
         .skip(1)
-        .filter_map(|arg| MULE_FLAGS.iter().find(|f| *f == arg).copied())
+        .map(String::as_str)
+        .filter(|arg| {
+            let Some(name) = arg.strip_prefix("--") else {
+                return false;
+            };
+            let name = name.split('=').next().unwrap_or(name);
+            run.get_arguments()
+                .any(|arg| !arg.is_hide_set() && arg.get_long() == Some(name))
+        })
         .collect();
     if found.is_empty() {
         return;
@@ -1709,11 +1707,21 @@ fn warn_about_swallowed_flags(cmd: &[String]) {
         "mule: warning: {} went to the command, not to mule",
         found.join(", ")
     );
-    eprintln!(
-        "  mule flags go before the command: mule run {} {}",
-        found.join(" "),
-        cmd.first().map(String::as_str).unwrap_or("<cmd>")
-    );
+    // A swallowed option may need a value or another flag: do not suggest
+    // an invocation Clap itself would reject.
+    let corrected = ["mule", "run"]
+        .into_iter()
+        .chain(found.iter().copied())
+        .chain([cmd[0].as_str()]);
+    if cli.try_get_matches_from(corrected).is_ok() {
+        eprintln!(
+            "  mule flags go before the command: mule run {} {}",
+            found.join(" "),
+            cmd[0]
+        );
+    } else {
+        eprintln!("  put mule flags and their values before the command");
+    }
     eprintln!(
         "  to silence this, separate them explicitly: mule run -- {}",
         command_from_args(cmd)
