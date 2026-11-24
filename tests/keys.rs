@@ -16,6 +16,7 @@ use common::local::{Local, LocalTmux, scratch, tmux_available, wait_until};
 use mule::config::{Config, Host};
 use mule::errors::{MuleError, exit_code};
 use mule::key::{JobKey, KeyPrefix};
+use mule::remote::CANNOT_TELL;
 use mule::run::{Dispatched, dispatch_keyed, lookup};
 use mule::stopfence::StopFence;
 use mule::transport::{Fake, Output};
@@ -269,8 +270,9 @@ fn a_lease_whose_claim_finds_the_key_held_names_only_the_holder() {
         .push(Output::ok(
             "unstarted pid=1 host=elsewhere.invalid start=Thu Jan  1 00:00:00 1970\n",
         ))
-        .push(Output::ok(
-            "exists=1\nrc=\nrcread=1\ncmd=0\nalive=0\nwatch=0\nwhy=\nsize=0\nbytes:\n",
+        .push(Output::fail(
+            CANNOT_TELL,
+            "mule: cannot tell: the job is claimed by its key but has not started (no cmd)",
         ));
 
     let owned = lease_start(&fake, &dir, &key("k6")).unwrap();
