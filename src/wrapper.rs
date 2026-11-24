@@ -57,15 +57,15 @@ pub fn dispatch_script_with(host: &Host, job: &Job, first: &str) -> String {
         JobMode::Exec => pipe_dispatch_script(host, job, true),
         JobMode::Tui => tui_dispatch_script(host, job),
     };
-    // A dispatch that fails leaves no definite state (review of P7a, round
-    // 3). `pending` is made first and goes only once the job's session has
+    // A dispatch that fails leaves no definite state. `pending` is made first and goes only once the job's session has
     // started, so a dir with no `rc` and `pending` still in it reads
     // `unknown`, never `orphan` or `running`. A failure anywhere in the body
     // (`first` included) kills whatever sessions it made and removes the dir
     // -- the key with it, so a retry of the key starts afresh -- and the
-    // dispatch fails. Before, a failed `base64` or `new-session` left a `cmd`
-    // and a key, and the key's next `run` returned that never-started job as
-    // an orphan; a failed `pipe-pane` left a TUI session hung on `wait-for`.
+    // dispatch fails. Otherwise a failed `base64` or `new-session` leaves a
+    // `cmd` and a key, and the key's next `run` returns that never-started job
+    // as an orphan; a failed `pipe-pane` leaves a TUI session hung on
+    // `wait-for`.
     //
     // The dir goes only once both sessions are proven gone: killed, or
     // tmux's own "can't find session" / "no server" (matched without the
@@ -101,59 +101,8 @@ pub fn dispatch_script_with(host: &Host, job: &Job, first: &str) -> String {
 fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     let dir = state_dir(&job.id);
     let command = encode_command(job.cmd.as_bytes());
-    let cwd = job
-        .cwd
-        .as_deref()
-        .or(host.default_cwd.as_deref())
-        .unwrap_or("$HOME");
-
-    // The cwd is encoded for the same reason the command is: it is user input
-    // crossing the same four expansion layers. Interpolated raw, a path with a
-    // space splits into two words and `cd` either fails or -- worse -- succeeds
-    // against the wrong directory. `$HOME` is the one value mule supplies
-    // itself, and it must stay unencoded so the remote shell expands it.
-    // The cwd is a PATH, not a shell expression, and those two goals conflict:
-    // encoding it keeps a space or a `$(...)` from being interpreted, but it
-    // also stops `~` and `$HOME` from expanding. Since only the remote shell
-    // knows the remote home, a home-relative path has to be emitted as an
-    // unquoted `$HOME` with the remainder still encoded.
-    //
-    // Previously only the exact string `$HOME` was special-cased, so every
-    // other spelling became a literal directory name that cannot exist: `cd`
-    // failed, the `&&` short-circuited, and the job reported rc 1 with an empty
-    // log. Measured as broken: `~/`, `~/work`, `$HOME/work`, `${HOME}/work` --
-    // and mule's own config template suggested `~/work`, so following the
-    // documentation produced a host where nothing ran.
-    let cd = match home_relative(cwd) {
-        // Nothing after the home directory.
-        Some("") => "cd \"$HOME\"".to_string(),
-        // `$HOME` unquoted so the remote shell expands it; the rest encoded so
-        // a space or a metacharacter in the path is still inert.
-        Some(rest) => format!(
-            "cd \"$HOME/$(printf %s {} | base64 -d)\"",
-            encode_command(rest.as_bytes())
-        ),
-        None => format!(
-            "cd \"$(printf %s {} | base64 -d)\"",
-            encode_command(cwd.as_bytes())
-        ),
-    };
-
-    let shell = match &job.metadata {
-        JobMetadata::Managed { workstream } => {
-            let agent = format!("mule-{}", job.id);
-            match workstream {
-                Some(workstream) => format!(
-                    "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh",
-                    encode_command(workstream.as_bytes())
-                ),
-                None => format!("env -u MU_WORKSTREAM MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} sh"),
-            }
-        }
-        JobMetadata::Human => {
-            "env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh".to_string()
-        }
-    };
+    let cd = cd_clause(host, job);
+    let shell = agent_env(job, "sh");
 
     // exec appends the command's stderr to `err` and nothing else's: the group
     // covers `cd` too, so a bad `--cwd` leaves its reason on the first line of
@@ -205,31 +154,14 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
     let run = if job.max_secs == 0 {
         format!("{}; rc=$?; {}", body(&cd, &shell), record("$rc"))
     } else {
-        // POSIX sh has no portable process-group primitive, so the inner tmux
-        // session supplies one: `kill-session` terminates the command and all
-        // descendants. The watchdog runs in a separate tmux session, because a
-        // background `sleep` inside the job session would keep that session
-        // alive after a fast command exits. Whichever path finishes first
-        // destroys the other session. 124 follows GNU timeout and is distinct
-        // from mule kill's 137. Write 124 only when rc is missing, matching
-        // the job path, so a concurrent kill's 137 is not overwritten.
-        let watchdog = format!(
-            "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
-             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc.wd && mv -f {dir}/rc.wd {dir}/rc; fi; \
-             tmux -L {socket} kill-session -t mule-{id}; fi",
-            socket = host.tmux_socket,
-            id = job.id,
-            secs = job.max_secs,
-        );
         format!(
-            "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
-             \"printf %s {watchdog} | base64 -d | sh\"; \
+            "{watchdog}; \
              {body}; rc=$?; \
              tmux -L {socket} kill-session -t watch-{id} 2>/dev/null; \
              {record}",
             socket = host.tmux_socket,
             id = job.id,
-            watchdog = encode_command(watchdog.as_bytes()),
+            watchdog = watchdog_launch(host, job),
             body = body(&cd, &shell),
             record = record("$rc"),
         )
@@ -249,58 +181,12 @@ fn pipe_dispatch_script(host: &Host, job: &Job, split_err: bool) -> String {
 fn tui_dispatch_script(host: &Host, job: &Job) -> String {
     let dir = state_dir(&job.id);
     let command = encode_command(job.cmd.as_bytes());
-    let cwd = job
-        .cwd
-        .as_deref()
-        .or(host.default_cwd.as_deref())
-        .unwrap_or("$HOME");
-    let cd = match home_relative(cwd) {
-        Some("") => "cd \"$HOME\"".to_string(),
-        Some(rest) => format!(
-            "cd \"$HOME/$(printf %s {} | base64 -d)\"",
-            encode_command(rest.as_bytes())
-        ),
-        None => format!(
-            "cd \"$(printf %s {} | base64 -d)\"",
-            encode_command(cwd.as_bytes())
-        ),
-    };
-    let shell = match &job.metadata {
-        JobMetadata::Managed { workstream } => {
-            let agent = format!("mule-{}", job.id);
-            match workstream {
-                Some(workstream) => format!(
-                    "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" sh \"$job_dir/cmd\"",
-                    encode_command(workstream.as_bytes())
-                ),
-                None => format!(
-                    "env -u MU_WORKSTREAM MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} sh \"$job_dir/cmd\""
-                ),
-            }
-        }
-        JobMetadata::Human => {
-            "env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM sh \"$job_dir/cmd\""
-                .to_string()
-        }
-    };
+    let cd = cd_clause(host, job);
+    let shell = agent_env(job, "sh \"$job_dir/cmd\"");
     let watchdog = if job.max_secs == 0 {
         String::new()
     } else {
-        let body = format!(
-            "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
-             if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc.wd && mv -f {dir}/rc.wd {dir}/rc; fi; \
-             tmux -L {socket} kill-session -t mule-{id}; fi",
-            socket = host.tmux_socket,
-            id = job.id,
-            secs = job.max_secs,
-        );
-        format!(
-            "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
-             \"printf %s {body} | base64 -d | sh\"; ",
-            socket = host.tmux_socket,
-            id = job.id,
-            body = encode_command(body.as_bytes()),
-        )
+        format!("{}; ", watchdog_launch(host, job))
     };
     let wrapper = format!(
         "job_dir=$PWD; tmux -L {socket} wait-for tui-{id}; rm -f \"$job_dir/wrapper\"; \
@@ -337,6 +223,85 @@ fn tui_dispatch_script(host: &Host, job: &Job) -> String {
         id = job.id,
         wrapper = encode_command(wrapper.as_bytes()),
         consumer = encode_command(consumer.as_bytes()),
+    )
+}
+
+/// `cd` into the job's cwd (the job's, else the host's default, else home).
+///
+/// The cwd is user input crossing the same four expansion layers as the
+/// command, so it is encoded: a space or a `$(...)` stays inert. But it is a
+/// path, and encoding also stops `~` and `$HOME` from expanding, which only the
+/// remote shell can do. So a home-relative path is emitted as an unquoted
+/// `$HOME` with the remainder still encoded. Every spelling in
+/// [`home_relative`] counts: one left literal names a directory that cannot
+/// exist, `cd` fails, and the job reports rc 1 with an empty log -- mule's own
+/// config template suggests `~/work`.
+fn cd_clause(host: &Host, job: &Job) -> String {
+    let cwd = job
+        .cwd
+        .as_deref()
+        .or(host.default_cwd.as_deref())
+        .unwrap_or("$HOME");
+    match home_relative(cwd) {
+        Some("") => "cd \"$HOME\"".to_string(),
+        Some(rest) => format!(
+            "cd \"$HOME/$(printf %s {} | base64 -d)\"",
+            encode_command(rest.as_bytes())
+        ),
+        None => format!(
+            "cd \"$(printf %s {} | base64 -d)\"",
+            encode_command(cwd.as_bytes())
+        ),
+    }
+}
+
+/// `env` setting or clearing mu's agent variables, then `shell`.
+fn agent_env(job: &Job, shell: &str) -> String {
+    match &job.metadata {
+        JobMetadata::Managed { workstream } => {
+            let agent = format!("mule-{}", job.id);
+            match workstream {
+                Some(workstream) => format!(
+                    "env MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} MU_WORKSTREAM=\"$(printf %s {} | base64 -d)\" {shell}",
+                    encode_command(workstream.as_bytes())
+                ),
+                None => {
+                    format!("env -u MU_WORKSTREAM MU_MANAGED_AGENT=1 MU_AGENT_NAME={agent} {shell}")
+                }
+            }
+        }
+        JobMetadata::Human => {
+            format!("env -u MU_MANAGED_AGENT -u MU_AGENT_NAME -u MU_WORKSTREAM {shell}")
+        }
+    }
+}
+
+/// Start the `--max-secs` watchdog session.
+///
+/// POSIX sh has no portable process-group primitive, so the inner tmux session
+/// supplies one: `kill-session` terminates the command and all descendants.
+/// The watchdog runs in a separate tmux session, because a background `sleep`
+/// inside the job session would keep that session alive after a fast command
+/// exits. Whichever path finishes first destroys the other session. 124
+/// follows GNU timeout and is distinct from mule kill's 137. Write 124 only
+/// when rc is missing, matching the job path, so a concurrent kill's 137 is
+/// not overwritten.
+fn watchdog_launch(host: &Host, job: &Job) -> String {
+    let dir = state_dir(&job.id);
+    let body = format!(
+        "sleep {secs}; if tmux -L {socket} has-session -t mule-{id} 2>/dev/null; then \
+         if [ ! -f {dir}/rc ]; then echo 124 > {dir}/rc.wd && mv -f {dir}/rc.wd {dir}/rc; fi; \
+         tmux -L {socket} kill-session -t mule-{id}; fi",
+        socket = host.tmux_socket,
+        id = job.id,
+        secs = job.max_secs,
+    );
+    format!(
+        "tmux -L {socket} -f /dev/null new-session -d -s watch-{id} \
+         \"printf %s {body} | base64 -d | sh\"",
+        socket = host.tmux_socket,
+        id = job.id,
+        body = encode_command(body.as_bytes()),
     )
 }
 
