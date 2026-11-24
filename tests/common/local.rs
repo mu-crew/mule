@@ -248,6 +248,9 @@ pub fn wait_until(what: &str, secs: u64, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Ends each script in a [`ShimHost`]'s call log.
+const SHIM_CALL_END: &str = "--mule-shim-call-end--";
+
 /// The mule binary, with an `ssh` on `PATH` that runs every script right
 /// here: layer 2 for a whole verb, its CLI and exit codes included.
 ///
@@ -278,10 +281,13 @@ impl ShimHost {
                  for arg; do if [ \"$arg\" = -O ]; then\n\
                    [ -e '{down}' ] && {{ echo 'Control socket connect: No such file or directory' >&2; exit 255; }}\n\
                    echo 'Master running (pid=1)' >&2; exit 0; fi; done\n\
-                 [ -e '{down}' ] && exit 255\n\
                  for last; do :; done\n\
+                 printf '%s\\n{sep}\\n' \"$last\" >> '{calls}'\n\
+                 [ -e '{down}' ] && exit 255\n\
                  exec sh -c \"$last\"\n",
-                down = dir.join("master-down").display()
+                down = dir.join("master-down").display(),
+                calls = dir.join("ssh.calls").display(),
+                sep = SHIM_CALL_END,
             ),
         )
         .unwrap();
@@ -313,6 +319,18 @@ impl ShimHost {
 
     pub fn jobs(&self) -> PathBuf {
         self.state.join("mule/jobs")
+    }
+
+    /// Every script handed to the shim for a session, in order: what mule
+    /// tried to run, recorded before the shim runs it (or refuses it as a
+    /// down master), so an attempt shows even if it never got to act.
+    pub fn ssh_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.join("ssh.calls"))
+            .unwrap_or_default()
+            .split(&format!("{SHIM_CALL_END}\n"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Take the master away, or bring it back.
