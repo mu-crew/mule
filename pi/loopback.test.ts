@@ -282,7 +282,8 @@ test("serve carries file ops in one child, a burst in shared round trips", { ski
 	}
 });
 
-test("Pi's tools in parallel over one capped master", { skip: noFixture || (!havePi() && "requires a standalone Pi (MULE_TEST_PI)"), timeout: 90_000 }, () => {
+const noPi = !noFixture && !process.env.MULE_REQUIRE_LAYERS && !havePi() && "requires a standalone Pi (MULE_TEST_PI)";
+test("Pi's tools in parallel over one capped master", { skip: noFixture || noPi, timeout: 90_000 }, () => {
 	const result = runPiCase("loopback", (dir) => {
 		mkdirSync(join(dir, "config/mule"), { recursive: true });
 		writeFileSync(join(dir, "config/mule/config.toml"), readFileSync(process.env.MULE_PI_TEST_CONFIG!));

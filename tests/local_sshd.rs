@@ -92,6 +92,10 @@ fn pi_ops_over_a_capped_master() {
         .output()
         .is_ok_and(|out| out.status.success())
     {
+        assert!(
+            std::env::var_os("MULE_REQUIRE_LAYERS").is_none(),
+            "Pi loopback requires Node with TypeScript stripping"
+        );
         eprintln!("skipping Pi loopback test: Node with TypeScript stripping is not installed");
         return;
     }
@@ -122,10 +126,7 @@ fn pi_ops_over_a_capped_master() {
         .env("MULE_PI_TEST_BIN", &bin)
         .env("MULE_PI_REAL_BIN", env!("CARGO_BIN_EXE_mule"));
     let master = sshd.open_master(&sshd.socket);
-    let out = node
-        .args(["pi/loopback.test.ts", "pi/routing.test.ts"])
-        .output()
-        .unwrap();
+    let out = node.arg("pi/loopback.test.ts").output().unwrap();
     assert!(
         out.status.success(),
         "{}\n{}",

@@ -57,6 +57,9 @@ impl Drop for Master {
 /// rather than passing silently. A test that quietly does nothing is worse than
 /// no test.
 pub fn unavailable() -> Option<String> {
+    if std::env::var_os("MULE_SKIP_SSHD").is_some() {
+        return Some("MULE_SKIP_SSHD is set".into());
+    }
     if !Path::new(SSHD).exists() {
         return Some(format!("{SSHD} is not present"));
     }

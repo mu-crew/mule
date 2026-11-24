@@ -32,9 +32,24 @@ jobs:
       # Layers 2 and 3 skip when tmux or /usr/sbin/sshd is missing, so a bare
       # runner would pass while testing nothing those layers exist for.
       # Install both so CI runs them.
-      - name: Install tmux and sshd (Linux)
+      - name: Install Rust and Pi test fixtures (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux openssh-server zsh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux openssh-server zsh ripgrep fd-find procps
+          sudo ln -sf /usr/bin/fdfind /usr/local/bin/fd
+      - uses: actions/setup-node@v5
+        if: runner.os == 'Linux'
+        with:
+          node-version: '24.14.0'
+      - name: Install standalone Pi (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          npm install --global @earendil-works/pi-coding-agent@1.6.0
+          echo "MULE_TEST_PI=$(command -v pi)" >> "$GITHUB_ENV"
+      - name: Test Pi routing and tool registration (Linux)
+        if: runner.os == 'Linux'
+        run: node --test pi/routing.test.ts pi/tools.test.ts
       - name: Install tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install tmux
