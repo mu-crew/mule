@@ -139,7 +139,11 @@ Keyed artifacts are retained by mule until explicitly removed.
   timeout + 930 s as a backstop. Light commands, including when muzzle
   is gone or returns no usable answer, skip admission. Their Pi timeout
   (exit 124) uses `timeout(1)` when present, or a Bash watchdog.
-  `MULE_PI_MUZZLE=off` skips it; an absolute path pins it.
+  `MULE_PI_MUZZLE=off` skips it; an absolute path pins it. While a
+  `--mule` session is on, even if its startup failed, the extension sets
+  `globalThis[Symbol.for("@mu-crew/remote-bash")] = "mule"`, and muzzle's
+  own pi extension leaves bash calls to it rather than wrapping them with
+  this machine's binary.
 - **Output caps.** A `bash` result is the last 64 KiB of the job's log.
   When the job outran `max_log_bytes` (`mule tail` says so on stderr), or
   the log is longer than that tail, a `[mule: ...]` note follows the

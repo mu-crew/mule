@@ -604,6 +604,24 @@ esac
 			delete process.env.MULE_PI_MUZZLE;
 		}
 	},
+	async remotebash() {
+		// muzzle's pi extension stands aside while this marker is set: the
+		// remote host's muzzle wraps instead (muzzle's README, "remote bash").
+		const marker = Symbol.for("@mu-crew/remote-bash");
+		const g = globalThis as Record<symbol, unknown>;
+		const off = register();
+		await off.start();
+		assert.equal(g[marker], undefined, "no --mule, no marker: muzzle wraps locally");
+		await off.stop();
+		// Set even when startup fails: bash still never runs locally.
+		writeFileSync(join(dir, "down"), "3");
+		const s = enabled();
+		await s.start();
+		assert.equal(g[marker], "mule");
+		await s.stop();
+		assert.equal(g[marker], undefined, "released with the session");
+		rmSync(join(dir, "down"));
+	},
 	async caps() {
 		const s = enabled();
 		await s.start();

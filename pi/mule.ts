@@ -26,6 +26,10 @@ const MAX_STARTUP_BACKOFF_MS = 2_000;
 // A reattached job's result goes to the model as a message. Pi keeps about
 // this much of a bash result, from the end.
 const REATTACH_TAIL_BYTES = 50 * 1024;
+// Set on globalThis while the bash tool runs remote. muzzle's pi extension
+// skips its local rewrite then: it would name a binary and a report path
+// that exist only on this machine, and bashJob wraps with the host's muzzle.
+const REMOTE_BASH = Symbol.for("@mu-crew/remote-bash");
 
 type Entry = {
 	type: string; message?: { role?: string; content?: unknown; toolCallId?: string };
@@ -125,6 +129,8 @@ export default function (pi: ExtensionAPI) {
 		const option = typeof flag === "string" && flag ? flag : (pi.getSettings?.() as { mule?: unknown } | undefined)?.mule;
 		if (typeof option !== "string" || !option) return;
 		enabled = true;
+		// Before startup can fail: the overrides route bash remote regardless.
+		(globalThis as Record<symbol, unknown>)[REMOTE_BASH] = "mule";
 		const cwd = ctx.cwd;
 		const separator = option.indexOf(":");
 		const host = separator === -1 ? option : option.slice(0, separator);
@@ -421,6 +427,7 @@ export default function (pi: ExtensionAPI) {
 		watching = undefined;
 		serve?.close();
 		serve = undefined;
+		if (enabled) delete (globalThis as Record<symbol, unknown>)[REMOTE_BASH];
 	});
 	pi.on("user_bash", (_event, ctx) => {
 		if (!enabled) return;

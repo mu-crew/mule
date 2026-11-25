@@ -10,6 +10,9 @@
   a real failure. If startup outlives that wait, the prompt says the
   workspace is still connecting (not unavailable) and remote tools await the
   same in-flight attempt.
+- Pi extension: with `--mule`, sets `globalThis[Symbol.for("@mu-crew/remote-bash")]`
+  so muzzle's pi extension no longer wraps bash with the local binary, which
+  made every remote call exit 127. The remote host's muzzle still wraps.
 
 ## [0.7.2] — 2026-11-25
 
