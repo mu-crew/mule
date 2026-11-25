@@ -1,7 +1,7 @@
 {
   "name": "@mu-crew/mule",
   "version": "0.7.1",
-  "description": "Run long remote jobs without holding an SSH session",
+  "description": "Remote jobs, files and agent tools over one SSH connection it never holds",
   "license": "MIT",
   "repository": {
     "type": "git",

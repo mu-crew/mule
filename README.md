@@ -2,10 +2,14 @@
 
 On a host that allows one SSH session per connection (`MaxSessions 1`), a long
 remote command holds that session, and every other tool's ssh fails with an
-error that looks like bad credentials. `mule` dispatches each job detached under
-a private tmux server on the host, returns an ID, and uses its own connection
-only for sub-second dispatches and reads. The build runs; `git fetch` keeps
-working.
+error that looks like bad credentials. `mule` keeps one private connection per
+host and never holds it: each job runs detached under a private tmux server on
+the host, and file reads and writes go over short `mule serve` batches. The
+build runs; `git fetch` keeps working.
+
+Three ways in: the `mule` CLI for jobs; [mu](https://github.com/mu-crew/mu)'s
+plugin for remote workers; and a [pi](https://github.com/earendil-works/pi)
+extension that keeps your agent local while its tools work on the remote tree.
 
 Measured on a capped host: 5 concurrent plain ssh calls, 1 succeeded; through
 mule, 5 of 5. [Why, with diagrams, and which jobs belong here](docs/why.md).
@@ -50,6 +54,14 @@ mu host check box
 Details (including setup, `lease` capabilities, and exit codes) in
 [docs/usage.md](docs/usage.md#as-a-mu-plugin-mu-plugin-mule).
 
+## Use it from pi
+
+`@mu-crew/mule` is also a pi package. With `pi install npm:@mu-crew/mule` and
+`--mule build:/path/to/worktree`, pi's read, write, edit, bash, grep, find and
+ls run on the host while the agent loop, its session and its credentials stay
+on your machine. mu starts this for you with `mu agent spawn --mule`.
+Details in [pi/README.md](pi/README.md).
+
 ## 30-second demo
 
 ```console
@@ -85,6 +97,7 @@ for the whole job: the failure mule exists to remove.
 | --- | --- |
 | [docs/why.md](docs/why.md) | The session cap, measurements, which jobs to route through mule |
 | [docs/usage.md](docs/usage.md) | TUI jobs, the job's shell, output, timeouts, cleanup, exit codes, `--strict-codes`, the mu plugin |
+| [pi/README.md](pi/README.md) | The pi extension: remote workspace tools, policy, setup |
 | [SPEC.md](SPEC.md) | Design, invariants, failure behaviour, reproducing the cap locally |
 | [RELEASING.md](RELEASING.md) | Cutting a release |
 

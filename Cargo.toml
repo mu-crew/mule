@@ -5,7 +5,7 @@
 name = "mule-cli"
 version = "0.7.1"
 edition = "2024"
-description = "Fire remote jobs down a private ssh channel nothing else can contend with."
+description = "Remote jobs, files and agent tools over one SSH connection it never holds."
 license = "MIT"
 repository = "https://github.com/mu-crew/mule"
 homepage = "https://github.com/mu-crew/mule"
