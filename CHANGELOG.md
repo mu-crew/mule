@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+## [0.7.2] — 2026-11-25
+
+### Fixed
+
+- `mule` retries a job's `tmux new-session` up to 4 times when it hits a
+  `tmux` server exiting with its last session (`server exited unexpectedly`),
+  fixing intermittent failures under parallel Pi tool calls.
+- Pi extension: enforce bash job deadlines without `timeout(1)` on the host,
+  preserve trailing newlines in `find` git-ancestor walks, and mark remote
+  commands with `MU_REMOTE_WORKSPACE=1` (mu Spec B D1.2c).
+- `mule ls` encodes command listings under a bytewise `awk` locale; `mule run`
+  derives swallowed-flag warnings from Clap and no longer warns on a command's
+  own `--help`; `probe` rejects malformed flags instead of inferring state.
+
+### Changed
+
+- Updated README and package descriptions to cover `mule serve`, the mu plugin,
+  and the Pi extension.
+- Internal refactors (`libc::flock`, shared wrapper/CLI/dispatch helpers,
+  `serve/script.rs` split; −324 net lines) and event-based test oracles + Pi CI
+  release gating.
+
 ## [0.7.1] — 2026-11-24
 
 0.7.0 was tagged but never published (its release stopped at the macOS
