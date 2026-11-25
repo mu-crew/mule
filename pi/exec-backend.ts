@@ -232,8 +232,10 @@ else printf missing; fi`, 9, signal);
 
 	async exec({ command, cwd, key, timeout }: Parameters<WorkspaceOps["exec"]>[0]) {
 		// mule's worker wrapper runs POSIX sh. Bash tools expect bash syntax.
+		// MU_REMOTE_WORKSPACE=1 marks a rung 2 remote command: a mu run on the
+		// host refuses to open the host's default DB (mu Spec B D1.2c).
 		const id = (await this.#call("run", ["--human", "--cwd", cwd, "--key", key,
-			...(timeout && timeout > 0 ? ["--max-secs", String(Math.ceil(timeout))] : []), "--", `exec bash -c ${quote(command)}`])).toString().trim();
+			...(timeout && timeout > 0 ? ["--max-secs", String(Math.ceil(timeout))] : []), "--", `exec env MU_REMOTE_WORKSPACE=1 bash -c ${quote(command)}`])).toString().trim();
 		if (!JOB_ID.test(id)) throw new Error("Mule did not return a job id");
 		return id;
 	}
