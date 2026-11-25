@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Pi extension: a first turn that raced workspace startup no longer gets
+  "Still starting" baked into its system prompt; `before_agent_start` now
+  waits (up to 30s) for the in-flight startup and reports unavailable only on
+  a real failure.
+
 ## [0.7.2] — 2026-11-25
 
 ### Fixed

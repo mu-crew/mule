@@ -666,6 +666,16 @@ esac
 			assert.match((await s.prompt()).sections.mule, /remote instructions/);
 		}
 	},
+	async racestart() {
+		// The first turn can race session_start: hold it for startup rather
+		// than bake "Still starting" into the system prompt.
+		const racing = enabled();
+		const starting = racing.start();
+		const raced = await racing.prompt();
+		assert.equal(raced.cwd, root);
+		assert.match(raced.sections.mule, /remote instructions/);
+		await starting;
+	},
 };
 
 // Load through Pi so this exercises its real built-in definitions and their

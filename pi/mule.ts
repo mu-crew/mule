@@ -18,6 +18,7 @@ import { bashJob, readOnlyRefusal } from "./policy.ts";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const AGENTS_BYTES = 64 * 1024;
+const STARTUP_WAIT_MS = 30_000;
 const STARTUP_BACKOFF_MS = 250;
 const MAX_STARTUP_BACKOFF_MS = 2_000;
 // A reattached job's result goes to the model as a message. Pi keeps about
@@ -111,8 +112,11 @@ export default function (pi: ExtensionAPI) {
 	let serve: MuleServeBackend | undefined;
 	// Stops watching reattached jobs (never kills them) when the session goes.
 	let watching: AbortController | undefined;
+	// The in-flight session_start, so a first turn that raced it can wait.
+	let starting: Promise<unknown> | undefined;
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", (_event, ctx) => starting = start(ctx));
+	const start = async (ctx: ExtensionContext) => {
 		// Off unless asked for: the flag, else a "mule" key in settings
 		// (project .pi/settings.json, which Pi reads only for a trusted project).
 		const flag = pi.getFlag("mule");
@@ -408,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 		prompt = undefined;
 		startupError = undefined;
 		await ready().catch(() => { /* Overrides stay installed; ready reports the failure. */ });
-	});
+	};
 
 	pi.on("session_shutdown", () => {
 		watching?.abort();
@@ -421,7 +425,11 @@ export default function (pi: ExtensionAPI) {
 		if (!userBash) throw startupError ?? new Error("Mule workspace not ready");
 		return { operations: userBash(ctx) };
 	});
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event) => {
+		// Pi need not finish session_start before the first turn. Hold the
+		// turn for startup (bounded) instead of deciding "unavailable" early;
+		// a real failure has already set startupError by the time this settles.
+		if (!prompt && starting) await Promise.race([starting.catch(() => {}), delay(STARTUP_WAIT_MS, undefined, { ref: false })]);
 		if (!enabled) return;
 		// A new prompt is the user's go-ahead after a handback.
 		handedBack = false;
