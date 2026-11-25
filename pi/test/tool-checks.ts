@@ -418,6 +418,10 @@ const checks = {
 			await again.start();
 			await waitFor("the never-started call's lookup", () => calls().slice(after).includes(`lookup-done ${never}\n`));
 			await again.stop();
+			// stop aborts the watch but does not drain lookups already started:
+			// wait until every lookup that began has finished before counting.
+			const count = (re: RegExp) => calls().slice(after).match(re)?.length ?? 0;
+			await waitFor("every started lookup to finish", () => count(/^lookup-key /gm) === count(/^lookup-done /gm));
 			const looked = calls().slice(after).match(/^lookup-key .*$/gm)?.map((line) => line.slice("lookup-key ".length));
 			assert.deepEqual(looked, [never], "only the call never started is looked up, never the reported one");
 			assert.deepEqual(again.messages, [], "the reported result is not reported again");
