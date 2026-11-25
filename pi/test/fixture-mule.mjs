@@ -17,6 +17,8 @@ if (existsSync(down)) {
 	console.error(code === 3 ? "Open the master: ssh -MNf fixture" : "Fixture startup I/O failure");
 	process.exit(code);
 }
+// A slow first connection: hold every exec until the test lifts the hold.
+if (verb === "exec") while (existsSync(join(dir, "hold"))) await new Promise((r) => setTimeout(r, 25));
 const flag = (name) => args.includes(name) ? args[args.indexOf(name) + 1] : undefined;
 if (verb === "exec") {
 	const cwd = flag("--cwd") ?? join(dir, "remote [root]");

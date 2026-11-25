@@ -676,6 +676,27 @@ esac
 		assert.match(raced.sections.mule, /remote instructions/);
 		await starting;
 	},
+	async slowstart() {
+		// Startup outlives the first turn's wait: the prompt says "still
+		// connecting", not a final "unavailable", and a tool awaits the same
+		// attempt (one probe) instead of failing or probing again.
+		process.env.MULE_PI_STARTUP_WAIT_MS = "200";
+		const hold = join(dir, "hold");
+		writeFileSync(hold, "");
+		const s = enabled();
+		const before = calls();
+		const starting = s.start();
+		const slow = (await s.prompt()).sections.mule;
+		assert.match(slow, /still connecting/i);
+		assert.doesNotMatch(slow, /Still starting|Remote workspace unavailable/);
+		const read = s.run("read", { path: "shared.txt" });
+		await delay(300);
+		rmSync(hold);
+		assert.match(await read, /remote text/);
+		await starting;
+		assert.equal(calls().slice(before.length).match(/^exec$/gm)?.length, 1, "one probe, shared by the tool");
+		assert.match((await s.prompt()).sections.mule, /remote instructions/);
+	},
 };
 
 // Load through Pi so this exercises its real built-in definitions and their

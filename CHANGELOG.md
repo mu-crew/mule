@@ -7,7 +7,9 @@
 - Pi extension: a first turn that raced workspace startup no longer gets
   "Still starting" baked into its system prompt; `before_agent_start` now
   waits (up to 30s) for the in-flight startup and reports unavailable only on
-  a real failure.
+  a real failure. If startup outlives that wait, the prompt says the
+  workspace is still connecting (not unavailable) and remote tools await the
+  same in-flight attempt.
 
 ## [0.7.2] — 2026-11-25
 

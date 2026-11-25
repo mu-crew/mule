@@ -18,7 +18,9 @@ import { bashJob, readOnlyRefusal } from "./policy.ts";
 
 const extensionDir = dirname(fileURLToPath(import.meta.url));
 const AGENTS_BYTES = 64 * 1024;
-const STARTUP_WAIT_MS = 30_000;
+// Only how long the first turn waits; the startup itself is not cut off.
+// The env override exists for tests.
+const startupWaitMs = () => Number(process.env.MULE_PI_STARTUP_WAIT_MS) || 30_000;
 const STARTUP_BACKOFF_MS = 250;
 const MAX_STARTUP_BACKOFF_MS = 2_000;
 // A reattached job's result goes to the model as a message. Pi keeps about
@@ -429,15 +431,21 @@ export default function (pi: ExtensionAPI) {
 		// Pi need not finish session_start before the first turn. Hold the
 		// turn for startup (bounded) instead of deciding "unavailable" early;
 		// a real failure has already set startupError by the time this settles.
-		if (!prompt && starting) await Promise.race([starting.catch(() => {}), delay(STARTUP_WAIT_MS, undefined, { ref: false })]);
+		if (!prompt && starting) await Promise.race([starting.catch(() => {}), delay(startupWaitMs(), undefined, { ref: false })]);
 		if (!enabled) return;
 		// A new prompt is the user's go-ahead after a handback.
 		handedBack = false;
 		const options = event.systemPromptOptions;
 		for (const skill of options.skills ?? []) loop?.keepLocal(dirname(skill.filePath));
 		options.contextFiles = (options.contextFiles ?? []).filter((file) => file.path === join(homedir(), "AGENTS.md") || loop?.path(file.path));
+		if (!prompt && !startupError && starting) {
+			// Slow, not failed: the same attempt is still in flight, and every
+			// remote tool awaits it. Don't call it final.
+			options.sections.mule = "Remote workspace is still connecting; it is not unavailable. Remote tools wait for the connection to finish, so call them as usual. Do not substitute local workspace tools.";
+			return;
+		}
 		if (!prompt) {
-			options.sections.mule = `Remote workspace unavailable. Do not substitute local workspace tools. Read the remote AGENTS.md first when the workspace recovers. ${String(startupError ?? "Still starting")}`;
+			options.sections.mule = `Remote workspace unavailable. Do not substitute local workspace tools. Read the remote AGENTS.md first when the workspace recovers. ${String(startupError ?? "Not started")}`;
 			return;
 		}
 		const { host, root, agents } = prompt;
