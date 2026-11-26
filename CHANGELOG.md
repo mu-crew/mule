@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.3] — 2026-11-26
+
 ### Changed
 
 - Docs and comments use mu's placement vocabulary (local, remote workspace,

@@ -1,6 +1,6 @@
 {
   "name": "@mu-crew/mule",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Remote jobs, files and agent tools over one SSH connection it never holds",
   "license": "MIT",
   "repository": {
@@ -26,9 +26,9 @@
     "prepack": "node ../../scripts/npm-pi.js"
   },
   "optionalDependencies": {
-    "@mu-crew/mule-linux-x64": "0.7.2",
-    "@mu-crew/mule-linux-arm64": "0.7.2",
-    "@mu-crew/mule-darwin-arm64": "0.7.2"
+    "@mu-crew/mule-linux-x64": "0.7.3",
+    "@mu-crew/mule-linux-arm64": "0.7.3",
+    "@mu-crew/mule-darwin-arm64": "0.7.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

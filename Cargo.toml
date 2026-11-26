@@ -3,7 +3,7 @@
 # suffix. Both targets below are still named `mule`, so nothing a user types
 # changes.
 name = "mule-cli"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2024"
 description = "Remote jobs, files and agent tools over one SSH connection it never holds."
 license = "MIT"
