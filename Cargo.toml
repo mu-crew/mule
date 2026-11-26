@@ -40,7 +40,7 @@ path = "src/bin/mu-plugin-mule.rs"
 
 [features]
 # `serve` exposes the `mule serve --stdio` verb (SPEC § Bounded synchronous
-# ops). On by default: it is rung 2's transport, and its consumers (mu's pi
+# ops). On by default: it is the remote workspace placement's transport, and its consumers (mu's pi
 # tools) run a stock `cargo install`. A build that wants only the job verbs
 # drops it with `--no-default-features`; the module itself always builds, so
 # its tests run in the gate either way.

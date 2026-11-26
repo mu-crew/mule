@@ -164,7 +164,7 @@ const checks = {
 		await assert.rejects(s.run("read", { path: "absent.txt" }), /not found/);
 		assert.equal((await s.run("bash", { command: "pwd -P" })).trim(), root);
 		assert.equal(await s.bang("pwd -P"), root);
-		// Every remote command carries mu's rung 2 marker (D1.2c); an explicit
+		// Every remote command carries mu's remote-workspace marker (D1.2c); an explicit
 		// MU_DB_PATH in the command still overrides its sibling var.
 		assert.equal(await s.run("bash", { command: 'printf "%s" "$MU_REMOTE_WORKSPACE"' }), "1");
 		assert.equal(await s.run("bash", { command: 'MU_DB_PATH=/x; printf "%s|%s" "$MU_REMOTE_WORKSPACE" "$MU_DB_PATH"' }), "1|/x");

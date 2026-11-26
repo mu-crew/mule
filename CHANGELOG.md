@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Docs and comments use mu's placement vocabulary (local, remote workspace,
+  remote loop) in place of the old numbered scheme.
+
 ### Fixed
 
 - Pi extension: a first turn that raced workspace startup no longer gets

@@ -50,7 +50,7 @@ mod script;
 use script::write_body;
 pub use script::{BOUND_FN, batch_body, batch_script};
 
-/// Hard per-op limit on the host. 1s: rung 2 wants a single op at <=0.5s, so a
+/// Hard per-op limit on the host. 1s: the remote workspace wants a single op at <=0.5s, so a
 /// bounded op needing twice that is a job.
 pub const MAX_OP_SECS: u32 = 1;
 /// Test seam: a longer op deadline, for a test whose subject is not the
