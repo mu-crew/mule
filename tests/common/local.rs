@@ -172,8 +172,20 @@ impl Drop for LocalTmux {
             .args(["-L", &self.socket, "kill-server"])
             .stderr(Stdio::null())
             .status();
-        if let Some(path) = path {
-            let _ = std::fs::remove_file(path);
+        let fallback = Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                let uid = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let base = std::env::var("TMUX_TMPDIR").unwrap_or_else(|_| "/tmp".into());
+                PathBuf::from(base)
+                    .join(format!("tmux-{uid}"))
+                    .join(&self.socket)
+            });
+        for p in path.map(PathBuf::from).into_iter().chain(fallback) {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
